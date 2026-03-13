@@ -1,0 +1,8 @@
+# Files to exclude from skill package (maintainer-only)
+.gitignore
+.pre-commit-config.yaml
+.venv/
+Makefile
+dev/
+tests/
+uv.lock

@@ -1,0 +1,52 @@
+{#Copyright (c) 2026 Snowflake Inc. All rights reserved.#}
+{#Licensed under the Snowflake Skills License. #}
+{#Refer to the LICENSE file in the root of this repository for full terms.#}
+
+-- =============================================================================
+-- GEPA Optimization SPROC for AI Functions
+-- Uses the official GEPA algorithm with reflection-based prompt evolution
+-- =============================================================================
+--
+-- PREREQUISITES:
+-- Upload Python files to stage:
+--    PUT file://src/metrics_core.py @<STAGE> AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--    PUT file://src/snow_gepa_adapter.py @<STAGE> AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--    PUT file://src/snow_gepa_optimize.py @<STAGE> AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--
+-- Use scripts/create_sproc.py to generate this SPROC:
+--   uv run python scripts/create_sproc.py optimize DATABASE SCHEMA STAGE_NAME
+--
+-- =============================================================================
+
+CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION(
+    FUNCTION_NAME VARCHAR,
+    TRAINING_TABLE VARCHAR,
+    LABEL_COLUMN VARCHAR,
+    INPUT_COLUMNS ARRAY,
+    METRIC_NAME VARCHAR,
+    MODELS ARRAY,
+    REFLECTION_MODEL VARCHAR,
+    TEST_TABLE VARCHAR DEFAULT NULL,
+    AUTO_BUDGET VARCHAR DEFAULT 'light',
+    TRACKING_TABLE VARCHAR DEFAULT NULL,
+    RESULTS_TABLE VARCHAR DEFAULT NULL,
+    VALIDATION_FRACTION FLOAT DEFAULT 0.667,
+    TEMPERATURE FLOAT DEFAULT 0.7,
+    MAX_TOKENS INTEGER DEFAULT 8192,
+    METRIC_OPTIONS VARIANT DEFAULT NULL,
+    CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
+    ENABLE_DETAILED_TRACKING BOOLEAN DEFAULT FALSE,
+    RUN_ID VARCHAR DEFAULT NULL
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.12'
+PACKAGES = ('snowflake-snowpark-python', 'gepa')
+IMPORTS = (
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/custom_ai_function_utils.py',
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/metrics_core.py',
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/snow_gepa_adapter.py',
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/snow_gepa_optimize.py'
+)
+HANDLER = 'snow_gepa_optimize.run_optimization'
+EXECUTE AS CALLER;

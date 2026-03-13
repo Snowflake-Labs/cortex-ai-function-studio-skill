@@ -1,0 +1,140 @@
+{#Copyright (c) 2026 Snowflake Inc. All rights reserved.#}
+{#Licensed under the Snowflake Skills License. #}
+{#Refer to the LICENSE file in the root of this repository for full terms.#}
+
+-- =============================================================================
+-- Async Optimization SPROC for AI Functions
+-- Creates and executes a Snowflake Task to run optimization in the background
+-- =============================================================================
+--
+-- Use scripts/create_sproc.py to generate this SPROC:
+--   uv run python scripts/create_sproc.py optimize_async DATABASE SCHEMA STAGE_NAME
+--
+-- =============================================================================
+
+CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION_ASYNC(
+    FUNCTION_NAME VARCHAR,
+    TRAINING_TABLE VARCHAR,
+    LABEL_COLUMN VARCHAR,
+    INPUT_COLUMNS ARRAY,
+    METRIC_NAME VARCHAR,
+    MODELS ARRAY,
+    REFLECTION_MODEL VARCHAR,
+    TEST_TABLE VARCHAR DEFAULT NULL,
+    AUTO_BUDGET VARCHAR DEFAULT 'light',
+    TRACKING_TABLE VARCHAR DEFAULT NULL,
+    RESULTS_TABLE VARCHAR DEFAULT NULL,
+    VALIDATION_FRACTION FLOAT DEFAULT 0.667,
+    TEMPERATURE FLOAT DEFAULT 0.7,
+    MAX_TOKENS INTEGER DEFAULT 8192,
+    METRIC_OPTIONS VARIANT DEFAULT NULL,
+    CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
+    ENABLE_DETAILED_TRACKING BOOLEAN DEFAULT FALSE,
+    RUN_ID VARCHAR DEFAULT NULL,
+    WAREHOUSE_NAME VARCHAR DEFAULT NULL
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    task_name VARCHAR;
+    func_short_name VARCHAR;
+    input_cols_str VARCHAR;
+    models_str VARCHAR;
+    metric_opts_str VARCHAR;
+    sproc_call VARCHAR;
+    create_task_sql VARCHAR;
+    current_wh VARCHAR;
+    wh_to_use VARCHAR;
+    current_role_name VARCHAR;
+    wh_grant_count INTEGER;
+BEGIN
+    -- Generate run_id if not provided
+    IF (RUN_ID IS NULL) THEN
+        func_short_name := SPLIT_PART(FUNCTION_NAME, '.', -1);
+        task_name := 'ai_func_opt_' || func_short_name || '_' || TO_VARCHAR(DATE_PART('epoch_millisecond', CURRENT_TIMESTAMP()));
+    ELSE
+        task_name := RUN_ID;
+    END IF;
+    
+    -- Determine warehouse to use
+    IF (WAREHOUSE_NAME IS NULL) THEN
+        SELECT CURRENT_WAREHOUSE() INTO current_wh;
+        wh_to_use := current_wh;
+    ELSE
+        wh_to_use := WAREHOUSE_NAME;
+    END IF;
+    
+    -- Validate that the current role has USAGE on the target warehouse.
+    -- Snowflake Tasks run under the owner role, which requires a direct USAGE grant.
+    -- Session-level warehouse access (via role hierarchy) is NOT sufficient for tasks.
+    SELECT CURRENT_ROLE() INTO current_role_name;
+    EXECUTE IMMEDIATE 'SHOW GRANTS TO ROLE ' || current_role_name;
+    SELECT COUNT(*) INTO wh_grant_count
+        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+        WHERE "granted_on" = 'WAREHOUSE'
+          AND "privilege" = 'USAGE'
+          AND UPPER("name") = UPPER(:wh_to_use);
+    
+    IF (wh_grant_count = 0) THEN
+        RETURN 'ERROR: Role ' || current_role_name || ' does not have a direct USAGE grant on warehouse ' || wh_to_use || '. ' ||
+            'Async tasks run under the owner role, which requires an explicit USAGE privilege on the warehouse — ' ||
+            'session-level warehouse access through role hierarchy is not sufficient for tasks. ' ||
+            'To fix this, either: (1) Grant access: GRANT USAGE ON WAREHOUSE ' || wh_to_use || ' TO ROLE ' || current_role_name || '; ' ||
+            'or (2) Pass a warehouse your role already has access to via the WAREHOUSE_NAME parameter. ' ||
+            'To see which warehouses your role can use: SHOW GRANTS TO ROLE ' || current_role_name || ' — look for USAGE on WAREHOUSE.';
+    END IF;
+    
+    -- Build input columns array string
+    input_cols_str := 'ARRAY_CONSTRUCT(' || ARRAY_TO_STRING(INPUT_COLUMNS, ''',''') || ')';
+    input_cols_str := REPLACE(input_cols_str, 'ARRAY_CONSTRUCT(', 'ARRAY_CONSTRUCT(''');
+    input_cols_str := REPLACE(input_cols_str, ')', ''')');
+    
+    -- Build models array string
+    models_str := 'ARRAY_CONSTRUCT(' || ARRAY_TO_STRING(MODELS, ''',''') || ')';
+    models_str := REPLACE(models_str, 'ARRAY_CONSTRUCT(', 'ARRAY_CONSTRUCT(''');
+    models_str := REPLACE(models_str, ')', ''')');
+    
+    -- Build metric options string
+    IF (METRIC_OPTIONS IS NULL) THEN
+        metric_opts_str := 'NULL';
+    ELSE
+        metric_opts_str := 'PARSE_JSON(''' || TO_VARCHAR(METRIC_OPTIONS) || ''')';
+    END IF;
+    
+    -- Build the SPROC call (RUN_ID = task_name for tracking)
+    sproc_call := 'CALL {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION(' ||
+        '''' || FUNCTION_NAME || ''', ' ||
+        '''' || TRAINING_TABLE || ''', ' ||
+        '''' || LABEL_COLUMN || ''', ' ||
+        input_cols_str || ', ' ||
+        '''' || METRIC_NAME || ''', ' ||
+        models_str || ', ' ||
+        '''' || REFLECTION_MODEL || ''', ' ||
+        COALESCE('''' || TEST_TABLE || '''', 'NULL') || ', ' ||
+        '''' || AUTO_BUDGET || ''', ' ||
+        COALESCE('''' || TRACKING_TABLE || '''', 'NULL') || ', ' ||
+        COALESCE('''' || RESULTS_TABLE || '''', 'NULL') || ', ' ||
+        TO_VARCHAR(VALIDATION_FRACTION) || ', ' ||
+        TO_VARCHAR(TEMPERATURE) || ', ' ||
+        TO_VARCHAR(MAX_TOKENS) || ', ' ||
+        metric_opts_str || ', ' ||
+        COALESCE('''' || CUSTOM_METRIC_UDF || '''', 'NULL') || ', ' ||
+        TO_VARCHAR(ENABLE_DETAILED_TRACKING) || ', ' ||
+        '''' || task_name || ''')';
+    
+    -- Create the task (no schedule — single execution only via EXECUTE TASK)
+    create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}.' || task_name ||
+        ' WAREHOUSE = ' || wh_to_use ||
+        ' AS ' || sproc_call;
+    
+    EXECUTE IMMEDIATE create_task_sql;
+    
+    -- Execute the task immediately (works on suspended tasks, no RESUME needed)
+    EXECUTE IMMEDIATE 'EXECUTE TASK {{ database }}.{{ schema }}.' || task_name;
+    
+    RETURN task_name;
+END;
+$$;

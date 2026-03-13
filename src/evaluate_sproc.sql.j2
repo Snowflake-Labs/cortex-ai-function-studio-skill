@@ -1,0 +1,38 @@
+{#Copyright (c) 2026 Snowflake Inc. All rights reserved.#}
+{#Licensed under the Snowflake Skills License. #}
+{#Refer to the LICENSE file in the root of this repository for full terms.#}
+
+-- =============================================================================
+-- Evaluation SPROC for AI Functions
+-- Generic procedure that works with any AI function
+-- =============================================================================
+--
+-- Use scripts/create_sproc.py to generate this SPROC with correct stage paths:
+--   uv run python scripts/create_sproc.py evaluate DATABASE SCHEMA STAGE_NAME
+--
+-- =============================================================================
+
+CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.EVALUATE_AI_FUNCTION(
+    FUNCTION_NAME VARCHAR,
+    TEST_TABLE VARCHAR,
+    INPUT_COLUMNS ARRAY,
+    LABEL_COLUMN VARCHAR,
+    METRIC_NAME VARCHAR,
+    MODEL_NAME VARCHAR,
+    SAMPLE_SIZE INTEGER DEFAULT NULL,
+    RESULTS_TABLE VARCHAR DEFAULT NULL,
+    METRIC_OPTIONS VARIANT DEFAULT NULL,
+    MAX_LENGTH INTEGER DEFAULT 500,
+    CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
+    RUN_ID VARCHAR DEFAULT NULL
+)
+RETURNS FLOAT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.12'
+PACKAGES = ('snowflake-snowpark-python', 'pandas')
+IMPORTS = (
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/custom_ai_function_utils.py',
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/metrics_core.py'
+)
+HANDLER = 'metrics_core.evaluate_handler'
+EXECUTE AS CALLER;
