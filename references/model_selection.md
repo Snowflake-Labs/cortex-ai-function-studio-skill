@@ -20,8 +20,8 @@ SHOW PARAMETERS LIKE 'cortex_models_allowlist' IN ACCOUNT
 **Based on the `value` column:**
 
 - **`ALL`**: Proceed to Step 2 to query all available models
-- **Comma-separated list** (e.g., `llama3.1-70b,claude-3-5-sonnet`): Parse and use only those specific models as the available set
-- **`NONE`**: Inform user: "No Cortex models are available for this account. Please contact your administrator to enable model access." Then exit the custom ai function skill.
+- **Comma-separated list** (e.g., `claude-haiku-4-5, claude-sonnet-4-5`): Parse and use only those specific models as the available set
+- **`NONE`**: Inform user: "No Cortex models are available for this account. Please contact your administrator to enable model access." Then exit the Cortex AI Function Studio.
 
 ### Step 2: Query Available Models
 

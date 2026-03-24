@@ -1,7 +1,7 @@
 ---
 name: optimize-ai-function
 description: "Optimize an AI function's prompt through automated prompt tuning."
-parent_skill: custom-ai-function
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -12,13 +12,9 @@ Automatically improves prompts through iterative optimization with Pareto fronti
 
 ## Prerequisites
 
-**The target function must be created via `create/SKILL.md`** (or have compatible structure). The optimizer invokes the UDF directly with `MODEL_NAME` and `SYSTEM_PROMPT` override parameters, so functions must have this signature:
+**The target function must be created via `create/SKILL.md`** (or have compatible structure). The optimizer reverse-parses the function DDL to extract the baked-in model and system prompt, then creates temporary functions with candidate model/prompt combinations during optimization. The function body must use the standard `AI_COMPLETE(model=>'...', messages=>ARRAY_CONSTRUCT(...))` pattern.
 
-```sql
-MY_FUNC(input1, input2, ..., MODEL_NAME VARCHAR DEFAULT 'model', SYSTEM_PROMPT VARCHAR DEFAULT NULL)
-```
-
-If the function was not created with these parameters, the optimization will fail. Direct the user to recreate the function using the create workflow.
+If the function was not created with the expected structure, the optimization will fail. Direct the user to recreate the function using the create workflow.
 
 ## When to Load
 
@@ -34,16 +30,17 @@ Load from main skill when user intent matches OPTIMIZE: "optimize", "tune", "imp
 | `test_table` | No | training_table | No | - |
 | `input_columns` | Yes | - | **Yes** | training_table |
 | `label_column` | Yes | - | **Yes** | training_table |
-| `metric` | Yes | exact_match | No | - |
+| `metric` | Yes | - | **Yes** | - |
 | `auto_budget` | Yes | medium | No | - |
-| `models` | Yes | [llama3.1-70b] | No | - |
-| `reflection_model` | Yes | snowflake-llama-3.1-405b | No | - |
+| `models` | Yes | [claude-sonnet-4-5] | No | - |
+| `reflection_model` | Yes | claude-sonnet-4-6 | No | - |
 | `stage` | Yes | (generated) | No | - |
 | `tracking_table` | No | (generated) | No | function_name |
+| `aggregation_metric` | No | accuracy | No | metric |
 
-**Critical fields** (always confirm even if pre-provided): `function_structure_confirmed`, `input_columns`, `label_column`
+**Critical fields** (always confirm even if pre-provided): `function_structure_confirmed`, `input_columns`, `label_column`, `metric`
 
-**Simple fields** (accept silently if pre-provided): `function_name`, `training_table`, `test_table`, `metric`, `auto_budget`, `models`, `reflection_model`, `stage`, `tracking_table`
+**Simple fields** (accept silently if pre-provided): `function_name`, `training_table`, `test_table`, `auto_budget`, `models`, `reflection_model`, `stage`, `tracking_table`, `aggregation_metric`
 
 ## Pre-Collection
 
@@ -54,7 +51,7 @@ Before prompting, scan the user's initial message and any prior context for alre
 3. **Column mappings**: Look for phrases like "input column X", "label column Y", "expected column Z"
 4. **Metric**: Look for evaluation metrics like "exact_match" or "llm_judge". Note these are not the only names, and users can build custom evaluation metrics. If you aren't sure, ask the user.
 5. **Budget**: Look for "light", "medium", "heavy" or phrases like "quick optimization", "thorough search"
-6. **Models**: Look for model names like "llama3.1-70b", "llama3.1-8b", "llama3.1-405b"
+6. **Models**: Look for model names like "claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5"
 
 For each piece found:
 - **Simple fields**: Accept silently, proceed without re-asking
@@ -72,9 +69,13 @@ For each piece found:
 
 ### Step 2: Verify Function Structure (Background)
 
-The optimizer extracts the seed prompt from the function DDL by looking for the `COALESCE(SYSTEM_PROMPT, '...')` pattern. This is the prompt that will be optimized.
+The optimizer reverse-parses the function DDL to extract:
+- The **model** from `model=>'...'` in the `AI_COMPLETE` call
+- The **system prompt** from `OBJECT_CONSTRUCT('role', 'system', 'content', '...')` in the messages array
 
-If extraction fails (function doesn't have `MODEL_NAME`/`SYSTEM_PROMPT` parameters), inform user they need to recreate the function using `create/SKILL.md`.
+These become the seed model and seed prompt for optimization.
+
+If extraction fails (function doesn't use the expected `AI_COMPLETE` pattern), inform user they need to recreate the function using `create/SKILL.md`.
 
 ### Step 3: Get Training & Test Data Tables
 
@@ -125,21 +126,18 @@ Store the column lists from both DESCRIBE outputs — you will need them for col
 
 **⚠️ STOP**: Always confirm column mapping before proceeding (critical fields).
 
-After confirmation, validate columns per `references/data_preparation.md` Step 5.
+After confirmation, **Load** `references/data_preparation.md` Step 5 to validate that all mapped columns exist in the relevant tables. Do NOT proceed if columns don't match.
+
+**Multi-key output handling:** If the user's training/test table has multiple truth columns that correspond to keys in a multi-key function output (e.g., separate `SENTIMENT`, `CONFIDENCE` columns instead of a single VARIANT), help them combine these into a single VARIANT `label_column` using `OBJECT_CONSTRUCT` in a view before optimization. See `references/data_preparation.md` "Multi-Column Truth Aggregation" for the SQL pattern.
 
 ### Step 4: Configure Optimization
 
 #### Step 4.1: Select Metric
 
-**If `metric` already collected** (user provided metric upfront):
-Accept silently (simple field) — skip this substep
-
-**If not collected:**
-
 **Load** `references/metrics.md` and present the metric selection prompt.
 
 **If user chooses "Create custom metric" (option 6):**
-Load `references/custom_metrics.md` with context:
+**Load** `references/custom_metrics.md` with context:
 - Preserve function name: `{function_name}`
 - Preserve training table: `{training_table}`
 - Preserve column mappings: `{input_columns}`, `{label_column}`
@@ -149,12 +147,29 @@ After custom metric creation completes, return to this step with the new metric 
 
 Store as `metric_name`.
 
+#### Step 4.1b: Select Aggregation Metric (Classification Tasks Only)
+
+**If `aggregation_metric` already collected**, skip. Otherwise:
+
+**Only ask this if the task/problem appears classification-based (e.g., predicting categories, classes, or labels).** For non-classification tasks, skip and leave `aggregation_metric` as NULL.
+
+```
+The optimizer will use batch-level accuracy as the aggregation metric and report
+precision, recall, F1, and accuracy as diagnostics for each candidate.
+
+Would you like to change the aggregation metric?
+
+1. **accuracy** (default) - Optimize for overall accuracy
+2. **f1-score** - Optimize for F1 score (recommended for imbalanced classes)
+```
+
+Store as `aggregation_metric`. Default: `'accuracy'`
+
+When `aggregation_metric` is set, the optimizer computes precision, recall, F1, and accuracy across each evaluation batch. All four are reported as diagnostics; the selected metric is used to score and rank candidates.
+
 #### Step 4.2: Select Budget
 
-**If `auto_budget` already collected** (user provided budget upfront):
-Accept silently (simple field) — skip this substep
-
-**If not collected**, ask the user which optimization budget to use:
+**If `auto_budget` already collected**, skip. Otherwise:
 
 ```
 How thorough should the optimization search be?
@@ -168,25 +183,19 @@ Store as `auto_budget`. Default: `medium`
 
 #### Step 4.3: Select Models to Optimize
 
-**If `models` already collected** (user provided model list upfront):
-Accept silently (simple field) — skip this substep
-
-**If not collected:**
+**If `models` already collected**, skip. Otherwise:
 
 The optimizer will run independently for each selected model, allowing you to compare results across different cost/quality tradeoffs.
 
-Ask the user which models to optimize for (can select multiple):
+**⚠️ STOP**: Ask the user which models to optimize for (can select multiple):
 
-**Load** `references/model_selection.md` and follow its full workflow to dynamically query available models and present smart recommendations. Use `multiSelect: true` since the optimizer runs independently for each model. Present the same one-per-family options from model_selection.md — do not expand any family into multiple size variants. Users who want a specific size variant (e.g., llama3.1-8b instead of llama3.1-405b) can select "See all models".
+**Load** `references/model_selection.md` and follow its full workflow to dynamically query available models and present smart recommendations. Use `multiSelect: true` since the optimizer runs independently for each model. Present the same one-per-family options from model_selection.md — do not expand any family into multiple size variants. Users who want a specific size variant (e.g., claude-haiku-4-5 instead of claude-opus-4-5) can select "See all models".
 
-Store as `models` (array). Default: `['llama3.1-70b']`
+Store as `models` (array). Default: `['claude-sonnet-4-5']`
 
 #### Step 4.4: Select Reflection Model
 
-**If `reflection_model` already collected** (user provided reflection model upfront):
-Accept silently (simple field) — skip this substep
-
-**If not collected:**
+**If `reflection_model` already collected**, skip. Otherwise:
 
 The reflection model analyzes failures during optimization to guide prompt evolution. A more capable model generally produces better reflections.
 
@@ -235,6 +244,13 @@ How would you like to run the optimization?
 2. **Async** (recommended) - Run in background, track with run_id
 ```
 
+**If user selects Async**, ask about timeout:
+```
+The default async timeout is 4 hours (240 minutes).
+Would you like to use a different timeout?
+```
+If user provides a custom value, store as `timeout_minutes`. Otherwise use the default (240).
+
 **Sync execution** (default): Runs directly with extended timeout. Risk of Cortex Code timeout on heavy budgets.
 
 **Async execution**: Uses a Snowflake Task to run optimization in the background. Recommended for `medium` or `heavy` budgets.
@@ -262,7 +278,8 @@ CALL OPTIMIZE_AI_FUNCTION(
     NULL,                                          -- Metric options (or OBJECT_CONSTRUCT(...))
     '{custom_metric_udf}',                         -- Custom metric UDF name (or NULL)
     FALSE,                                         -- enable_detailed_tracking: verbose logging (default FALSE)
-    NULL                                           -- run_id: external ID for tracking (auto-generated if NULL)
+    NULL,                                          -- run_id: external ID for tracking (auto-generated if NULL)
+    NULL                                           -- aggregation_metric: 'accuracy' or 'f1-score' (NULL to disable)
 );
 ```
 
@@ -285,7 +302,7 @@ The single call returns results for all models. Each model gets the same budget 
 
 **Required params:** FUNCTION_NAME, TRAINING_TABLE, LABEL_COLUMN, INPUT_COLUMNS, METRIC_NAME, MODELS, REFLECTION_MODEL
 
-**Optional params:** TEST_TABLE, AUTO_BUDGET ('light'), TRACKING_TABLE, VALIDATION_FRACTION (0.667), TEMPERATURE (0.0), MAX_TOKENS (8192), METRIC_OPTIONS, CUSTOM_METRIC_UDF, ENABLE_DETAILED_TRACKING, RUN_ID
+**Optional params:** TEST_TABLE, AUTO_BUDGET ('light'), TRACKING_TABLE, VALIDATION_FRACTION (0.667), TEMPERATURE (0.0), MAX_TOKENS (8192), METRIC_OPTIONS, CUSTOM_METRIC_UDF, ENABLE_DETAILED_TRACKING, RUN_ID, AGGREGATION_METRIC
 
 #### Async Optimization
 
@@ -310,14 +327,16 @@ CALL OPTIMIZE_AI_FUNCTION_ASYNC(
     NULL,                                          -- Metric options (or OBJECT_CONSTRUCT(...))
     '{custom_metric_udf}',                         -- Custom metric UDF name (or NULL)
     FALSE,                                         -- enable_detailed_tracking: verbose logging (default FALSE)
-    NULL                                           -- run_id: external ID for tracking (auto-generated if NULL)
-    NULL                                           -- warehouse_name: warehouse to run task (NULL = current)
+    NULL,                                          -- run_id: external ID for tracking (auto-generated if NULL)
+    NULL,                                          -- aggregation_metric: 'accuracy' or 'f1-score' (NULL to disable)
+    NULL,                                          -- warehouse_name: warehouse to run task (NULL = current)
+    240                                            -- timeout_minutes: max task runtime in minutes (default 240 = 4 hours)
 );
 ```
 
 **Required params:** FUNCTION_NAME, TRAINING_TABLE, LABEL_COLUMN, INPUT_COLUMNS, METRIC_NAME, MODELS, REFLECTION_MODEL
 
-**Optional params:** TEST_TABLE, AUTO_BUDGET ('light'), TRACKING_TABLE, VALIDATION_FRACTION (0.667), TEMPERATURE (0.0), MAX_TOKENS (8192), METRIC_OPTIONS, CUSTOM_METRIC_UDF, ENABLE_DETAILED_TRACKING, RUN_ID
+**Optional params:** TEST_TABLE, AUTO_BUDGET ('light'), TRACKING_TABLE, VALIDATION_FRACTION (0.667), TEMPERATURE (0.0), MAX_TOKENS (8192), METRIC_OPTIONS, CUSTOM_METRIC_UDF, ENABLE_DETAILED_TRACKING, RUN_ID, AGGREGATION_METRIC, TIMEOUT_MINUTES (240)
 
 The SPROC returns immediately with a **run_id** like `ai_func_opt_MY_AI_FUNCTION_1709234567890`.
 
@@ -326,9 +345,7 @@ The SPROC returns immediately with a **run_id** like `ai_func_opt_MY_AI_FUNCTION
 **⚠️ IMPORTANT**: Display the run_id prominently to the user:
 
 ```
-╔═══════════════════════════════════════════════════════════╗
-║  RUN_ID: ai_func_opt_MY_AI_FUNCTION_1709234567890                 ║
-╚═══════════════════════════════════════════════════════════╝
+RUN_ID: ai_func_opt_MY_AI_FUNCTION_1709234567890
 
 Save this run_id to track your optimization.
 
@@ -344,7 +361,7 @@ You can close this session and return later. To resume, load the custom AI funct
 
 ### Step 7: Present Results (with Pareto Filtering)
 
-**⚠️ MANDATORY: You MUST complete ALL substeps below (7.1 through 7.5) before presenting any results to the user or asking what to do next. Do NOT skip the pareto filter.**
+**⚠️ MANDATORY**: You MUST complete ALL substeps below (7.1 through 7.5) before presenting any results to the user or asking what to do next. Do NOT skip the pareto filter.
 
 **7.1. Collect raw results:**
 
@@ -358,8 +375,21 @@ SELECT ROW_NUMBER() OVER (PARTITION BY MODEL_NAME ORDER BY CREATED_AT) AS IDX, M
 ```
 
 **7.2. Get character length statistics:**
+
+For each input column, compute average length separately. If there are multiple input columns, sum their averages:
 ```sql
-SELECT AVG(LENGTH({input_columns})) AS avg_input_chars, AVG(LENGTH({label_column})) AS avg_output_chars FROM {test_table};
+SELECT
+    {sum_of_AVG_LENGTH_per_input_column} AS avg_input_chars,
+    AVG(LENGTH({label_column})) AS avg_output_chars
+FROM {test_table};
+```
+
+Example for two input columns `COL_A` and `COL_B`:
+```sql
+SELECT
+    AVG(LENGTH(COL_A)) + AVG(LENGTH(COL_B)) AS avg_input_chars,
+    AVG(LENGTH({label_column})) AS avg_output_chars
+FROM {test_table};
 ```
 
 **7.3. Filter to pareto-optimal options:**
@@ -379,8 +409,8 @@ Select the best result to apply:
 
 | # | Model | Score | Improvement | Relative Cost |
 |---|-------|-------|-------------|---------------|
-| 1 | llama3.1-8b | 82.0% | +17.0% | 1.0x (cheapest) |
-| 2 | llama3.1-70b | 85.0% | +20.0% | 3.0x |
+| 1 | claude-haiku-4-5 | 82.0% | +17.0% | 1.0x (cheapest) |
+| 2 | claude-sonnet-4-5 | 85.0% | +20.0% | 3.0x |
 
 Enter the number of your choice (or 0 to skip):
 ```
@@ -406,7 +436,7 @@ Apply the optimized prompt?
 
 Recreate the function using the create skill script with:
 - The optimized system prompt from `best_prompt`
-- The original user template (preserved)
+- The original user prompt template (preserved)
 - The selected model
 - The original response_format schema (preserved)
 
@@ -427,12 +457,20 @@ Extract the original function metadata from Step 2, then build the JSON config:
 ```
 
 Generate and execute the SQL:
+
 ```bash
 uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
     --json '<JSON_CONFIG>'
 ```
 
-**⚠️ STOP**: Show generated SQL DDL to user for review before execution.
+**⚠️ STOP**: Show generated SQL DDL to user for review. Once confirmed, run the script once again in execute mode to create the udf
+
+```bash
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+    --execute --json '<JSON_CONFIG>' \
+    --connection <CONNECTION_NAME> \
+    --warehouse <WAREHOUSE_NAME>
+```
 
 **If "Save as new version":**
 
@@ -470,6 +508,33 @@ If manage versions → **Load** `references/version_management.md` with context:
 - `{database}`, `{schema}`: Current location
 - `{function_base}`: Base function name
 
+If the customer wants to re-optimize or is unsatisfied with the current improvement:
+**⚠️ STOP**: Use `ask_user_question` to let the user select the result to apply.
+
+Ask the user:
+```
+Do you want to change the initial `AI_COMPLETE` prompts or pre- and post-processing?
+Most of the cases, changing in abstraction can give significantly different results.
+
+1. Yes - Go back to recreate new function with different initial prompts/ pre/ post processing. 
+2. No - Re-optimize with different optimization effort level.
+3. Analyze errors and help me decide.
+```
+
+If the user select 1 -> Load `create/SKILL.md` with context:
+- Preserve `{database}`, `{schema}`, `{function_name}`, `{inputs}`, `{outputs}`, `{model}`
+- Pass the current seed prompt and error analysis so the create workflow can inform approach selection
+- Note: *"The customer is re-creating this function with a different approach. Skip to Step 4 (Select Creation Mode) — task description, clarifications, inputs, and outputs are already known. Default to Agent Research mode for the re-creation."*
+
+If the user select 2 -> Ask the customer for a new `auto_budget` and optionally new `models`. Then re-run optimization from Step 5 (Execute Optimization) with the updated settings.
+
+If the user select 3:
+Try to run evaluation on the optimized version and see what the error types are. Then, critically reason through the following:
+1. Can this be solved with different pre-/post-processing?
+2. Inspect prompt optimization progression to see whether it's in the correct direction. Would a different seed prompt solve this problem?
+3. Is the current model just not strong enough? Should we try a stronger or different type of model?
+After doing this analysis, help user identify whether they should run optimization with different effort level or re-create function with different settings.
+
 ## Stopping Points
 
 Critical confirmations (always stop, even if pre-provided):
@@ -484,7 +549,8 @@ Optional confirmations:
 | Problem | Solution |
 |---------|----------|
 | `Function not found` | Use fully qualified name: `DB.SCHEMA.MY_FUNC`. Verify: `SHOW FUNCTIONS LIKE 'MY_FUNC' IN SCHEMA DB.SCHEMA;` |
-| `Could not extract prompt definition` | Function missing `MODEL_NAME`/`SYSTEM_PROMPT` params. Recreate via `create/SKILL.md`. |
+| `Could not extract system prompt from DDL` | Function does not use the expected `AI_COMPLETE(model=>'...', messages=>...)` pattern. Recreate via `create/SKILL.md`. |
+| `Could not extract model name from DDL` | Function body does not contain `model=>'...'`. Recreate via `create/SKILL.md`. |
 
 ## Output
 

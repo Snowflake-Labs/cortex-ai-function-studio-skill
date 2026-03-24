@@ -36,7 +36,10 @@ from snow_gepa_adapter import (
     SnowflakeLLM,
     load_dataset,
 )
-from custom_ai_function_utils import with_custom_ai_function_query_tag
+from custom_ai_function_utils import (
+    build_temp_function_name,
+    with_custom_ai_function_query_tag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,8 @@ def optimize(
     reflection_model: str,
     auto: Literal["light", "medium", "heavy"] | None,
     max_metric_calls: int | None,
+    original_ddl: str = "",
+    temp_function_name: str = "",
     reflection_minibatch_size: int = 10,
     skip_perfect_score: bool = True,
     perfect_score: float = 1.0,
@@ -176,23 +181,17 @@ def optimize(
         valset: Validation examples for scoring candidates. Typically 2/3 of
             your labeled data. Must be provided (no default).
         function_name: Fully qualified UDF name (DB.SCHEMA.FUNC) to optimize.
-            The UDF must have MODEL_NAME and SYSTEM_PROMPT override parameters.
         input_columns: List of input column names that map to UDF parameters.
         model: Snowflake Cortex model for task execution.
         reflection_model: Model for reflection/mutation. Defaults to same as model.
         auto: Auto budget preset. One of "light", "medium", "heavy".
-            - light: ~6 iterations per component (quick experiments)
-            - medium: ~12 iterations per component (balanced)
-            - heavy: ~18 iterations per component (thorough)
-            Mutually exclusive with max_metric_calls.
         max_metric_calls: Maximum total evaluations (budget limit).
-            Mutually exclusive with auto.
+        original_ddl: DDL of the original function for creating temp functions.
+        temp_function_name: Fully qualified name for the temp function.
         reflection_minibatch_size: Examples per reflection step. Default 3.
         skip_perfect_score: Skip reflection when all scores are perfect.
         perfect_score: Score threshold considered perfect. Default 1.0.
         candidate_selection_strategy: How to select parent candidate.
-            "pareto": Sample from Pareto frontier (default, more diverse).
-            "current_best": Always select highest-scoring candidate.
         use_merge: Whether to use merge-based optimization. Default True.
         max_merge_invocations: Maximum merge operations. Default 5.
         no_improvement_patience: Stop optimization if no improvement after this
@@ -200,8 +199,7 @@ def optimize(
         seed: Random seed for reproducibility. Default 0.
         log_dir: Directory for saving logs (optional).
         tracking_callback: Optional callback function called after each candidate
-            evaluation with (candidate_dict, average_score). Used for incremental
-            tracking to save results as frequently as possible.
+            evaluation with (candidate_dict, average_score).
         detailed_tracking_callback: Optional callback for per-row evaluation details.
         temperature: LLM sampling temperature for reflection. Default 0.7.
         max_tokens: Maximum tokens for reflection responses. Default 8192.
@@ -231,6 +229,8 @@ def optimize(
         function_name=function_name,
         input_columns=input_columns,
         model=model,
+        original_ddl=original_ddl,
+        temp_function_name=temp_function_name,
         tracking_callback=tracking_callback,
         detailed_tracking_callback=detailed_tracking_callback,
     )
@@ -250,24 +250,27 @@ def optimize(
             )
         )
 
-    return gepa_pkg.optimize(
-        seed_candidate=seed_candidate,
-        trainset=trainset,
-        valset=valset,
-        adapter=adapter,
-        reflection_lm=reflection_lm,
-        candidate_selection_strategy=candidate_selection_strategy,
-        skip_perfect_score=skip_perfect_score,
-        reflection_minibatch_size=reflection_minibatch_size,
-        perfect_score=perfect_score,
-        use_merge=use_merge,
-        max_merge_invocations=max_merge_invocations,
-        max_metric_calls=resolved_budget,
-        stop_callbacks=stop_callbacks if stop_callbacks else None,
-        logger=PythonLoggingAdapter(logger),
-        seed=seed,
-        run_dir=log_dir,
-    )
+    try:
+        return gepa_pkg.optimize(
+            seed_candidate=seed_candidate,
+            trainset=trainset,
+            valset=valset,
+            adapter=adapter,
+            reflection_lm=reflection_lm,
+            candidate_selection_strategy=candidate_selection_strategy,
+            skip_perfect_score=skip_perfect_score,
+            reflection_minibatch_size=reflection_minibatch_size,
+            perfect_score=perfect_score,
+            use_merge=use_merge,
+            max_merge_invocations=max_merge_invocations,
+            max_metric_calls=resolved_budget,
+            stop_callbacks=stop_callbacks if stop_callbacks else None,
+            logger=PythonLoggingAdapter(logger),
+            seed=seed,
+            run_dir=log_dir,
+        )
+    finally:
+        adapter.cleanup()
 
 
 def split_dataset(
@@ -727,22 +730,24 @@ def save_opt_results(
             pass
 
 
-def _get_function_ddl(session: Session, function_name: str) -> str:
-    """Fetch and normalize DDL for an AI function.
+def get_function_ddl(
+    session: Session, function_name: str, *, unescape: bool = True
+) -> str:
+    """Fetch DDL for an AI function.
 
     Args:
         session: Snowpark session
         function_name: Fully qualified function name (e.g., DB.SCHEMA.FUNC or
             DB.SCHEMA.FUNC(VARCHAR, ARRAY))
+        unescape: If True (default), unescape SQL quotes for easier parsing.
+            Set to False to return raw executable SQL from GET_DDL.
 
     Returns:
-        Normalized DDL string with quotes unescaped
+        DDL string (unescaped for parsing, or raw for execution)
 
     Raises:
         ValueError: If the DDL cannot be retrieved
     """
-    # Handle case where signature is included in function name
-    # e.g., "DB.SCHEMA.FUNC(VARCHAR, ARRAY)" -> "DB.SCHEMA.FUNC"
     base_name = function_name
     provided_signature = None
     if "(" in function_name:
@@ -757,14 +762,12 @@ def _get_function_ddl(session: Session, function_name: str) -> str:
         )
     db, schema, func = parts
 
-    # Determine function signature
     rows = session.sql(
         f"SHOW FUNCTIONS LIKE '{func}' IN SCHEMA {db}.{schema}"
     ).collect()
     if not rows:
         raise ValueError(f"Function not found: {function_name}")
 
-    # If signature was provided, find matching overload; otherwise use first match
     if provided_signature and len(rows) > 1:
         target_sig = f"{func}{provided_signature}"
         matching_row = None
@@ -789,12 +792,16 @@ def _get_function_ddl(session: Session, function_name: str) -> str:
         raise ValueError(f"Could not retrieve DDL for function: {full_signature}")
 
     ddl = result[0][0]
-    ddl = ddl.replace("\\'", "'").replace("''", "'")
+    if unescape:
+        ddl = ddl.replace("\\'", "'").replace("''", "'")
     return ddl
 
 
 def _get_prompt_from_ddl(session: Session, function_name: str) -> str:
     """Extract the system prompt from a UDF's DDL.
+
+    Parses the hardcoded system prompt from the function body where it appears
+    as the 'content' value in the system message OBJECT_CONSTRUCT.
 
     Args:
         session: Snowpark session
@@ -807,19 +814,149 @@ def _get_prompt_from_ddl(session: Session, function_name: str) -> str:
     Raises:
         ValueError: If the DDL cannot be retrieved or parsed
     """
-    ddl = _get_function_ddl(session, function_name)
+    ddl = get_function_ddl(session, function_name)
+    return extract_prompt_from_ddl_string(ddl, function_name)
 
-    coalesce_pattern = r"'role'.\s*'system'.\s*'content'.\s*COALESCE\s*\(\s*SYSTEM_PROMPT\s*,\s*'((?:[^']|'')*)'\s*\)"
-    match = re.search(coalesce_pattern, ddl, re.DOTALL)
+
+def extract_prompt_from_ddl_string(ddl: str, function_name: str = "") -> str:
+    """Extract the system prompt from a raw DDL string.
+
+    Looks for the pattern: 'role', 'system', 'content', '<prompt>'
+    """
+    prompt_pattern = r"'role'\s*,\s*'system'\s*,\s*'content'\s*,\s*'((?:[^']|'')*)'"
+    match = re.search(prompt_pattern, ddl, re.DOTALL)
 
     if not match:
         raise ValueError(
             f"Could not extract system prompt from DDL for function: {function_name}. "
-            f"Ensure the function was created with MODEL_NAME and SYSTEM_PROMPT parameters."
+            f"Expected hardcoded system prompt in OBJECT_CONSTRUCT('role', 'system', 'content', '...')."
         )
 
-    prompt = match.group(1)
-    return prompt
+    return match.group(1)
+
+
+def get_model_from_ddl(session: Session, function_name: str) -> str:
+    """Extract the model name from a UDF's DDL.
+
+    Parses the hardcoded model from the function body where it appears
+    as ``model=>'model_name'``.
+
+    Args:
+        session: Snowpark session
+        function_name: Fully qualified function name
+
+    Returns:
+        The model name extracted from the DDL
+
+    Raises:
+        ValueError: If the DDL cannot be retrieved or parsed
+    """
+    ddl = get_function_ddl(session, function_name)
+    return extract_model_from_ddl_string(ddl, function_name)
+
+
+def extract_model_from_ddl_string(ddl: str, function_name: str = "") -> str:
+    """Extract the model name from a raw DDL string.
+
+    Looks for the pattern: model=>'model_name'
+    """
+    model_pattern = r"model\s*=>\s*'([^']*)'"
+    match = re.search(model_pattern, ddl, re.IGNORECASE)
+
+    if not match:
+        raise ValueError(
+            f"Could not extract model name from DDL for function: {function_name}. "
+            f"Expected hardcoded model in AI_COMPLETE(model=>'...')."
+        )
+
+    return match.group(1)
+
+
+def normalize_ddl_to_dollar_quoting(raw_ddl: str) -> str:
+    """Convert function DDL body to use ``$$`` delimiters.
+
+    ``GET_DDL`` may return the body wrapped in ``'...'`` with internal
+    single-quotes doubled (``''``).  Converting to ``$$`` delimiters
+    removes the escaping so the body can be manipulated with simple
+    regex patterns.
+
+    If the DDL already uses ``$$`` delimiters it is returned unchanged.
+    """
+    if "$$" in raw_ddl:
+        return raw_ddl
+
+    match = re.search(r"(\bAS\s+)'(.*)'(\s*;?\s*)$", raw_ddl, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return raw_ddl
+
+    prefix = raw_ddl[: match.start(0)] + match.group(1)
+    body = match.group(2).replace("''", "'")
+    suffix = match.group(3)
+
+    return f"{prefix}$$\n{body}\n$${suffix}"
+
+
+def create_temp_function_ddl(
+    original_ddl: str,
+    temp_function_name: str,
+    candidate_model: str,
+    candidate_prompt: str,
+) -> str:
+    """Create DDL for a temporary function by substituting model and prompt.
+
+    Takes the original function's DDL (raw from ``GET_DDL`` or locally
+    generated) and produces a new ``CREATE OR REPLACE FUNCTION`` statement
+    with:
+
+    - The function name replaced by ``temp_function_name``
+    - The model literal replaced by ``candidate_model``
+    - The system prompt replaced by ``candidate_prompt``
+
+    The DDL is first normalized to use ``$$`` body delimiters so that
+    internal single-quote patterns can be matched without double-escaping
+    issues.
+
+    Args:
+        original_ddl: The DDL of the original function (raw or normalized)
+        temp_function_name: Fully qualified name for the temp function
+        candidate_model: Model to substitute
+        candidate_prompt: System prompt to substitute
+
+    Returns:
+        SQL DDL string for the temp function
+    """
+    ddl = normalize_ddl_to_dollar_quoting(original_ddl)
+
+    # Replace function name in CREATE ... FUNCTION <name>(
+    ddl = re.sub(
+        r"(CREATE\s+OR\s+REPLACE\s+FUNCTION\s+)\S+(\s*\()",
+        rf"\g<1>{temp_function_name}\2",
+        ddl,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    # Replace model literal: model=>'old' -> model=>'new'
+    escaped_model = candidate_model.replace("'", "''")
+    ddl = re.sub(
+        r"(model\s*=>\s*')[^']*(')",
+        rf"\g<1>{escaped_model}\2",
+        ddl,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    # Replace system prompt: the content value in OBJECT_CONSTRUCT('role', 'system', 'content', '...')
+    escaped_prompt = candidate_prompt.replace("'", "''")
+    ddl = re.sub(
+        r"('role'\s*,\s*'system'\s*,\s*'content'\s*,\s*')(?:[^']|'')*(')",
+        rf"\g<1>{escaped_prompt}\2",
+        ddl,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    return ddl
 
 
 def _run_single_model_optimization(
@@ -842,6 +979,8 @@ def _run_single_model_optimization(
     seed_prompt: str,
     run_id: str,
     enable_detailed_tracking: bool = False,
+    aggregation_metric: str | None = None,
+    original_ddl: str = "",
 ) -> dict:
     """Run optimization for a single model. Designed to be called in parallel.
 
@@ -897,8 +1036,9 @@ def _run_single_model_optimization(
             )
             detailed_tracking_callback = detailed_tracker.track_detail
 
+    temp_fn = build_temp_function_name(function_name, "__OPT_TEMP")
+
     try:
-        # Pass explicit max_metric_calls (not auto) to ensure same budget for all models
         result = optimize(
             seed_candidate=seed_candidate,
             trainset=trainset,
@@ -907,8 +1047,10 @@ def _run_single_model_optimization(
             valset=valset,
             function_name=function_name,
             input_columns=input_columns,
-            auto=None,  # Don't use auto - use explicit budget
-            max_metric_calls=resolved_budget,  # Same budget for all models
+            auto=None,
+            max_metric_calls=resolved_budget,
+            original_ddl=original_ddl,
+            temp_function_name=temp_fn,
             model=model,
             reflection_model=reflection_model or model,
             no_improvement_patience=None,
@@ -959,44 +1101,73 @@ def _run_single_model_optimization(
             "reflection_model": reflection_model or model,
         }
 
-        # Test set evaluation using shared evaluate logic
-        if test_table:
+        subscores = getattr(result, "val_aggregate_subscores", None) or []
+        if (
+            subscores
+            and result.best_idx < len(subscores)
+            and subscores[result.best_idx]
+        ):
+            model_output["best_val_subscores"] = subscores[result.best_idx]
+
+        # Test set evaluation using temp functions
+        if test_table and original_ddl:
             eval_metric_options = (
                 dict(evaluator.kwargs) if hasattr(evaluator, "kwargs") else {}
             )
             if expected_columns:
                 eval_metric_options["expected_columns"] = expected_columns
 
-            seed_test_score = evaluate_ai_function(
-                session=session,
-                function_name=function_name,
-                test_table=test_table,
-                input_columns=input_columns,
-                label_column=label_column,
-                metric_name=evaluator.metric_name,
-                custom_metric_udf=evaluator.custom_metric_udf,
-                metric_options=eval_metric_options,
-                system_prompt=seed_prompt,
-                model_name_override=model,
-            )
-            best_test_score = evaluate_ai_function(
-                session=session,
-                function_name=function_name,
-                test_table=test_table,
-                input_columns=input_columns,
-                label_column=label_column,
-                metric_name=evaluator.metric_name,
-                custom_metric_udf=evaluator.custom_metric_udf,
-                metric_options=eval_metric_options,
-                system_prompt=result.best_candidate["instruction"],
-                model_name_override=model,
-            )
-            model_output["seed_test_score"] = seed_test_score
-            model_output["best_test_score"] = best_test_score
-            test_count = session.sql(f"SELECT COUNT(*) FROM {test_table}").collect()[0][
-                0
-            ]
-            model_output["num_test_examples"] = test_count
+            test_temp_fn = build_temp_function_name(function_name, "__OPT_TEST")
+
+            try:
+                # Evaluate seed: create temp function with seed model+prompt
+                seed_ddl = create_temp_function_ddl(
+                    original_ddl, test_temp_fn, model, seed_prompt
+                )
+                session.sql(seed_ddl).collect()
+                seed_test_score = evaluate_ai_function(
+                    session=session,
+                    function_name=test_temp_fn,
+                    test_table=test_table,
+                    input_columns=input_columns,
+                    label_column=label_column,
+                    metric_name=evaluator.metric_name,
+                    custom_metric_udf=evaluator.custom_metric_udf,
+                    metric_options=eval_metric_options,
+                    model_name=model,
+                )
+
+                # Evaluate best: create temp function with best model+prompt
+                best_ddl = create_temp_function_ddl(
+                    original_ddl,
+                    test_temp_fn,
+                    model,
+                    result.best_candidate["instruction"],
+                )
+                session.sql(best_ddl).collect()
+                best_test_score = evaluate_ai_function(
+                    session=session,
+                    function_name=test_temp_fn,
+                    test_table=test_table,
+                    input_columns=input_columns,
+                    label_column=label_column,
+                    metric_name=evaluator.metric_name,
+                    custom_metric_udf=evaluator.custom_metric_udf,
+                    metric_options=eval_metric_options,
+                    model_name=model,
+                )
+
+                model_output["seed_test_score"] = seed_test_score
+                model_output["best_test_score"] = best_test_score
+                test_count = session.sql(
+                    f"SELECT COUNT(*) FROM {test_table}"
+                ).collect()[0][0]
+                model_output["num_test_examples"] = test_count
+            finally:
+                try:
+                    session.sql(f"DROP FUNCTION IF EXISTS {test_temp_fn}").collect()
+                except Exception:
+                    pass
 
         return model_output
 
@@ -1028,7 +1199,7 @@ def _run_single_model_optimization(
         }
 
 
-@with_custom_ai_function_query_tag("RUN_OPTIMIZE_SPROC")
+@with_custom_ai_function_query_tag("SPROC_OPTIMIZATION")
 def run_optimization(
     session: Session,
     function_name: str,
@@ -1049,6 +1220,7 @@ def run_optimization(
     custom_metric_udf: str = None,
     enable_detailed_tracking: bool = False,
     run_id: str = None,
+    aggregation_metric: str | None = None,
 ) -> dict:
     """Run GEPA optimization on a prompt. SPROC handler function.
 
@@ -1083,6 +1255,10 @@ def run_optimization(
         enable_detailed_tracking: If True, log per-row evaluation details to
             {tracking_table}_DETAILS for debugging. Off by default for performance.
         run_id: Unique identifier for this optimization run. Auto-generated if not provided.
+        aggregation_metric: Optional batch-level classification metric to use for
+            selecting the best prompt. Supported: "accuracy", "f1-score". When provided,
+            the final best prompt is chosen by the highest value of this metric
+            across all candidates.
 
     Returns:
         Dict with optimization results including best_prompt and scores for each model
@@ -1103,7 +1279,11 @@ def run_optimization(
         return {"error": "reflection_model parameter is required", "status": "failed"}
 
     try:
-        seed_prompt = _get_prompt_from_ddl(session, function_name)
+        parsed_ddl = get_function_ddl(session, function_name, unescape=True)
+        seed_prompt = extract_prompt_from_ddl_string(parsed_ddl, function_name)
+        seed_model = extract_model_from_ddl_string(parsed_ddl, function_name)
+        # Raw DDL (not unescaped) is valid SQL for creating temp functions
+        original_ddl = get_function_ddl(session, function_name, unescape=False)
     except ValueError as e:
         return {"error": str(e), "status": "failed"}
 
@@ -1162,10 +1342,19 @@ def run_optimization(
             "status": "failed",
         }
 
+    valid_agg_metrics = {"accuracy", "f1-score"}
+    if aggregation_metric and aggregation_metric not in valid_agg_metrics:
+        return {
+            "error": f"Unknown aggregation_metric: '{aggregation_metric}'. "
+            f"Available: {', '.join(sorted(valid_agg_metrics))}",
+            "status": "failed",
+        }
+
     evaluator = Evaluator(
         metric_name,
         session=session,
         custom_metric_udf=custom_metric_udf,
+        aggregation_metric=aggregation_metric,
         **metric_opts,
     )
 
@@ -1233,6 +1422,8 @@ def run_optimization(
                 seed_prompt=seed_prompt,
                 run_id=run_id,
                 enable_detailed_tracking=enable_detailed_tracking,
+                aggregation_metric=aggregation_metric,
+                original_ddl=original_ddl,
             ): model
             for model in models
         }
@@ -1306,6 +1497,9 @@ def run_optimization(
         if overall_best_score >= 0
         else None,
     }
+
+    if aggregation_metric:
+        output["aggregation_metric"] = aggregation_metric
 
     if dataset_expected_columns:
         output["expected_columns"] = dataset_expected_columns

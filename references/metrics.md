@@ -78,6 +78,8 @@ score, feedback = compute_metric(metric_name, expected, predicted, **metric_opti
 
 ## Metric Selection Prompt
 
+**Always** present ALL 6 options below. If none of the built-in metrics fit the user's needs, a custom metric is the right answer.
+
 Present this menu when asking users to select a metric:
 
 ```
@@ -91,7 +93,7 @@ Built-in metrics:
 5. llm_judge - Use LLM to judge correctness (requires task description)
 
 Or:
-6. Create custom metric - Build your own evaluation metric
+6. Create custom metric - Build your own evaluation metric (e.g., match on specific output fields, weighted scoring, domain-specific logic)
 ```
 
 **If user selects option 6:** Load `references/custom_metrics.md` to guide through custom metric creation. Preserve workflow context (function name, tables, columns) and return to the calling workflow after creation.

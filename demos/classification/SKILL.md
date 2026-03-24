@@ -91,7 +91,7 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/generate_tox
   --test {test_rows}
 ```
 
-**Note:** Replace `<SKILL_DIRECTORY>` with the absolute path to the custom-ai-function skill directory, and `<CONNECTION_NAME>` with the active Snowflake connection.
+**Note:** Replace `<SKILL_DIRECTORY>` with the absolute path to the cortex-ai-function-studio skill directory, and `<CONNECTION_NAME>` with the active Snowflake connection.
 
 Verify creation:
 ```sql
@@ -169,12 +169,12 @@ Results table: DEMO_DETECT_TOXICITY_EVAL_RESULTS
 - `function_model`: `llama3.1-70b` (or user's choice from Step 4)
 - `test_table`: `{database}.{schema}.DEMO_TOXICITY_TEST`
 - `input_columns`: `['TEXT']`
-- `expected_column`: `EXPECTED_OUTPUT`
+- `label_column`: `EXPECTED_OUTPUT`
 - `metric_name`: `exact_match`
 - `results_table`: `{database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS`
 - `stage_name`: `{database}.{schema}.AI_FUNCTIONS`
 
-The create workflow should have set up the stage, created the SPROCs as needed before coming to this evaluate workflow. Then, the evaluate workflow will run the evaluation and present results. **Skip Step 8 (next steps)** in the evaluate workflow -- return here after results are presented.
+The create workflow should have set up the stage, created the SPROCs as needed before coming to this evaluate workflow. Then, the evaluate workflow will run the evaluation and present results. **Skip Step 7 (next steps)** in the evaluate workflow -- return here after results are presented.
 
 Once evaluation is done, review the results. Show the scores to the user. Offer to see what cases did not match:
 ```
@@ -214,8 +214,8 @@ on the budget selected.
 Please confirm or modify any settings you'd like to change:
 
 Auto budget: medium (~5-10 minutes)
-Tracking table: DEMO_DETECT_TOXICITY_GEPA_TRACKING
-Models: ['llama3.1-8b', 'llama3.1-70b', 'claude-4-sonnet']
+Tracking table: DEMO_DETECT_TOXICITY_OPT_TRACKING
+Models: ['claude-haiku-4-5', 'llama3.1-70b', 'llama3.1-8b', 'claude-sonnet-4-5']
 
 Options:
 1. Yes - Run GEPA optimization with these settings
@@ -234,13 +234,13 @@ If yes, **load `optimize/SKILL.md`** and follow its workflow from **Step 6 onwar
 - `input_columns`: `['TEXT']`
 - `label_column`: `EXPECTED_OUTPUT`
 - `metric_name`: `exact_match`
-- `models`: `['llama3.1-8b', 'llama3.1-70b', 'claude-4-sonnet']`
-- `reflection_model`: `snowflake-llama-3.1-405b`
+- `models`: `['claude-haiku-4-5', 'llama3.1-70b', 'llama3.1-8b', 'claude-sonnet-4-5']`
+- `reflection_model`: `claude-opus-4-5`
 - `auto_budget`: `medium`
-- `tracking_table`: `{database}.{schema}.DEMO_DETECT_TOXICITY_GEPA_TRACKING`
+- `tracking_table`: `{database}.{schema}.DEMO_DETECT_TOXICITY_OPT_TRACKING`
 - `stage_name`: `{database}.{schema}.AI_FUNCTIONS`
 
-The create workflow should have uploaded code and created the SPROCs as needed. Then, the optimize workflow will run the optimization and present results. **Skip Step 11 (next steps)** in the optimize workflow -- return here after results are presented and the user has decided whether to apply the optimized prompt.
+The create workflow should have uploaded code and created the SPROCs as needed. Then, the optimize workflow will run the optimization and present results. **Skip Step 9 (next steps)** in the optimize workflow -- return here after results are presented and the user has decided whether to apply the optimized prompt.
 
 After optimization completes, present the results and compare the before and after scores. Query the tracking table to show the optimization journey:
 ```sql
@@ -249,7 +249,7 @@ SELECT
     MODEL_NAME,
     METRIC_SCORE AS SCORE,
     LEFT(PROMPT_TEXT, 100) AS PROMPT_PREVIEW
-FROM {database}.{schema}.DEMO_DETECT_TOXICITY_GEPA_TRACKING
+FROM {database}.{schema}.DEMO_DETECT_TOXICITY_OPT_TRACKING
 WHERE METRIC_SCORE IS NOT NULL
 ORDER BY METRIC_SCORE DESC
 LIMIT 10;
@@ -269,7 +269,7 @@ This will drop:
 - {database}.{schema}.DEMO_TOXICITY_TEST
 - {database}.{schema}.DEMO_DETECT_TOXICITY (function)
 - {database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS (if created)
-- {database}.{schema}.DEMO_DETECT_TOXICITY_GEPA_TRACKING (if created)
+- {database}.{schema}.DEMO_DETECT_TOXICITY_OPT_TRACKING (if created)
 
 Options:
 1. Yes - Clean up all demo objects
@@ -284,7 +284,7 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_TOXICITY_TRAIN;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_TOXICITY_TEST;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_DETECT_TOXICITY(VARCHAR);
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_DETECT_TOXICITY_GEPA_TRACKING;
+DROP TABLE IF EXISTS {database}.{schema}.DEMO_DETECT_TOXICITY_OPT_TRACKING;
 ```
 
 ### Step 8: Next Steps

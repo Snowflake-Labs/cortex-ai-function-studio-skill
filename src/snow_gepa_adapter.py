@@ -5,11 +5,13 @@
 """Snowflake adapter for GEPA optimization.
 
 This module provides the adapter classes that connect GEPA's optimization
-engine to Snowflake AI functions via UDF invocation with MODEL_NAME and
-SYSTEM_PROMPT overrides.
+engine to Snowflake AI functions. During optimization, temporary functions
+are created with candidate model/prompt combinations baked in, rather than
+overriding parameters at call time.
 """
 
 from collections.abc import Callable, Mapping, Sequence
+import json
 from typing import Any, TypedDict
 
 from gepa.core.adapter import EvaluationBatch, GEPAAdapter
@@ -17,6 +19,7 @@ from metrics_core import (
     quote_identifier,
     to_text,
     build_object_construct_expr,
+    compute_classification_objectives,
     compute_metric,
     compute_metric_batch,
     get_table_column_names,
@@ -98,11 +101,13 @@ class Evaluator:
         metric_name: str,
         session: Session | None = None,
         custom_metric_udf: str | None = None,
+        aggregation_metric: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.metric_name = metric_name
         self.session = session
         self.custom_metric_udf = custom_metric_udf
+        self.aggregation_metric = aggregation_metric
         self.kwargs = kwargs
 
     def __call__(self, data: "SnowflakeDataInst", response: str) -> EvaluationResult:
@@ -142,7 +147,30 @@ class Evaluator:
             self.custom_metric_udf,
             **self.kwargs,
         )
-        return [EvaluationResult(score=s, feedback=f) for s, f in results]
+        eval_results = [EvaluationResult(score=s, feedback=f) for s, f in results]
+
+        if self.aggregation_metric:
+            label_pairs = [
+                (expected, predicted)
+                for (expected, predicted), _ in zip(batch_items, results)
+            ]
+            # For classification tasks, always compute precision, recall, F1, and accuracy across each evaluation batch.
+            objectives = compute_classification_objectives(label_pairs)
+            if objectives:
+                for er in eval_results:
+                    er.objective_scores = objectives
+
+                # If aggregation_metric is requested, but not "accuracy",
+                # override model scores to use requested aggregation metric to filter candidates
+                if (
+                    self.aggregation_metric != "accuracy"
+                    and self.aggregation_metric in objectives
+                ):
+                    agg_score = objectives[self.aggregation_metric]
+                    for er in eval_results:
+                        er.score = agg_score
+
+        return eval_results
 
 
 class SnowflakeLLM:
@@ -181,9 +209,9 @@ class SnowflakeAdapter(
 ):
     """GEPA adapter for Snowflake AI functions.
 
-    This adapter evaluates candidates by calling the target UDF with
-    MODEL_NAME and SYSTEM_PROMPT overrides, then scores responses using
-    a user-provided evaluator function.
+    This adapter evaluates candidates by creating temporary functions with
+    the candidate model/prompt baked in, then calling the temp function and
+    scoring responses using a user-provided evaluator function.
     """
 
     def __init__(
@@ -193,6 +221,8 @@ class SnowflakeAdapter(
         function_name: str,
         input_columns: list[str],
         model: str,
+        original_ddl: str,
+        temp_function_name: str,
         tracking_callback: Callable[[dict[str, str], float], None] | None = None,
         detailed_tracking_callback: Callable[[dict], None] | None = None,
     ) -> None:
@@ -201,6 +231,8 @@ class SnowflakeAdapter(
         self.function_name = function_name
         self.input_columns = input_columns
         self.model = model
+        self.original_ddl = original_ddl
+        self.temp_function_name = temp_function_name
         self.tracking_callback = tracking_callback
         self.detailed_tracking_callback = detailed_tracking_callback
 
@@ -208,63 +240,77 @@ class SnowflakeAdapter(
         """Formats inputs dict as string for tracking/reflection."""
         return "\n".join(f"{k}: {v}" for k, v in inputs.items())
 
+    def _ensure_temp_function(self, system_prompt: str) -> None:
+        """Create or replace the temp function with the given model and prompt."""
+        from snow_gepa_optimize import create_temp_function_ddl
+
+        ddl = create_temp_function_ddl(
+            self.original_ddl, self.temp_function_name, self.model, system_prompt
+        )
+        self.session.sql(ddl).collect()
+
+    def cleanup(self) -> None:
+        """Drop the temporary function used during optimization."""
+        try:
+            self.session.sql(
+                f"DROP FUNCTION IF EXISTS {self.temp_function_name}"
+            ).collect()
+        except Exception:
+            pass
+
     def _call_udf_batch(
         self,
         system_prompt: str,
         batch: list[SnowflakeDataInst],
     ) -> list[str]:
-        """Calls the target UDF for all inputs in a single query.
+        """Calls a temp function for all inputs in a single query.
 
-        Uses MODEL_NAME and SYSTEM_PROMPT override parameters to test
-        different prompt candidates without recreating the function.
+        Creates (or replaces) a temporary function with the candidate
+        model and prompt baked in, then calls it without overrides.
         """
         if not batch:
             return []
 
-        # Build column expressions for the UDF call
-        # Each input column is referenced from the VALUES table
+        self._ensure_temp_function(system_prompt)
+
         input_col_refs = ", ".join(
             [f"t.{quote_identifier(col)}" for col in self.input_columns]
         )
 
-        # Build VALUES clause with all input data
-        # Format: (idx, col1_val, col2_val, ...)
-        value_placeholders = []
+        # Build UNION ALL clause with all input data
+        # Format: SELECT idx AS idx, col1_val AS col1, col2_val AS col2, ...
+        select_statements = []
         bind_params: list[object] = []
 
         for idx, data in enumerate(batch):
-            col_qmarks = ", ".join(["?"] * len(self.input_columns))
-            value_placeholders.append(f"({idx}, {col_qmarks})")
+            col_exprs = []
             for col in self.input_columns:
-                bind_params.append(data["inputs"].get(col, ""))
+                val = data["inputs"].get(col, "")
+                if isinstance(val, (list, tuple)):
+                    col_exprs.append(f"PARSE_JSON(?) AS {quote_identifier(col)}")
+                    bind_params.append(json.dumps(val))
+                else:
+                    col_exprs.append(f"? AS {quote_identifier(col)}")
+                    bind_params.append(val)
+            select_statements.append(f"SELECT {idx} AS idx, {', '.join(col_exprs)}")
 
-        values_clause = ", ".join(value_placeholders)
+        subquery = " UNION ALL ".join(select_statements)
 
-        # Build the SQL query that calls the UDF with overrides
         sql = f"""
             SELECT
                 t.idx,
-                {self.function_name}(
-                    {input_col_refs},
-                    MODEL_NAME => '{self.model}',
-                    SYSTEM_PROMPT => ?
+                {self.temp_function_name}(
+                    {input_col_refs}
                 ) AS result
-            FROM (
-                SELECT * FROM VALUES {values_clause}
-                AS t(idx, {', '.join([quote_identifier(col) for col in self.input_columns])})
-            ) AS t
+            FROM ({subquery}) AS t
             ORDER BY t.idx
         """
 
-        # System prompt is the first bind parameter
-        all_params = [system_prompt] + bind_params
-
-        results = self.session.sql(sql, params=all_params).collect()
+        results = self.session.sql(sql, params=bind_params).collect()
 
         responses = []
         for row in results:
             result_val = row["RESULT"]
-            # Convert result to string (handles VARCHAR, VARIANT, etc.)
             responses.append(to_text(result_val))
 
         return responses
@@ -329,6 +375,9 @@ class SnowflakeAdapter(
             outputs=outputs,
             scores=scores,
             trajectories=trajectories,
+            objective_scores=objective_scores
+            if any(o is not None for o in objective_scores)
+            else None,
         )
 
     def make_reflective_dataset(
@@ -404,9 +453,18 @@ def load_dataset(
 
     dataset = []
     for row in rows:
-        inputs = {
-            col: str(row[col]) if row[col] is not None else "" for col in input_columns
-        }
+        inputs = {}
+        for col in input_columns:
+            val = row[col]
+            if val is None:
+                inputs[col] = ""
+            elif isinstance(val, str) and val.strip().startswith("["):
+                try:
+                    inputs[col] = json.loads(val)
+                except json.JSONDecodeError:
+                    inputs[col] = val
+            else:
+                inputs[col] = val
         answer = to_text(row["ANSWER"])
         dataset.append(SnowflakeDataInst(inputs=inputs, answer=answer))
 

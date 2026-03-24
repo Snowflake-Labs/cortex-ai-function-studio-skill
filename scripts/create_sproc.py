@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -28,6 +29,13 @@ from textwrap import dedent
 
 from jinja2 import Template
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = SCRIPT_DIR.parent / "src"
+sys.path.insert(0, str(SRC_DIR))
+from custom_ai_function_utils import (
+    customai_query_tag_logging,
+    create_session_from_connection,
+)
 
 SPROC_TEMPLATES = {
     "optimize": "optimize_sproc.sql.j2",
@@ -36,6 +44,8 @@ SPROC_TEMPLATES = {
     "optimize_async": "optimize_async_sproc.sql.j2",
     "evaluate_async": "evaluate_async_sproc.sql.j2",
 }
+
+COCO_SESSION_TAG_PREFIX = "__CUSTOM_AI_FUNCTION_COCO_SESSION_ID_"
 
 
 def validate_identifier(name: str, label: str) -> str:
@@ -106,32 +116,39 @@ def render_sproc_sql(
     return rendered_sql
 
 
-def execute_sql(sql: str, connection_name: str) -> None:
+def execute_sql(
+    sql: str,
+    connection_name: str,
+    *,
+    coco_session_id: str | None = None,
+) -> None:
     """Execute SQL using Snowpark.
+
+    When coco_session_id is provided, temporarily appends a query tag segment
+    using the `customai_query_tag_logging` contextmanager.
 
     Args:
         sql: SQL to execute
         connection_name: Snowflake connection name
+        coco_session_id: Cortex Code session id (from env CORTEX_SESSION_ID)
     """
-    try:
-        import snowflake.connector
-    except ImportError:
-        print(
-            "Error: snowflake-connector-python is required for --execute",
-            file=sys.stderr,
-        )
-        print("Install with: pip install snowflake-connector-python", file=sys.stderr)
-        sys.exit(1)
-
     print(f"Connecting to Snowflake using connection: {connection_name}")
-    conn = snowflake.connector.connect(connection_name=connection_name)
+    session = create_session_from_connection(connection_name)
 
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql)
+        if coco_session_id:
+            with customai_query_tag_logging(
+                session,
+                coco_session_id,
+                tag_prefix=COCO_SESSION_TAG_PREFIX,
+            ):
+                session.sql(sql).collect()
+        else:
+            session.sql(sql).collect()
+
         print("SPROC created successfully.")
     finally:
-        conn.close()
+        session.close()
 
 
 def main():
@@ -200,7 +217,13 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-        execute_sql(sql, args.connection)
+
+        coco_session_id = os.environ.get("CORTEX_SESSION_ID")
+        execute_sql(
+            sql,
+            args.connection,
+            coco_session_id=coco_session_id,
+        )
     elif args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(sql)

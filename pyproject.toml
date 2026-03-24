@@ -1,7 +1,7 @@
 [project]
-name = "custom-ai-function"
+name = "cortex-ai-function-studio"
 version = "0.1.0"
-description = "Create, evaluate, and optimize custom AI functions using Snowflake Cortex AI_COMPLETE"
+description = "Cortex AI Function Studio: Create, evaluate, and optimize custom AI functions using Snowflake Cortex AI_COMPLETE"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "datasets>=2.0.0",

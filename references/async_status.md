@@ -109,7 +109,7 @@ ORDER BY MODEL_NAME, CREATED_AT;
 To see all recent async jobs:
 
 ```sql
--- List recent evaluation/optimization tasks
+-- List recent evaluation/optimization tasks (use {database} prefix)
 SELECT 
     NAME AS RUN_ID,
     STATE,
@@ -117,7 +117,7 @@ SELECT
     COMPLETED_TIME,
     TIMESTAMPDIFF('SECOND', SCHEDULED_TIME, COALESCE(COMPLETED_TIME, CURRENT_TIMESTAMP())) AS DURATION_SECONDS,
     ERROR_MESSAGE
-FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
+FROM TABLE({database}.INFORMATION_SCHEMA.TASK_HISTORY(
     RESULT_LIMIT => 20
 ))
 WHERE NAME LIKE 'ai_func_eval_%' OR NAME LIKE 'ai_func_opt_%'
@@ -157,6 +157,7 @@ If state is `FAILED`:
 1. Check `ERROR_MESSAGE` for details
 2. Common issues:
    - **Warehouse privilege error** ("USAGE privilege on the task's warehouse must be granted to owner role"): The async SPROC now detects this before creating the task and returns an actionable error. If you see this in task history from an older SPROC version, it means the current role does not have a direct USAGE grant on the warehouse. Snowflake Tasks run under the owner role and require an explicit grant — session-level warehouse access via role hierarchy is not sufficient. Fix: either grant access (`GRANT USAGE ON WAREHOUSE {wh} TO ROLE {role}`) or re-run with a warehouse the role has access to via the `WAREHOUSE_NAME` parameter. To find usable warehouses: `SHOW GRANTS TO ROLE {role}` and look for USAGE on WAREHOUSE.
+   - **Task timed out**: The async task exceeded its timeout limit (`USER_TASK_TIMEOUT_MS`). The default is 4 hours (240 minutes). Re-run with a larger `TIMEOUT_MINUTES` value, or reduce dataset size / optimization budget
    - Warehouse not available
    - Table/function not found
    - Out of memory (try smaller sample_size)
@@ -236,7 +237,7 @@ Inform the user the job is still running. Show elapsed time from `SCHEDULED_TIME
 ```
 Your job is still running ({elapsed} so far).
 
-You can check again anytime by loading the custom AI function skill and saying:
+You can check again anytime by loading the Cortex AI Function Studio and saying:
 "check status of {run_id}"
 ```
 

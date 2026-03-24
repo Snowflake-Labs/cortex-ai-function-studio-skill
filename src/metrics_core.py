@@ -9,6 +9,7 @@ No external dependencies except stdlib.
 """
 
 from collections.abc import Callable
+from collections import Counter
 import re
 from textwrap import dedent
 import time
@@ -20,7 +21,7 @@ import json
 
 from custom_ai_function_utils import with_custom_ai_function_query_tag, RobustAIComplete
 
-LLM_JUDGE_DEFAULT_MODEL = "llama3.1-70b"
+LLM_JUDGE_DEFAULT_MODEL = "claude-sonnet-4-5"
 LLM_JUDGE_DEFAULT_TEMP = 0.0
 LLM_JUDGE_DEFAULT_MAX_TOKENS = 8192
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
@@ -302,34 +303,26 @@ def validate_input_columns(
 
 
 def resolve_expected_column(table_columns: set[str], expected_column: str) -> str:
-    """Resolve the expected/label column name with ``EXPECTED_`` prefix fallback.
+    """Normalize the expected/label column name by stripping surrounding quotes.
 
-    Strips quotes, then checks for the column directly, with an ``EXPECTED_``
-    prefix, or the bare ``EXPECTED`` column.
+    Callers are responsible for validating that the returned name exists in the
+    target table.  No implicit fallback is performed — if the column is wrong,
+    the caller should surface a clear error.
 
     Args:
-        table_columns: Set of uppercase column names.  If empty, returns
-            the stripped column name unchanged.
+        table_columns: Unused (kept for call-site compatibility).
         expected_column: Raw column name (may have quotes).
 
     Returns:
-        Resolved column name.
+        Quote-stripped column name.
     """
-    col_name = str(expected_column).strip('"').strip("'")
-    if not table_columns or col_name.upper() in table_columns:
-        return col_name
-    prefixed = f"EXPECTED_{col_name.upper()}"
-    if prefixed in table_columns:
-        return prefixed
-    if "EXPECTED" in table_columns:
-        return "EXPECTED"
-    return col_name
+    return str(expected_column).strip('"').strip("'")
 
 
 def resolve_multi_output_columns(
     table_columns: set[str], expected_columns: list[str]
 ) -> list[tuple[str, str]]:
-    """Resolve multi-output column names with ``EXPECTED_`` prefix fallback.
+    """Resolve multi-output column names against table columns.
 
     Args:
         table_columns: Set of uppercase column names.  If empty, columns
@@ -337,18 +330,16 @@ def resolve_multi_output_columns(
         expected_columns: List of output column names to resolve.
 
     Returns:
-        List of ``(output_key, resolved_table_col)`` pairs.
+        List of ``(output_key, resolved_table_col)`` pairs.  Columns not
+        found in the table are silently dropped.
     """
     if not table_columns:
         return [(str(c), str(c)) for c in expected_columns]
     pairs: list[tuple[str, str]] = []
     for col in expected_columns:
         upper = str(col).upper()
-        prefixed = f"EXPECTED_{upper}"
         if upper in table_columns:
             pairs.append((str(col), upper))
-        elif prefixed in table_columns:
-            pairs.append((str(col), prefixed))
     return pairs
 
 
@@ -719,6 +710,104 @@ def llm_judge_core(
     return results[0] if results else (0.0, "Evaluation failed")
 
 
+def compute_classification_objectives(items: list[tuple[str, str]]) -> dict[str, float]:
+    """Compute precision, recall, F1, and accuracy from expected/predicted label pairs.
+
+    For binary classification, auto-detects the positive class as the less
+    frequent expected label (standard convention for imbalanced data).
+    For multi-class, computes macro-averaged metrics across all classes.
+
+    Args:
+        items: List of (expected, predicted) string pairs.
+
+    Returns:
+        Dict with keys: accuracy, precision, recall, f1.
+        Returns empty dict if input is empty.
+    """
+    if not items:
+        return {}
+
+    expected_labels, predicted_labels = zip(
+        *[(e.strip().lower(), p.strip().lower()) for e, p in items]
+    )
+
+    accuracy = sum(
+        1 for e, p in zip(expected_labels, predicted_labels) if e == p
+    ) / len(items)
+
+    all_labels = set(expected_labels) | set(predicted_labels)
+
+    if len(all_labels) == 2:
+        # Binary classification
+        label_counts = Counter(expected_labels)
+        pos = min(label_counts, key=label_counts.get)
+
+        tp = sum(
+            1
+            for e, p in zip(expected_labels, predicted_labels)
+            if e == pos and p == pos
+        )
+        fp = sum(
+            1
+            for e, p in zip(expected_labels, predicted_labels)
+            if e != pos and p == pos
+        )
+        fn = sum(
+            1
+            for e, p in zip(expected_labels, predicted_labels)
+            if e == pos and p != pos
+        )
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (
+            (2 * precision * recall / (precision + recall))
+            if (precision + recall) > 0
+            else 0.0
+        )
+    else:
+        # Multi-class
+        per_class_precision = []
+        per_class_recall = []
+        per_class_f1 = []
+
+        for label in all_labels:
+            tp = sum(
+                1
+                for e, p in zip(expected_labels, predicted_labels)
+                if e == label and p == label
+            )
+            fp = sum(
+                1
+                for e, p in zip(expected_labels, predicted_labels)
+                if e != label and p == label
+            )
+            fn = sum(
+                1
+                for e, p in zip(expected_labels, predicted_labels)
+                if e == label and p != label
+            )
+
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+
+            per_class_precision.append(p)
+            per_class_recall.append(r)
+            per_class_f1.append(f)
+
+        precision = sum(per_class_precision) / len(per_class_precision)
+        recall = sum(per_class_recall) / len(per_class_recall)
+        f1 = sum(per_class_f1) / len(per_class_f1)
+
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1-score": f1,
+    }
+
+
 def compute_metric(
     metric_name: str,
     expected: str,
@@ -819,11 +908,14 @@ def evaluate(
     metric_options: dict | None = None,
     max_length: int = 500,
     custom_metric_udf: str | None = None,
-    system_prompt: str | None = None,
-    model_name_override: str | None = None,
     run_id: str | None = None,
 ) -> float:
     """Evaluate an AI function against a test dataset.
+
+    The function is called directly without parameter overrides. The model
+    and system prompt are baked into the function body. To evaluate with a
+    different model or prompt, create a temporary function and pass its
+    name as ``function_name``.
 
     Args:
         session: Snowpark session
@@ -832,16 +924,12 @@ def evaluate(
         input_columns: List of column names to pass to function
         label_column: Column containing expected outputs
         metric_name: Metric to use for evaluation
-        model_name: Model to use for evaluation
+        model_name: Model name for results tracking metadata
         sample_size: Number of rows to evaluate (None = all)
         results_table: Table to save detailed results (None = don't save)
         metric_options: Metric-specific options
         max_length: Max length for truncated fields (default 500)
         custom_metric_udf: Fully qualified name of a custom metric UDF.
-        system_prompt: Optional system prompt override passed to the UDF via
-            its ``SYSTEM_PROMPT`` named argument.
-        model_name_override: Optional model name override passed to the UDF
-            via its ``MODEL_NAME`` named argument.
         run_id: Optional external run ID for tracking (auto-generated if None).
     """
     metric_opts, output_field, multi_expected_cols = parse_metric_options(
@@ -874,18 +962,7 @@ def evaluate(
                 f"available_columns={sorted(table_columns)}"
             )
 
-    bind_params: list[object] = []
-    if system_prompt is not None or model_name_override is not None:
-        override_parts: list[str] = []
-        if model_name_override is not None:
-            override_parts.append("MODEL_NAME => ?")
-            bind_params.append(model_name_override)
-        if system_prompt is not None:
-            override_parts.append("SYSTEM_PROMPT => ?")
-            bind_params.append(system_prompt)
-        udf_call = f"{base_function_name}({columns}, {', '.join(override_parts)})"
-    else:
-        udf_call = f"{base_function_name}({columns})"
+    udf_call = f"{base_function_name}({columns})"
 
     query = f"""
         SELECT 
@@ -898,10 +975,7 @@ def evaluate(
     if sample_size:
         query += f" LIMIT {sample_size}"
 
-    if bind_params:
-        results_data = session.sql(query, params=bind_params).collect()
-    else:
-        results_data = session.sql(query).collect()
+    results_data = session.sql(query).collect()
 
     if not results_data:
         return 0.0
@@ -1036,7 +1110,7 @@ def evaluate(
     return avg_score
 
 
-@with_custom_ai_function_query_tag("EVALUTE_SPROC_HANDLER")
+@with_custom_ai_function_query_tag("SPROC_EVALUATE")
 def evaluate_handler(
     session,
     function_name: str,

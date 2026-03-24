@@ -1,7 +1,7 @@
 ---
 name: data-preparation
 description: "Prepare train/test data for AI function evaluation and optimization."
-parent_skill: custom-ai-function
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -159,7 +159,7 @@ After user confirms column mapping, verify all mapped columns exist in the relev
 - If `test_table` provided, validate same columns exist there too
 
 **If any column is missing:**
-Display to the user
+Present the mismatch to the user using `ask_user_question` with remediation options:
 ```
 Column mismatch detected:
 - Table ({table_name}) columns: [list]
@@ -172,6 +172,30 @@ Options:
 ```
 
 **⚠️ STOP**: Do NOT proceed if columns don't match — the workflow will fail.
+
+### Multi-Column Truth Aggregation
+
+When the user's table has multiple truth columns that correspond to keys in a multi-key function output (e.g., separate `SENTIMENT`, `CONFIDENCE`, `RATIONALE` columns), these must be combined into a single VARIANT `label_column` before passing data to evaluate or optimize.
+
+Help the user create a view that aggregates the truth columns using `OBJECT_CONSTRUCT`:
+
+```sql
+CREATE OR REPLACE VIEW {database}.{schema}.{table_name}_WITH_EXPECTED AS
+SELECT *,
+    OBJECT_CONSTRUCT(
+        'SENTIMENT', "SENTIMENT",
+        'CONFIDENCE', "CONFIDENCE",
+        'RATIONALE', "RATIONALE"
+    ) AS EXPECTED
+FROM {database}.{schema}.{original_table};
+```
+
+Then use the view as the table and `EXPECTED` as the `label_column`.
+
+Individual keys can be verified with VARIANT syntax:
+```sql
+SELECT EXPECTED:SENTIMENT, EXPECTED:CONFIDENCE FROM {view_name} LIMIT 5;
+```
 
 ---
 

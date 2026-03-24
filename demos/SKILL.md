@@ -1,7 +1,7 @@
 ---
 name: demos
 description: "Interactive demos showcasing custom AI function capabilities with concrete example use cases."
-parent_skill: custom-ai-function
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -24,8 +24,9 @@ Which demo would you like to try?
 
 1. **PII Redaction** - Build a function that redacts sensitive information (names, emails, SSNs)
 2. **Content Moderation** - Detect toxic content across 55 languages
-3. **Image Summarization** - Summarize image content as text (coming soon)
-4. **Sentiment Analysis** - Analyze text sentiment (coming soon)
+3. **Insurance Claim Routing** - Build and optimize a claim routing AI function with async task execution
+4. **Image Summarization** - Summarize image content as text (coming soon)
+5. **Sentiment Analysis** - Analyze text sentiment (coming soon)
 ```
 
 ### Step 2: Route
@@ -33,6 +34,8 @@ Which demo would you like to try?
 **If PII Redaction:** Load `redaction/SKILL.md`
 
 **If Content Moderation:** Load `classification/SKILL.md`
+
+**If Insurance Claim Routing:** Load `insurance-claim-routing/SKILL.md`
 
 **If Image Summarization:** Inform user this demo is coming soon, offer to try another demo instead.
 

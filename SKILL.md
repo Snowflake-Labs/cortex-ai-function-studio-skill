@@ -1,11 +1,11 @@
 ---
-name: custom-ai-function
-description: "Create, evaluate, and optimize custom AI functions using Snowflake Cortex AI Complete. Use when: building LLM-powered functions, evaluating AI function performance, tuning prompts, selecting models, generating pseudo labels for input-only tables. Triggers: custom ai function, user defined ai function, build my own llm function, evaluate ai function, tune ai function, optimize ai function, pseudo label table."
+name: cortex-ai-function-studio
+description: "Create, evaluate, and optimize custom AI functions using Snowflake Cortex AI Complete. Use when: building LLM-powered functions, evaluating AI function performance, tuning prompts, selecting models, checking async job status. Triggers: ai function builder, custom ai function, user defined ai function, build my own llm function, evaluate ai function, tune ai function, optimize ai function, demo ai function, resume ai function job."
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
-# Custom AI Function
+# Cortex AI Function Studio
 
 Build, evaluate, and optimize AI functions powered by Snowflake Cortex AI Complete.
 
@@ -15,9 +15,9 @@ Load when user wants to work with LLM-powered functions: "custom ai function", "
 
 Display to the user:
 ```
-This skill guides you through the full lifecycle of custom AI functions. The intended workflow is **create → evaluate → optimize**: 
-first define your function with a system prompt, then measure its performance against labeled data, and finally improve 
-it through automated prompt tuning and model selection. 
+The Cortex AI Function Studio guides you through the full lifecycle of custom AI functions. The intended workflow is **create → evaluate → optimize**.
+During creation, you choose how to build: **Direct** (simple AI_COMPLETE call) or **Agent Research** (I research and propose approaches 
+with SQL pre/post-processing — you can also specify your own strategy). After building, evaluate against labeled data, then optimize with automated prompt tuning and model selection.
 If you're new to custom AI functions, you can start with a **demo** to see a worked example end-to-end.
 ```
 
@@ -25,9 +25,9 @@ If you're new to custom AI functions, you can start with a **demo** to see a wor
 
 ### Step 0: Check Prerequisites
 
-**⚠️ STOP**: Before proceeding, verify all prerequisites are installed by loading `references/prerequisites.md`.
+**⚠️ STOP**: Before proceeding, verify all prerequisites by loading `references/prerequisites.md`. This checks the Snowflake connection, tool installation, collects the target database/schema, and verifies the user's role has the necessary privileges.
 
-If any are missing, follow the installation instructions in the prerequisites file.
+If any prerequisites or privileges are missing, follow the instructions in the prerequisites file. Do not proceed until all checks pass.
 
 ### Step 1: Detect Intent
 
@@ -63,7 +63,7 @@ What would you like to do?
 
 ## Capabilities
 
-- **Create**: Define AI functions from table or manual spec
+- **Create**: Two modes — Direct (simple AI_COMPLETE) or Agent Research (research + propose SQL UDF structures, with option to specify your own)
 - **Evaluate**: Measure with pre-built or custom metrics via SQL
 - **Optimize**: Improve functions using prompt optimization and perform cost/quality model comparison 
 - **Demo**: Interactive walkthroughs with example use cases
