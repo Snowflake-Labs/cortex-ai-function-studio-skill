@@ -313,7 +313,7 @@ def _extract_response_schema_from_function(
     if not rf_match:
         raise ValueError(
             "Could not infer output schema: function DDL has no response_format. "
-            "Recreate function with structured CORTEX.COMPLETE response_format."
+            "Recreate function with a structured response_format."
         )
 
     start = rf_match.end()
@@ -846,6 +846,9 @@ def _generate_examples_for_difficulty(
 ) -> tuple[list[dict], list[str]]:
     """Generate examples for a specified difficulty level.
 
+    Initial batches run in parallel via a thread pool. If any batch fails or
+    returns fewer examples than requested, sequential retry calls fill the gap.
+
     Args:
         session: Snowpark session
         task_description: Description of the AI function task
@@ -861,12 +864,48 @@ def _generate_examples_for_difficulty(
     errors: list[str] = []
 
     # Generate in batches, allowing multiple retries across batches.
-    # We cap total model calls at ~3x the number of batches required.
     required_batches = max(1, (num_examples + batch_size - 1) // batch_size)
-    max_calls = max(3, required_batches * 3)
+    batch_specs: list[tuple[int, int]] = []  # (batch_idx, batch_size)
+    remaining = num_examples
+    for i in range(required_batches):
+        current = min(batch_size, remaining)
+        batch_specs.append((i, current))
+        remaining -= current
 
-    call_idx = 0
-    while len(examples) < num_examples and call_idx < max_calls:
+    with ThreadPoolExecutor(max_workers=required_batches) as executor:
+        future_to_idx = {
+            executor.submit(
+                _generate_batch,
+                session=session,
+                task_description=task_description,
+                batch_size=size,
+                batch_idx=idx,
+                model=model,
+                difficulty=difficulty,
+                input_columns=input_columns,
+                output_keys=output_keys,
+                output_properties=output_properties,
+            ): idx
+            for idx, size in batch_specs
+        }
+
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                batch_examples = future.result()
+                if batch_examples:
+                    for ex in batch_examples:
+                        ex["difficulty"] = difficulty
+                    examples.extend(batch_examples)
+                else:
+                    errors.append(f"{difficulty} batch {idx + 1} returned 0 examples")
+            except Exception as e:
+                errors.append(f"{difficulty} batch {idx + 1} error: {str(e)}")
+
+    max_retries = required_batches * 2
+    retry_idx = 0
+    call_offset = required_batches
+    while len(examples) < num_examples and retry_idx < max_retries:
         remaining = num_examples - len(examples)
         current_batch_size = min(batch_size, remaining)
 
@@ -875,7 +914,7 @@ def _generate_examples_for_difficulty(
                 session=session,
                 task_description=task_description,
                 batch_size=current_batch_size,
-                batch_idx=call_idx,
+                batch_idx=call_offset + retry_idx,
                 model=model,
                 difficulty=difficulty,
                 input_columns=input_columns,
@@ -883,23 +922,24 @@ def _generate_examples_for_difficulty(
                 output_properties=output_properties,
             )
         except Exception as e:
-            errors.append(f"{difficulty} call {call_idx + 1} error: {str(e)}")
-            call_idx += 1
+            errors.append(f"{difficulty} retry {retry_idx + 1} error: {str(e)}")
+            retry_idx += 1
             continue
 
         if not batch_examples:
-            errors.append(f"{difficulty} call {call_idx + 1} returned 0 examples")
-            call_idx += 1
+            errors.append(f"{difficulty} retry {retry_idx + 1} returned 0 examples")
+            retry_idx += 1
             continue
 
         for ex in batch_examples:
             ex["difficulty"] = difficulty
         examples.extend(batch_examples)
-        call_idx += 1
+        retry_idx += 1
 
     if len(examples) < num_examples:
         raise RuntimeError(
-            f"Failed to generate {num_examples} {difficulty} examples after {call_idx} call(s) "
+            f"Failed to generate {num_examples} {difficulty} examples after "
+            f"{required_batches} parallel + {retry_idx} retry call(s) "
             f"(generated {len(examples)}). Errors: {errors}"
         )
 
@@ -943,7 +983,9 @@ def _insert_examples(
         )
         difficulty = str(example.get("difficulty", "medium"))
 
-        row_values: list[object] = [str(inputs.get(col_name, "")) for col_name in input_cols]
+        row_values: list[object] = [
+            str(inputs.get(col_name, "")) for col_name in input_cols
+        ]
         expected_obj = {col_name: output_vals.get(col_name) for col_name in output_cols}
         expected_json = json.dumps(expected_obj, ensure_ascii=False)
         row_values.append(expected_json)
@@ -1143,14 +1185,14 @@ def _generate_pseudo_labeled_examples(
     return all_examples
 
 
-@with_custom_ai_function_query_tag("GEN_SYNTH_DATA")
+@with_custom_ai_function_query_tag("SPROC_GEN_SYNTH_DATA")
 def generate_synthetic_data(
     session: Session,
     task_description: str,
     output_table: str,
     input_columns: object,
     model: str | None = None,
-    num_examples: int = 50,
+    num_examples: int = 500,
     easy_pct: int = 50,
     medium_pct: int = 30,
     batch_size: int = 100,
@@ -1182,6 +1224,11 @@ def generate_synthetic_data(
         Dict with generation statistics and mode metadata.
     """
     try:
+        _db, _schema, _table = output_table.strip().split(".")
+        if _db and _schema:
+            session.sql(f"USE DATABASE {_db}").collect()
+            session.sql(f"USE SCHEMA {_schema}").collect()
+
         request = _prepare_generation_request(
             session=session,
             input_columns=input_columns,

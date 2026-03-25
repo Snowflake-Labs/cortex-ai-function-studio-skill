@@ -5,7 +5,7 @@
 
 ## When to Load
 
-Load from optimize/SKILL.md Step 10 when user selects "Save as new version". Also load for: "list versions", "compare versions", "rollback", "promote version", "delete version".
+Load from optimize/SKILL.md Step 8 when user selects "Save as new version". Also load for: "list versions", "compare versions", "rollback", "promote version", "delete version".
 
 This reference covers how to manage versions of AI functions.
 
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS {database}.{schema}.AI_FUNCTION_VERSIONS (
 
 ## Save New Version
 
-Use this workflow when saving an optimized function as a new version (called from `optimize/SKILL.md` Step 10).
+Use this workflow when saving an optimized function as a new version (called from `optimize/SKILL.md` Step 8).
 
 **Expected context from optimize workflow:**
 - `{database}`, `{schema}`: Target location
@@ -99,13 +99,20 @@ Build the JSON configuration:
 }
 ```
 
-Generate and execute the SQL:
+Generate the SQL:
 ```bash
 uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
     --json '<JSON_CONFIG>'
 ```
 
-**⚠️ STOP**: Show generated SQL DDL to user for review before execution.
+**⚠️ STOP**: Show generated SQL DDL to user for review. Once confirmed, run the script once again in execute mode
+
+```bash
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+    --execute --json '<JSON_CONFIG>' \
+    --connection <CONNECTION_NAME> \
+    --warehouse <WAREHOUSE_NAME>
+```
 
 ### Step 4: Save Version Metadata
 
@@ -176,8 +183,8 @@ Versions of {function_base}:
 
 | Function Name | Model | Score | Metric | Experiment | Notes | Created |
 |---------------|-------|-------|--------|------------|-------|---------|
-| MY_FUNC_V3 | llama3.1-70b | 88.5% | exact_match | ai_func_opt_MY_FUNC_1771615368000 | Optimized for... | 2024-01-15 |
-| MY_FUNC_V2 | llama3.1-8b | 82.0% | llm_judge | ai_func_opt_MY_FUNC_1771601234000 | Added few-shot... | 2024-01-10 |
+| MY_FUNC_V3 | claude-sonnet-4-5 | 88.5% | exact_match | ai_func_opt_MY_FUNC_1771615368000 | Optimized for... | 2024-01-15 |
+| MY_FUNC_V2 | claude-haiku-4-5 | 82.0% | llm_judge | ai_func_opt_MY_FUNC_1771601234000 | Added few-shot... | 2024-01-10 |
 | MY_FUNC | mistral-7b | 65.0% | - | - | Initial version | 2024-01-05 |
 ```
 
@@ -194,9 +201,9 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/filter_paret
     --format table
 ```
 
-The character count arguments are used to calculate the input/output ratio for cost weighting. See `optimize/SKILL.md` Step 9a for how to get these values from your test data.
+The character count arguments are used to calculate the input/output ratio for cost weighting. See `optimize/SKILL.md` Step 7.2 for how to get these values from your test data.
 
-This filters out dominated versions (e.g., if V2 with llama3.1-8b has 82% and V3 with llama3.1-70b has only 80%, V3 is filtered out since V2 is both cheaper and better).
+This filters out dominated versions (e.g., if V2 with llama3.1-8b has 82% and V3 with claude-sonnet-4-5 has only 80%, V3 is filtered out since V2 is both cheaper and better).
 
 ### Get Best Performing Version
 

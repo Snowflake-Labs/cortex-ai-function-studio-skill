@@ -1,7 +1,7 @@
 ---
 name: evaluate-ai-function
 description: "Evaluate an AI function's performance against a labeled dataset using a Python stored procedure."
-parent_skill: custom-ai-function
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -23,12 +23,12 @@ Load from main skill when user intent matches EVALUATE: "evaluate", "test", "mea
 | `label_column` | Yes | - | **Yes** | test_table |
 | `stage` | Yes | (generated) | No | - |
 | `sample_size` | No | all | No | - |
-| `metric` | Yes | exact_match | No | - |
+| `metric` | Yes | - | **Yes** | - |
 | `results_table` | No | (generated) | No | function_name |
 
-**Critical fields** (always confirm even if pre-provided): `input_columns`, `label_column`
+**Critical fields** (always confirm even if pre-provided): `input_columns`, `label_column`, `metric`
 
-**Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `stage`, `sample_size`, `metric`, `results_table`
+**Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `stage`, `sample_size`, `results_table`
 
 ## Pre-Collection
 
@@ -70,9 +70,9 @@ If not found confirm name or redirect to `create/SKILL.md` first.
 SELECT GET_DDL('FUNCTION', '<function_name>(<param_types>)');
 ```
 
-Parse the DDL to find the default model name in the function signature. The model appears as a parameter with a DEFAULT value:
+Parse the DDL to find the model name hardcoded in the function body. The model appears as a string literal in the AI_COMPLETE call:
 ```
-MODEL_NAME VARCHAR DEFAULT ''model-name''
+model=>'model-name'
 ```
 
 Store this as `{function_model}` for use when calling EVALUATE_AI_FUNCTION.
@@ -116,13 +116,13 @@ Store the column list from the DESCRIBE output — you will need it for column m
 
 **⚠️ STOP**: Always confirm column mapping before proceeding (critical fields).
 
-After confirmation, validate columns per `references/data_preparation.md` Step 5.
+After confirmation, **Load** `references/data_preparation.md` Step 5 to validate that all mapped columns exist in the relevant tables. Do NOT proceed if columns don't match.
+
+**Multi-key output handling:** If the user's test table has multiple truth columns that correspond to keys in a multi-key function output (e.g., separate `SENTIMENT`, `CONFIDENCE` columns instead of a single VARIANT), help them combine these into a single VARIANT `label_column` using `OBJECT_CONSTRUCT` in a view before evaluation. See `references/data_preparation.md` "Multi-Column Truth Aggregation" for the SQL pattern.
 
 ### Step 3: Configure Evaluation
 
-**If `stage`, `sample_size`, and `metric` already collected** (user provided configuration upfront):
-- Accept silently (simple fields) — skip this step entirely
-- Use defaults for any not provided: sample_size=all, metric=exact_match
+**If `stage` and `sample_size` already collected**, skip this step. Use defaults for any not provided: sample_size=all.
 
 **If not collected**, ask user:
 ```
@@ -139,7 +139,9 @@ Note: The metric is selected at runtime when calling the SPROC, not at creation 
 
 ### Step 4: Setup Infrastructure
 
-Explain to the user:
+**If infrastructure was already set up** (e.g., from a prior create or optimize workflow in this session), skip this step — proceed directly to Step 5.
+
+**Otherwise**, explain to the user:
 ```
 To evaluate your AI function, I need to set up infrastructure:
 1. Create a stage for Python code
@@ -160,7 +162,7 @@ Stage location: {stage_name}
 **Load** `references/metrics.md` and present the metric selection prompt.
 
 **If user chooses "Create custom metric" (option 6):**
-Load `references/custom_metrics.md` with context:
+**Load** `references/custom_metrics.md` with context:
 - Preserve function name: `{function_name}`
 - Preserve test table: `{test_table}`
 - Preserve column mappings: `{input_columns}`, `{label_column}`
@@ -182,6 +184,13 @@ How would you like to run the evaluation?
 1. **Sync** (default)
 2. **Async** (recommended for large datasets) - Run in background, track with run_id
 ```
+
+**If user selects Async**, ask about timeout:
+```
+The default async timeout is 4 hours (240 minutes).
+Would you like to use a different timeout?
+```
+If user provides a custom value, store as `timeout_minutes`. Otherwise use the default (240).
 
 **Sync execution** (default): Runs directly and returns results. 
 
@@ -224,7 +233,8 @@ CALL EVALUATE_AI_FUNCTION_ASYNC(
     500,                                  -- max_length: truncation limit for fields (default 500)
     NULL,                                 -- custom_metric_udf: fully qualified UDF name if using custom metric
     NULL,                                 -- warehouse_name: warehouse to run task (NULL = current)
-    NULL                                  -- run_id: custom run ID (auto-generated if NULL)
+    NULL,                                 -- run_id: custom run ID (auto-generated if NULL)
+    240                                   -- timeout_minutes: max task runtime in minutes (default 240 = 4 hours)
 );
 ```
 
@@ -237,9 +247,7 @@ The SPROC returns immediately with a **run_id** like `ai_func_eval_MY_AI_FUNCTIO
 ```
 Evaluation started in background!
 
-╔═══════════════════════════════════════════════════════════╗
-║  RUN_ID: ai_func_eval_MY_AI_FUNCTION_1709234567890                ║
-╚═══════════════════════════════════════════════════════════╝
+RUN_ID: ai_func_eval_MY_AI_FUNCTION_1709234567890
 
 Save this run_id to track your evaluation.
 
@@ -272,7 +280,7 @@ When saving results, the SPROC automatically:
 | MODEL_NAME | VARCHAR | Model name used |
 | EVAL_TIMESTAMP | TIMESTAMP | When this row was evaluated |
 
-**Metric Options:**
+**Metric Optional Parameters via `metric_options`:**
 
 | Metric | Option | Type | Default | Description |
 |--------|--------|------|---------|-------------|
@@ -312,7 +320,7 @@ Score distribution:
   SELECT SCORE, COUNT(*) FROM {results_table} WHERE RUN_ID = '{run_id}' GROUP BY SCORE ORDER BY SCORE DESC;
 
 Compare evaluation runs:
-  SELECT RUN_ID, METRIC_NAME, MODEL_NAME, AVG(SCORE) AS AVG_SCORE, COUNT(*) AS ROWS
+  SELECT RUN_ID, METRIC_NAME, MODEL_NAME, AVG(SCORE) AS AVG_SCORE, COUNT(*) AS ROW_COUNT
   FROM {results_table}
   GROUP BY RUN_ID, METRIC_NAME, MODEL_NAME
   ORDER BY EVAL_TIMESTAMP DESC;
@@ -342,9 +350,9 @@ Critical confirmations (always stop, even if pre-provided):
 - ✋ Step 2: Confirm column mapping (input_columns, label_column)
 
 Optional confirmations:
-- ✋ Step 4: Before creating stage and uploading files
-- ✋ Step 5: Before creating stored procedure
-- ✋ Step 8: After presenting results
+- ✋ Step 4: Before setting up infrastructure
+- ✋ Step 5: Before creating SPROC
+- ✋ Step 7: After presenting results
 
 ## Output
 

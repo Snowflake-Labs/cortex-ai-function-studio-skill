@@ -1,7 +1,7 @@
 ---
 name: custom-evaluation-metrics
 description: "Create custom evaluation metrics for AI functions as inline Python UDFs that score predictions against expected outputs."
-parent_skill: custom-ai-function
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->

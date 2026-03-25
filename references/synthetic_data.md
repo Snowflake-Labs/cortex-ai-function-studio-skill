@@ -1,6 +1,7 @@
 ---
 name: synthetic-data-generation
 description: "Guidelines and examples for generating high-quality synthetic training data for AI function evaluation and optimization."
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -89,7 +90,6 @@ Ask the user:
 How many synthetic examples would you like to generate?
 
 Options:
-- 50 (quick test / minimum for evaluation)
 - 200 (recommended for test set)
 - 300 (recommended for training set)
 - 500 (full dataset: split into ~300 train / ~200 test)
@@ -244,7 +244,7 @@ Use this flow when the user already has input rows but no expected labels.
 7. Show preview (`INPUT_*`, `EXPECTED`) and allow revise/regenerate.
 8. On approval, run full labeling (all rows) and overwrite destination table.
 9. Continue to evaluate/optimize with:
-   - `expected_column` / `label_column` = `EXPECTED`
+   - `label_column` = `EXPECTED`
    - `input_columns` unchanged
 
 ### Preview Call (sample rows)
@@ -255,7 +255,7 @@ CALL {database}.{schema}.GENERATE_SYNTHETIC_DATA(
     '{output_table}',
     ARRAY_CONSTRUCT({input_columns_csv}),
     NULL,                            -- MODEL optional; NULL defaults to claude-opus-4-6
-    50,                              -- ignored in pseudo-label mode
+    500,                              -- ignored in pseudo-label mode
     50,                              -- ignored in pseudo-label mode
     30,                              -- ignored in pseudo-label mode
     20,                              -- BATCH_SIZE
@@ -274,7 +274,7 @@ CALL {database}.{schema}.GENERATE_SYNTHETIC_DATA(
     '{output_table}',
     ARRAY_CONSTRUCT({input_columns_csv}),
     '{model}',                        -- optional override; NULL uses default
-    50,
+    500,
     50,
     30,
     100,                             -- BATCH_SIZE
@@ -300,7 +300,7 @@ CALL {database}.{schema}.GENERATE_SYNTHETIC_DATA(
 | OUTPUT_TABLE | VARCHAR | required | Fully qualified table name for output |
 | INPUT_COLUMNS | ARRAY | required | Required input column names in argument order |
 | MODEL | VARCHAR | NULL | Synthetic mode: required. Pseudo-label mode: optional (defaults to `claude-opus-4-6` if omitted). |
-| NUM_EXAMPLES | INTEGER | 50 | Total number of examples to generate |
+| NUM_EXAMPLES | INTEGER | 500 | Total number of examples to generate |
 | EASY_PCT | INTEGER | 50 | Percentage of easy examples (0-100) |
 | MEDIUM_PCT | INTEGER | 30 | Percentage of medium examples (0-100) |
 | BATCH_SIZE | INTEGER | 100 | Maximum examples to generate per LLM call |
@@ -351,7 +351,7 @@ Before calling `GENERATE_SYNTHETIC_DATA`, ensure you have collected:
 | `input_columns` | Input column names in argument order (become separate VARCHAR columns) | Yes | - |
 | `output_schema` or `function_name` | Output schema (one is required). Provide `output_schema` as a JSON object with `properties`, or `function_name` to infer from an existing function. | Yes (one of) | - |
 | `model` | Cortex model (`required` in synthetic mode; optional in pseudo-label mode) | Conditionally | pseudo-label default: claude-opus-4-6 |
-| `num_examples` | Number of examples to generate | No | 50 |
+| `num_examples` | Number of examples to generate | No | 500 |
 | `easy_pct` | Percentage of easy examples | No | 50 |
 | `medium_pct` | Percentage of medium examples | No | 30 |
 | `batch_size` | Maximum examples per LLM call | No | 100 |

@@ -25,7 +25,8 @@ CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.EVALUATE_AI_FUNCTION_ASY
     MAX_LENGTH INTEGER DEFAULT 500,
     CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
     WAREHOUSE_NAME VARCHAR DEFAULT NULL,
-    RUN_ID VARCHAR DEFAULT NULL
+    RUN_ID VARCHAR DEFAULT NULL,
+    TIMEOUT_MINUTES INTEGER DEFAULT 240
 )
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -110,6 +111,7 @@ BEGIN
     -- Create the task (no schedule — single execution only via EXECUTE TASK)
     create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}.' || task_name ||
         ' WAREHOUSE = ' || wh_to_use ||
+        ' USER_TASK_TIMEOUT_MS = ' || TO_VARCHAR(TIMEOUT_MINUTES * 60 * 1000) ||
         ' AS ' || sproc_call;
     
     EXECUTE IMMEDIATE create_task_sql;

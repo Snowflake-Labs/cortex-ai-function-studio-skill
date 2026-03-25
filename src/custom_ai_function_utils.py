@@ -18,19 +18,65 @@ from snowflake.snowpark.functions import (
     parse_json,
 )
 
-CUSTOM_AI_FUNCTION_TAG_PREFIX = "__DEBUG_CUSTOM_AI_FUNCTION_SPROC_"
+CUSTOM_AI_FUNCTION_TAG_PREFIX = "__CUSTOM_AI_FUNCTION_LOG_"
+
+
+def create_session_from_connection(connection: str) -> Session:
+    return Session.builder.config("connection_name", connection).create()
+
+
+def build_temp_function_name(function_name: str, prefix: str) -> str:
+    """Build a thread-safe temporary function name from a fully qualified function name.
+
+    Args:
+        function_name: Fully qualified function name (DB.SCHEMA.FUNC or
+            DB.SCHEMA.FUNC(VARCHAR, ...)).
+        prefix: Prefix for the temp function (e.g., ``"__OPT_TEMP"``
+            or ``"__OPT_TEST"``).
+
+    Returns:
+        Fully qualified temp function name like ``DB.SCHEMA.__OPT_TEMP_FUNC_<tid>``.
+    """
+    import threading
+
+    base_name = function_name.split("(")[0] if "(" in function_name else function_name
+    parts = base_name.split(".")
+    db, schema, func = parts[0], parts[1], parts[2]
+    tid = threading.current_thread().ident or 0
+    return f"{db}.{schema}.{prefix}_{func}_{tid}"
 
 
 @contextmanager
-def customai_sproc_logging(session: Session, tag_suffix: str):
+def customai_query_tag_logging(
+    session: Session,
+    tag_suffix: str,
+    *,
+    tag_prefix: str = CUSTOM_AI_FUNCTION_TAG_PREFIX,
+):
     original_tag = session.query_tag
-    prefix = original_tag if original_tag else ""
-    separator = "|" if prefix else ""
-    # update query tag and yield
+
+    def _compose_next_tag() -> str:
+        if not original_tag:
+            return json.dumps({tag_prefix: tag_suffix}, separators=(",", ":"))
+
+        string_tag = f"{original_tag}|{tag_prefix}{tag_suffix}"
+
+        try:
+            parsed = json.loads(original_tag)
+
+            if isinstance(parsed, dict):
+                parsed[tag_prefix] = tag_suffix
+            elif isinstance(parsed, list):
+                parsed.append(string_tag)
+            else:
+                return string_tag
+
+            return json.dumps(parsed, separators=(",", ":"))
+        except Exception:
+            return string_tag
+
     try:
-        session.query_tag = (
-            f"{prefix}{separator}{CUSTOM_AI_FUNCTION_TAG_PREFIX}{tag_suffix}"
-        )
+        session.query_tag = _compose_next_tag()
         yield session
     finally:
         session.query_tag = original_tag
@@ -40,7 +86,7 @@ def with_custom_ai_function_query_tag(tag_suffix: str):
     def decorator(func):
         @wraps(func)
         def wrapper(session, *args, **kwargs):
-            with customai_sproc_logging(session, tag_suffix):
+            with customai_query_tag_logging(session, tag_suffix):
                 return func(session, *args, **kwargs)
 
         return wrapper

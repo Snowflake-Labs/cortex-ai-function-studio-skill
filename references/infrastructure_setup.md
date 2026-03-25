@@ -1,7 +1,7 @@
 ---
 name: infrastructure-setup
 description: "Common infrastructure setup patterns for AI function workflows, including a deploy script shortcut."
-parent_skill: custom-ai-function
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -80,7 +80,7 @@ PUT file://<SKILL_DIRECTORY>/src/{filename}.py @{database}.{schema}.{stage_name}
 
 | Module | Used By | Purpose |
 |--------|---------|---------|
-| `custom_ai_function_utils` | evaluate, optimize, synthetic | Utility functions such as logging wrappers and Robust AI_COMPLETE wrapper (batching, parsing, error-details mode)|
+| `custom_ai_function_utils.py` | evaluate, optimize, synthetic | Utility functions such as logging wrappers and Robust AI_COMPLETE wrapper (batching, parsing, error-details mode)|
 | `metrics_core.py` | evaluate, optimize | Evaluation metrics (exact_match, fuzzy_match, llm_judge) |
 | `snow_gepa_adapter.py` | optimize | GEPA adapter for Snowflake |
 | `snow_gepa_optimize.py` | optimize | GEPA optimization logic |

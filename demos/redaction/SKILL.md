@@ -87,10 +87,12 @@ Run the data generation script with the specified row counts:
 uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/generate_redaction_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
-  --schema {schema}
+  --schema {schema} \
+  --train {train_rows} \
+  --test {test_rows}
 ```
 
-**Note:** Replace `<SKILL_DIRECTORY>` with the absolute path to the custom-ai-function skill directory, and `<CONNECTION_NAME>` with the active Snowflake connection.
+**Note:** Replace `<SKILL_DIRECTORY>` with the absolute path to the cortex-ai-function-studio skill directory, and `<CONNECTION_NAME>` with the active Snowflake connection.
 
 Verify creation:
 ```sql
@@ -118,7 +120,7 @@ Now we'll create an AI function that redacts PII from text.
 For now I'll use these settings. Please confirm or modify any you'd like to change:
 
 Function name: DEMO_REDACT_PII
-Model: claude-4-sonnet
+Model: claude-sonnet-4-5
 Input: TEXT (VARCHAR) - "Text that may contain personally identifiable information (PII)"
 Output: redacted_text (string) - "Redacted text with all PII replaced by [REDACTED]"
 System prompt:
@@ -151,25 +153,23 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.p
 }'
 ```
 
-This generates a function using the message array format required for optimization:
+This generates a function with the model and system prompt hardcoded in the body:
 ```sql
-CREATE OR REPLACE FUNCTION {database}.{schema}.{function_name}(TEXT VARCHAR, MODEL_NAME VARCHAR DEFAULT '{model}', SYSTEM_PROMPT VARCHAR DEFAULT NULL)
+CREATE OR REPLACE FUNCTION {database}.{schema}.{function_name}(TEXT VARCHAR)
 RETURNS VARCHAR
 ...
 AS
 $$
     SNOWFLAKE.CORTEX.AI_COMPLETE(
-        model=>MODEL_NAME,
+        model=>'{model}',
         messages=>[
-            {'role': 'system', 'content': COALESCE(SYSTEM_PROMPT, '{system_prompt}')},
+            {'role': 'system', 'content': '{system_prompt}'},
             {'role': 'user', 'content': TEXT}
         ],
         response_format=>{'type': 'json', 'schema': {...}}
     ).redacted_text::VARCHAR
 $$;
 ```
-
-Note: The MODEL_NAME and SYSTEM_PROMPT parameters allow overriding at runtime (e.g., `DEMO_REDACT_PII('text', 'llama3.1-405b')` or `DEMO_REDACT_PII('text', SYSTEM_PROMPT => 'Custom instructions...')`).
 
 Execute the generated SQL to create the function.
 
@@ -263,7 +263,7 @@ that improve redaction accuracy. Takes ~2-10 minutes to run.
 For now I'll use these settings. Please confirm or modify any you'd like to change:
 
 Auto budget: heavy
-Tracking table: DEMO_GEPA_TRACKING
+Tracking table: DEMO_REDACT_PII_OPT_TRACKING
 
 Options:
 1. Yes - Run GEPA optimization with these settings
@@ -281,7 +281,7 @@ If yes, follow the optimize workflow (`optimize/SKILL.md`) with these values:
 - Label column: `EXPECTED_OUTPUT`
 - Metric: `redaction_match`
 - Auto budget: heavy
-- Tracking table: `{database}.{schema}.DEMO_GEPA_TRACKING`
+- Tracking table: `{database}.{schema}.DEMO_REDACT_PII_OPT_TRACKING`
 
 Present results and compare before/after scores.
 
@@ -296,7 +296,7 @@ This will drop:
 - {database}.{schema}.DEMO_REDACTION_TEST
 - {database}.{schema}.DEMO_REDACT_PII
 - {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS (if created)
-- {database}.{schema}.DEMO_GEPA_TRACKING (if created)
+- {database}.{schema}.DEMO_REDACT_PII_OPT_TRACKING (if created)
 
 Options:
 1. Yes - Clean up all demo objects
@@ -307,9 +307,9 @@ If yes, execute:
 ```sql
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_TRAIN;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_TEST;
-DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_REDACT_PII(VARCHAR, VARCHAR, VARCHAR);
+DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_REDACT_PII(VARCHAR);
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_GEPA_TRACKING;
+DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACT_PII_OPT_TRACKING;
 ```
 
 ### Step 8: Next Steps
@@ -327,7 +327,9 @@ Ready to build your own AI function? Just say "create an AI function" to get sta
 
 ## Stopping Points
 
+- ✋ Step 0: After introduction, before proceeding
 - ✋ Step 1: After location selection
+- ✋ Step 2: Before loading data (confirm row counts)
 - ✋ Step 3: Before creating function (confirm settings)
 - ✋ Step 3: Before testing function (confirm example input)
 - ✋ Step 4: Before running evaluation (confirm settings)

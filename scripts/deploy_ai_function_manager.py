@@ -18,16 +18,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-import snowflake.connector
+from snowflake.snowpark import Session
 
 from create_sproc import render_sproc_sql as render_sproc_template_sql
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = SCRIPT_DIR.parent / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from custom_ai_function_utils import customai_query_tag_logging  # noqa: E402
+
+COCO_SESSION_TAG_PREFIX = "__CUSTOM_AI_FUNCTION_COCO_SESSION_ID_"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,16 +71,12 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def run_sql(cursor, sql: str, *, step: str = "") -> list:
+def run_sql(session: Session, sql: str, *, step: str = "") -> list:
     try:
-        cursor.execute(sql)
+        return session.sql(sql).collect()
     except Exception as exc:
         prefix = f"[{step}] " if step else ""
         raise RuntimeError(f"{prefix}{exc}") from exc
-    try:
-        return cursor.fetchall()
-    except Exception:
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +105,11 @@ def parse_stage_fqn(stage_fqn: str) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_warehouse(cursor, warehouse: str | None) -> str:
+def resolve_warehouse(session: Session, warehouse: str | None) -> str:
     """Use the explicit --warehouse value, or fall back to the session default."""
     if warehouse:
         return warehouse
-    rows = run_sql(cursor, "SELECT CURRENT_WAREHOUSE()", step="resolve warehouse")
+    rows = run_sql(session, "SELECT CURRENT_WAREHOUSE()", step="resolve warehouse")
     wh = rows[0][0] if rows and rows[0] else None
     if not wh:
         raise ValueError(
@@ -132,49 +136,61 @@ def render_sproc_ddl(
     return sql
 
 
-def upload_stage_modules(cursor, stage_fqn: str) -> None:
+def upload_stage_modules(session: Session, stage_fqn: str) -> None:
     for rel in STAGE_MODULES:
         path = SKILL_DIR / rel
         if not path.exists():
             raise FileNotFoundError(f"Missing module: {path}")
         log(f"  {Path(rel).name}")
-        run_sql(
-            cursor,
-            f"PUT file://{path} @{stage_fqn} AUTO_COMPRESS=FALSE OVERWRITE=TRUE",
-            step=f"upload {Path(rel).name}",
+        session.file.put(
+            f"file://{path}",
+            f"@{stage_fqn}",
+            auto_compress=False,
+            overwrite=True,
         )
 
 
 def create_stored_procedures(
-    cursor, database: str, schema: str, stage_fqn: str
+    session: Session, database: str, schema: str, stage_fqn: str
 ) -> None:
+    coco_session_id = os.environ.get("CORTEX_SESSION_ID")
+
     for proc_name, sproc_type in SPROC_TYPES.items():
         log(f"  {proc_name}")
         ddl = render_sproc_ddl(sproc_type, database, schema, stage_fqn)
-        run_sql(cursor, ddl, step=f"create procedure {proc_name}")
+
+        if coco_session_id:
+            with customai_query_tag_logging(
+                session,
+                coco_session_id,
+                tag_prefix=COCO_SESSION_TAG_PREFIX,
+            ):
+                run_sql(session, ddl, step=f"create procedure {proc_name}")
+        else:
+            run_sql(session, ddl, step=f"create procedure {proc_name}")
 
 
 def provision_infrastructure(
-    cursor, database: str, schema: str, stage_fqn: str, warehouse: str
+    session: Session, database: str, schema: str, stage_fqn: str, warehouse: str
 ) -> dict:
     """Set session context, create stage, upload modules, and create SPROCs."""
     log("Setting session context...")
-    run_sql(cursor, f"USE DATABASE {database}", step="USE DATABASE")
-    run_sql(cursor, f"USE SCHEMA {schema}", step="USE SCHEMA")
-    run_sql(cursor, f"USE WAREHOUSE {warehouse}", step="USE WAREHOUSE")
+    run_sql(session, f"USE DATABASE {database}", step="USE DATABASE")
+    run_sql(session, f"USE SCHEMA {schema}", step="USE SCHEMA")
+    run_sql(session, f"USE WAREHOUSE {warehouse}", step="USE WAREHOUSE")
 
     log("Ensuring stage...")
     run_sql(
-        cursor,
+        session,
         f"CREATE STAGE IF NOT EXISTS {stage_fqn} " f"DIRECTORY = (ENABLE = TRUE)",
         step="create stage",
     )
 
     log("Uploading modules...")
-    upload_stage_modules(cursor, stage_fqn)
+    upload_stage_modules(session, stage_fqn)
 
     log("Creating stored procedures...")
-    create_stored_procedures(cursor, database, schema, stage_fqn)
+    create_stored_procedures(session, database, schema, stage_fqn)
 
     return {
         "status": "success",
@@ -236,16 +252,15 @@ def main() -> None:
         print(json.dumps(plan, indent=2))
         return
 
-    conn = snowflake.connector.connect(connection_name=args.connection)
-    cursor = conn.cursor()
+    session = Session.builder.config("connection_name", args.connection).create()
     try:
-        warehouse = resolve_warehouse(cursor, args.warehouse)
+        warehouse = resolve_warehouse(session, args.warehouse)
         result = provision_infrastructure(
-            cursor, database, schema, stage_fqn, warehouse
+            session, database, schema, stage_fqn, warehouse
         )
         print(json.dumps(result, indent=2))
     finally:
-        conn.close()
+        session.close()
 
 
 def _write_debug_log(e: Exception) -> str | None:

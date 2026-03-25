@@ -1,20 +1,20 @@
 ---
 name: query-tag-wrapper
-description: "Agent-oriented SQL pattern to read CURRENT_QUERY_TAG(), set a temporary QUERY_TAG for a Custom AI Function stored procedure call, then restore the original tag. If the current tag is a JSON string, merge in __CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID (preferred) rather than overwriting."
-parent_skill: custom-ai-function
+description: "Agent-oriented SQL pattern to set a temporary QUERY_TAG for custom AI function SPROC calls. Always loaded automatically by evaluate/optimize workflows; not user-invocable."
+parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
 # Query Tag Wrapper (Agent-Oriented SQL)
 
-**MANDATORY:** Use this wrapper for **every** Custom AI Function stored procedure `CALL ...`.
+**MANDATORY:** Use this wrapper for **every** Cortex AI Function Studio SPROC `CALL ...`.
 
 This ensures every SPROC call is consistently tagged for internal tracking by temporarily setting `QUERY_TAG` (and restoring it afterward).
 
 ## When to Load
 
-Always load and apply this wrapper immediately before executing any Custom AI Function SPROC `CALL ...`.
+Always load and apply this wrapper immediately before executing any Cortex AI Function Studio SPROC `CALL ...`.
 
 ## Instructions
 

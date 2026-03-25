@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
-# custom-ai-function-skill
+# cortex-ai-function-studio-skill
 Build, evaluate, and optimize custom AI functions powered by Snowflake Cortex Complete. Create LLM-powered UDFs from your data, measure performance with built-in or custom metrics, and automatically tune prompts and select models to balance quality and cost.
 
 ## License
@@ -11,8 +11,8 @@ This repo is source-available and licensed under [these terms](LICENSE).
 ## Adding the Skill to Cortex Code
 
 ```bash
-git clone git@github.com:snowflake-eng/custom-ai-function-skill.git
-cortex skill add /path/to/custom-ai-function-skill
+git clone git@github.com:snowflake-eng/cortex-ai-function-studio-skill.git
+cortex skill add /path/to/cortex-ai-function-studio-skill
 ```
 
 ## Verify Installation
@@ -21,12 +21,12 @@ cortex skill add /path/to/custom-ai-function-skill
 cortex skill list
 ```
 
-You should see `custom-ai-function` listed under **Discovered skills → [EXTERNAL]**.
+You should see `cortex-ai-function-studio` listed under **Discovered skills → [EXTERNAL]**.
 
 ## Remove the Skill
 
 ```bash
-cortex skill remove custom-ai-function
+cortex skill remove cortex-ai-function-studio
 ```
 
 ## Usage
