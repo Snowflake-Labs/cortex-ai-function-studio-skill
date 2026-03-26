@@ -33,7 +33,7 @@ Target:
 
 This will:
 - create the stage if missing
-- upload prerequisite files (`ai_complete_utils.py`, `metrics_core.py`, `snow_gepa_adapter.py`, `snow_gepa_optimize.py`, `snow_synthetic_data.py`)
+- upload prerequisite files (`custom_ai_function_utils.py`, `metrics_core.py`, `snow_gepa_adapter.py`, `snow_gepa_optimize.py`, `snow_synthetic_data.py`)
 - create or replace procedures (`EVALUATE_AI_FUNCTION`, `OPTIMIZE_AI_FUNCTION`, `GENERATE_SYNTHETIC_DATA`)
 ```
 
