@@ -1,8 +1,3 @@
----
-name: custom-evaluation-metrics
-description: "Create custom evaluation metrics for AI functions as inline Python UDFs that score predictions against expected outputs."
-parent_skill: cortex-ai-function-studio
----
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
@@ -454,7 +449,7 @@ The metric is now available by its fully qualified UDF name. To use it in evalua
 - Pass `'{metric_name}'` as the `METRIC_NAME` parameter
 - Pass `'{database}.{schema}.{metric_name}'` as the `CUSTOM_METRIC_UDF` parameter
 
-See `evaluate/SKILL.md` Step 6 or `optimize/SKILL.md` Step 7 for full SPROC call syntax.
+See `evaluate/SKILL.md` Step 4 or `optimize/SKILL.md` Step 5 for full SPROC call syntax.
 
 ```
 Custom metric "{metric_name}" is ready!

@@ -12,7 +12,13 @@ Automatically improves prompts through iterative optimization with Pareto fronti
 
 ## Prerequisites
 
-**The target function must be created via `create/SKILL.md`** (or have compatible structure). The optimizer reverse-parses the function DDL to extract the baked-in model and system prompt, then creates temporary functions with candidate model/prompt combinations during optimization. The function body must use the standard `AI_COMPLETE(model=>'...', messages=>ARRAY_CONSTRUCT(...))` pattern.
+**The target function must be created via `create/SKILL.md`** (or have compatible structure). The optimizer reverse-parses the function DDL to extract the baked-in model and system prompt, then creates temporary functions with candidate model/prompt combinations during optimization. The function body must use the standard `AI_COMPLETE(model=>'...', messages=>ARRAY_CONSTRUCT(...))` pattern. The optimizer substitutes only the model and system prompt; the rest of the function body (including multimodal user messages) is left untouched.
+
+**Supported multimodal patterns:**
+- **VARCHAR file paths**: function takes VARCHAR inputs with `TO_FILE()` in the body — auto-detected from DDL.
+- **FILE data type**: function takes FILE parameters directly — auto-detected from DDL signature. `stage_name` **must** be provided in metric options.
+
+For FILE-type functions, ask the user for `stage_name` during data collection. The optimizer validates stage access and file existence automatically before starting — see `references/multimodal_setup.md` "Validating File Access".
 
 If the function was not created with the expected structure, the optimization will fail. Direct the user to recreate the function using the create workflow.
 
@@ -34,13 +40,12 @@ Load from main skill when user intent matches OPTIMIZE: "optimize", "tune", "imp
 | `auto_budget` | Yes | medium | No | - |
 | `models` | Yes | [claude-sonnet-4-5] | No | - |
 | `reflection_model` | Yes | claude-sonnet-4-6 | No | - |
-| `stage` | Yes | (generated) | No | - |
 | `tracking_table` | No | (generated) | No | function_name |
 | `aggregation_metric` | No | accuracy | No | metric |
 
 **Critical fields** (always confirm even if pre-provided): `function_structure_confirmed`, `input_columns`, `label_column`, `metric`
 
-**Simple fields** (accept silently if pre-provided): `function_name`, `training_table`, `test_table`, `auto_budget`, `models`, `reflection_model`, `stage`, `tracking_table`, `aggregation_metric`
+**Simple fields** (accept silently if pre-provided): `function_name`, `training_table`, `test_table`, `auto_budget`, `models`, `reflection_model`, `tracking_table`, `aggregation_metric`
 
 ## Pre-Collection
 
@@ -88,14 +93,14 @@ Using data splits from evaluation:
 - Training: {train_table_from_evaluate}
 - Test: {test_table_from_evaluate}
 
-Press Enter to confirm, or provide different tables.
+Confirm these tables? (y/n) If no, provide different table names.
 ```
 
 **Otherwise:** **Load** `references/data_preparation.md` with context:
 - `workflow`: "optimize"
 - Keep function context from Step 1 for synthetic or pseudo-label routes.
 
-**Note on optimize training data:** The optimizer internally splits training into train/dev sets (2/3 scoring, 1/3 reflection).
+**Note on optimize training data:** The optimizer internally splits training into train/dev sets automatically. Use `0.5` validation by default; if the training table has more than 200 rows, use `0.2` validation instead.
 
 **If no test table provided after data preparation:**
 ```
@@ -127,6 +132,8 @@ Store the column lists from both DESCRIBE outputs — you will need them for col
 **⚠️ STOP**: Always confirm column mapping before proceeding (critical fields).
 
 After confirmation, **Load** `references/data_preparation.md` Step 5 to validate that all mapped columns exist in the relevant tables. Do NOT proceed if columns don't match.
+
+**⚠️ Column mismatch handling**: If any mapped column does not exist in the training or test table, you MUST present the mismatch to the user via `ask_user_question` (not prose text). Include the mismatched column names, the actual table columns, and remediation options. Do NOT silently remap or proceed — always surface the mismatch through `ask_user_question` so the user can decide.
 
 **Multi-key output handling:** If the user's training/test table has multiple truth columns that correspond to keys in a multi-key function output (e.g., separate `SENTIMENT`, `CONFIDENCE` columns instead of a single VARIANT), help them combine these into a single VARIANT `label_column` using `OBJECT_CONSTRUCT` in a view before optimization. See `references/data_preparation.md` "Multi-Column Truth Aggregation" for the SQL pattern.
 
@@ -207,15 +214,12 @@ Store as `reflection_model`. Default: `claude-sonnet-4-6`
 
 The following have sensible defaults. Only ask if user wants to customize:
 
-- **Stage**: Where to upload optimizer code. Default: `{database}.{schema}.AI_FUNCTIONS`
 - **Tracking table**: Where to save optimization candidates. Default: `{FUNCTION_NAME}_OPT_TRACKING`
-- **Validation fraction**: Fraction of training data for validation vs reflection. Default: `0.667` (2/3 validation, 1/3 reflection)
+- **Validation fraction**: Fraction of training data for validation vs reflection. Recommended default from the Step 3 training row count: `0.5`; if the training table has more than 200 rows, use `0.2`
 
-Proceed with defaults unless user requests changes.
+Proceed with defaults unless user requests changes. 
 
-### Step 5: Setup Infrastructure
-
-**Load** `references/infrastructure_setup.md` and run the deploy script shortcut to provision stage, modules, and procedures before optimization.
+### Step 5: Run Optimization
 
 Explain to the user what the procedure does:
 ```
@@ -225,13 +229,11 @@ OPTIMIZE_AI_FUNCTION iteratively improves your prompt by:
 3. Generating new variations from successful prompts
 ```
 
-**⚠️ STOP**: Get user confirmation before creating the stored procedure.
+**⚠️ STOP**: Get user confirmation before proceeding with optimization.
 
-### Step 6: Run Optimization
+**MANDATORY**: Wrap the SPROC `CALL ...` in the query tag wrapper from `references/query_tag.md` (set/restore `QUERY_TAG`). The agent MUST inject its local `CORTEX_SESSION_ID` into the wrapper and record it under the canonical key `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID` (merge into JSON tags when possible; otherwise append to string tags). **You MUST reproduce the full wrapper SQL from `references/query_tag.md` verbatim** — including `CURRENT_QUERY_TAG()`, `TRY_PARSE_JSON`, `OBJECT_INSERT`, and both `ALTER SESSION SET QUERY_TAG` statements (set and restore). Do NOT simplify or abbreviate the wrapper. The agent MUST also inline the actual `CORTEX_SESSION_ID` value as a string literal — do NOT leave ANY placeholder such as `<CORTEX_SESSION_ID>`, `${CORTEX_SESSION_ID}`, `YOUR_SESSION_ID_HERE`, `YOUR_ACTUAL_SESSION_ID_HERE`, or similar. Look up the real session ID and substitute it directly into the SQL.
 
-**MANDATORY**: Wrap the SPROC `CALL ...` in the query tag wrapper from `references/query_tag.md` (set/restore `QUERY_TAG`). The agent MUST inject its local `CORTEX_SESSION_ID` into the wrapper and record it under the canonical key `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID` (merge into JSON tags when possible; otherwise append to string tags).
-
-Pass all selected models in a single SPROC call. The SPROC runs all models **concurrently** internally using parallel threads, so there is no need to call it once per model. Results from all models will be compared in Step 8 to find pareto-optimal options.
+Pass all selected models in a single SPROC call. The SPROC runs all models **concurrently** internally using parallel threads, so there is no need to call it once per model. Results from all models will be compared in Step 6 to find pareto-optimal options.
 
 #### Execution Mode Selection
 
@@ -240,7 +242,7 @@ Optimization can take 10-30+ minutes depending on budget and model count. Ask th
 ```
 How would you like to run the optimization?
 
-1. **Sync** (default) - Wait for results (use timeout_seconds: 1200)
+1. **Sync** (default) - Wait for results (use timeout_seconds: 14400)
 2. **Async** (recommended) - Run in background, track with run_id
 ```
 
@@ -251,101 +253,59 @@ Would you like to use a different timeout?
 ```
 If user provides a custom value, store as `timeout_minutes`. Otherwise use the default (240).
 
-**Sync execution** (default): Runs directly with extended timeout. Risk of Cortex Code timeout on heavy budgets.
+**Sync execution** (default): Runs directly with extended timeout via an anonymous stored procedure (no persistent objects). Python optimizer code is inlined into the SPROC body. Risk of Cortex Code timeout on heavy budgets.
 
-**Async execution**: Uses a Snowflake Task to run optimization in the background. Recommended for `medium` or `heavy` budgets.
+**Async execution**: Uses a Snowflake Task to run optimization in the background. The Task body contains the anonymous SPROC with inlined Python, so no named procedures are created and no stage upload is required. Recommended for `medium` or `heavy` budgets.
 
-#### Sync Optimization
+#### Running the Optimization Script
 
-**Important: SQL timeout** — The optimization SPROC can run for 10+ minutes depending on budget and model count. When executing the `CALL OPTIMIZE_AI_FUNCTION(...)` statement, use `timeout_seconds: 1200` (20 minutes) to prevent the query from timing out before completion.
+**Important: SQL timeout** — For sync execution, the optimization SPROC can run for 10+ minutes. The script runs in its own subprocess, so there is no Cortex Code UI timeout concern. However, Snowflake statement timeout still applies. Use `timeout_seconds: 14400` (4 hours) to prevent the query from timing out before completion.
 
-```sql
-CALL OPTIMIZE_AI_FUNCTION(
-    '{function_name}',                             -- Fully qualified function name (DB.SCHEMA.FUNC)
-    '{training_table}',                            -- Training table (auto-split into val/train)
-    '{label_column}',                              -- Label column
-    ARRAY_CONSTRUCT('{input_col1}', ...),          -- Input columns
-    '{metric_name}',                               -- Metric from Step 4.1
-    ARRAY_CONSTRUCT('{model1}', '{model2}', ...),  -- All models to optimize (run concurrently)
-    '{reflection_model}',                          -- Reflection model from Step 4.4 (required)
-    '{test_table}',                                -- Held-out test table (NULL = use training table)
-    '{auto_budget}',                               -- Budget from Step 4.2
-    '{tracking_table}',                            -- Tracking table (or NULL)
-    '{results_table}',                             -- Table to save optimization results (NULL = don't save)
-    {validation_fraction},                         -- Fraction for validation (default 0.667)
-    {temperature},                                 -- LLM temperature (default 0.0)
-    {max_tokens},                                  -- Max tokens (default 8192)
-    NULL,                                          -- Metric options (or OBJECT_CONSTRUCT(...))
-    '{custom_metric_udf}',                         -- Custom metric UDF name (or NULL)
-    FALSE,                                         -- enable_detailed_tracking: verbose logging (default FALSE)
-    NULL,                                          -- run_id: external ID for tracking (auto-generated if NULL)
-    NULL                                           -- aggregation_metric: 'accuracy' or 'f1-score' (NULL to disable)
-);
+Run the optimization script. It renders the anonymous SPROC, appends the CALL, and executes everything in a single Snowpark session. **Always pass every flag** — use `none` for unused optional parameters:
+
+```bash
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py optimize \
+    --database {database} --schema {schema} --connection <CONNECTION_NAME> \
+    --function-name {function_name} --training-table {training_table} \
+    --label-column {label_column} --input-columns {input_col1} {input_col2} \
+    --metric-name {metric_name} --models {model1} {model2} --reflection-model {reflection_model} \
+    --test-table {test_table or none} --auto-budget {auto_budget} \
+    --tracking-table {tracking_table or none} --results-table {results_table or none} \
+    --validation-fraction {validation_fraction} --temperature 0.0 --max-tokens 8192 \
+    --metric-options none --custom-metric-udf none --enable-detailed-tracking false \
+    --run-id none --aggregation-metric {aggregation_metric or none}
+    # For async: append --async --warehouse {warehouse} --timeout-minutes {timeout_minutes}
 ```
 
-Collect and store results from each model run for comparison in Step 7.
+Run `run.py optimize --help` to see all flags and their descriptions.
+
+#### Sync Output
+
+The script prints a JSON result to stdout:
+```json
+{"status": "success", "result": {"run_id": "...", "best_prompt": "...", ...}, "function": "DB.SCHEMA.MY_FUNC"}
+```
+
+Collect and store results from each model run for comparison in Step 6.
 The single call returns results for all models. Each model gets the same budget and runs independently in parallel.
 
-**Timeout self-correction:** If the CALL statement fails due to a SQL timeout (e.g., the query exceeds `timeout_seconds`), do NOT attempt to check query history or treat it as an unknown failure. The timeout is a client-side cancellation — the query was killed, not completed. Self-correct as follows:
-1. Inform the user the optimization timed out.
-2. If a tracking table was configured, check it for any partial results from the timed-out run (some models may have completed before the timeout):
-   ```sql
-   SELECT MODEL_NAME, COUNT(*) AS CANDIDATES_FOUND, MAX(METRIC_SCORE) AS BEST_SCORE
-   FROM {tracking_table}
-   GROUP BY MODEL_NAME;
-   ```
-3. Ask the user how to proceed:
-   - **Retry with longer timeout** — re-run the same CALL with a higher `timeout_seconds` (e.g., double the previous value).
-   - **Skip this model** — move on to the next model in the list, using any partial tracking data already captured.
-   - **Reduce budget** — re-run with a lighter budget setting (e.g., switch from `medium` to `light`).
-4. Do NOT silently move on or conflate partial results from a prior/different model's run with the timed-out model's results.
+**Timeout self-correction:** If the script fails due to a SQL timeout, the query was killed (client-side cancellation), not completed. Inform the user, then check the tracking table for partial results (`SELECT MODEL_NAME, COUNT(*) AS CANDIDATES_FOUND, MAX(METRIC_SCORE) AS BEST_SCORE FROM {tracking_table} GROUP BY MODEL_NAME`). Offer to **skip the timed-out model** or **reduce budget** (e.g., `medium` → `light`). Do NOT silently move on or conflate partial results from different models.
 
-**Required params:** FUNCTION_NAME, TRAINING_TABLE, LABEL_COLUMN, INPUT_COLUMNS, METRIC_NAME, MODELS, REFLECTION_MODEL
+#### Async Output
 
-**Optional params:** TEST_TABLE, AUTO_BUDGET ('light'), TRACKING_TABLE, VALIDATION_FRACTION (0.667), TEMPERATURE (0.0), MAX_TOKENS (8192), METRIC_OPTIONS, CUSTOM_METRIC_UDF, ENABLE_DETAILED_TRACKING, RUN_ID, AGGREGATION_METRIC
-
-#### Async Optimization
-
-For async execution, use `OPTIMIZE_AI_FUNCTION_ASYNC` which creates and executes a Snowflake Task:
-
-```sql
-CALL OPTIMIZE_AI_FUNCTION_ASYNC(
-    '{function_name}',                             -- Fully qualified function name (DB.SCHEMA.FUNC)
-    '{training_table}',                            -- Training table (auto-split into val/train)
-    '{label_column}',                              -- Label column
-    ARRAY_CONSTRUCT('{input_col1}', ...),          -- Input columns
-    '{metric_name}',                               -- Metric from Step 4.1
-    ARRAY_CONSTRUCT('{model1}', '{model2}', ...),  -- All models to optimize (run concurrently)
-    '{reflection_model}',                          -- Reflection model from Step 4.4 (required)
-    '{test_table}',                                -- Held-out test table (NULL = use training table)
-    '{auto_budget}',                               -- Budget from Step 4.2
-    '{tracking_table}',                            -- Tracking table (or NULL)
-    '{results_table}',                             -- Table to save optimization results (NULL = don't save)
-    {validation_fraction},                         -- Fraction for validation (default 0.667)
-    {temperature},                                 -- LLM temperature (default 0.0)
-    {max_tokens},                                  -- Max tokens (default 8192)
-    NULL,                                          -- Metric options (or OBJECT_CONSTRUCT(...))
-    '{custom_metric_udf}',                         -- Custom metric UDF name (or NULL)
-    FALSE,                                         -- enable_detailed_tracking: verbose logging (default FALSE)
-    NULL,                                          -- run_id: external ID for tracking (auto-generated if NULL)
-    NULL,                                          -- aggregation_metric: 'accuracy' or 'f1-score' (NULL to disable)
-    NULL,                                          -- warehouse_name: warehouse to run task (NULL = current)
-    240                                            -- timeout_minutes: max task runtime in minutes (default 240 = 4 hours)
-);
+The script prints a JSON result to stdout with the generated `run_id`:
+```json
+{"status": "submitted", "run_id": "ai_func_opt_MY_FUNC_1739919133000", "task": "DB.SCHEMA.ai_func_opt_MY_FUNC_1739919133000"}
 ```
 
-**Required params:** FUNCTION_NAME, TRAINING_TABLE, LABEL_COLUMN, INPUT_COLUMNS, METRIC_NAME, MODELS, REFLECTION_MODEL
-
-**Optional params:** TEST_TABLE, AUTO_BUDGET ('light'), TRACKING_TABLE, VALIDATION_FRACTION (0.667), TEMPERATURE (0.0), MAX_TOKENS (8192), METRIC_OPTIONS, CUSTOM_METRIC_UDF, ENABLE_DETAILED_TRACKING, RUN_ID, AGGREGATION_METRIC, TIMEOUT_MINUTES (240)
-
-The SPROC returns immediately with a **run_id** like `ai_func_opt_MY_AI_FUNCTION_1709234567890`.
-
-**⚠️ WAREHOUSE NOTE**: If the SPROC returns a string starting with `ERROR:` instead of a run_id, it means the current role lacks a direct USAGE grant on the target warehouse. Snowflake Tasks require an explicit grant — session-level access via role hierarchy is not sufficient. Display the full error to the user. It includes the exact `GRANT` command needed and instructions for finding usable warehouses.
+**⚠️ WAREHOUSE NOTE**: If the script returns `{"status": "error", ...}` instead of `{"status": "submitted", "run_id": "..."}`, it likely means the current role lacks a direct USAGE grant on the target warehouse. Snowflake Tasks require an explicit grant — session-level access via role hierarchy is not sufficient. Display the `message` field to the user. It includes the exact `GRANT` command needed and instructions for finding usable warehouses.
 
 **⚠️ IMPORTANT**: Display the run_id prominently to the user:
 
 ```
-RUN_ID: ai_func_opt_MY_AI_FUNCTION_1709234567890
+Optimization started in background!
+
+RUN_ID: {run_id}
 
 Save this run_id to track your optimization.
 
@@ -353,17 +313,17 @@ Check status:  See references/async_status.md
 View results:  SELECT * FROM {tracking_table} WHERE RUN_ID = '{run_id}';
 ```
 
-You can close this session and return later. To resume, load the custom AI function skill and say "check status of {run_id}" — it will pick up where you left off and present your results.
+**⚠️ IMPORTANT**: For async optimization, `--tracking-table` is required since the return value isn't directly accessible. Results are written to the tracking table with `RUN_ID = run_id`.
 
 **Load** `references/async_status.md` if user wants to check status.
 
-**Note**: For async optimization, `TRACKING_TABLE` is required since the SPROC return value isn't directly accessible. Results are written to the tracking table with `RUN_ID = run_id`.
+**Cleanup after async completes:** See `references/async_status.md` Cleanup section for task status verification and cleanup SQL (drop the Task after it reaches `SUCCEEDED`, `FAILED`, or `CANCELLED`).
 
-### Step 7: Present Results (with Pareto Filtering)
+### Step 6: Present Results (with Pareto Filtering)
 
-**⚠️ MANDATORY**: You MUST complete ALL substeps below (7.1 through 7.5) before presenting any results to the user or asking what to do next. Do NOT skip the pareto filter.
+**⚠️ MANDATORY**: You MUST complete ALL substeps below (6.1 through 6.5) before presenting any results to the user or asking what to do next. Do NOT skip the pareto filter.
 
-**7.1. Collect raw results:**
+**6.1. Collect raw results:**
 
 The procedure returns JSON with: `run_id`, `seed_prompt`, `best_prompt`, `seed_val_score`, `best_val_score`, `seed_test_score`, `best_test_score`, `total_candidates`, `model`, `metric`.
 
@@ -374,9 +334,9 @@ If tracking table used, query candidate history:
 SELECT ROW_NUMBER() OVER (PARTITION BY MODEL_NAME ORDER BY CREATED_AT) AS IDX, MODEL_NAME, METRIC_SCORE, LEFT(PROMPT_TEXT, 100) FROM {tracking_table} WHERE METRIC_SCORE IS NOT NULL ORDER BY METRIC_SCORE DESC;
 ```
 
-**7.2. Get character length statistics:**
+**6.2. Get character length statistics:**
 
-For each input column, compute average length separately. If there are multiple input columns, sum their averages:
+For each input column, compute average length separately. If there are multiple input columns, sum their averages (e.g., `AVG(LENGTH(COL_A)) + AVG(LENGTH(COL_B))`):
 ```sql
 SELECT
     {sum_of_AVG_LENGTH_per_input_column} AS avg_input_chars,
@@ -384,44 +344,23 @@ SELECT
 FROM {test_table};
 ```
 
-Example for two input columns `COL_A` and `COL_B`:
-```sql
-SELECT
-    AVG(LENGTH(COL_A)) + AVG(LENGTH(COL_B)) AS avg_input_chars,
-    AVG(LENGTH({label_column})) AS avg_output_chars
-FROM {test_table};
-```
-
-**7.3. Filter to pareto-optimal options:**
+**6.3. Filter to pareto-optimal options:**
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/filter_pareto.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
     --json '[{"model": "model1", "score": 0.85}, ...]' \
     --prompt-chars {prompt_chars} --avg-input-chars {avg_input_chars} --avg-output-chars {avg_output_chars} \
     --seed-score {seed_test_score} --format table
 ```
 
-**7.4. Present pareto-optimal results:**
+**6.4. Present pareto-optimal results:**
 
-```
-Select the best result to apply:
+Present the `filter_pareto.py` table output to the user. The table shows columns: `#`, `Model`, `Score`, `Improvement`, `Relative Cost`. Dominated options (where another model has both lower cost AND higher score) are automatically filtered out. Cost uses model-specific token costs from `models.json`.
 
-(Showing pareto-optimal options only - dominated options filtered out)
-
-| # | Model | Score | Improvement | Relative Cost |
-|---|-------|-------|-------------|---------------|
-| 1 | claude-haiku-4-5 | 82.0% | +17.0% | 1.0x (cheapest) |
-| 2 | claude-sonnet-4-5 | 85.0% | +20.0% | 3.0x |
-
-Enter the number of your choice (or 0 to skip):
-```
-
-**Note**: Options where another model has both lower cost AND higher score are automatically filtered out. Cost is calculated using model-specific input/output token costs from `models.json`.
-
-**7.5. Get user selection:**
+**6.5. Get user selection:**
 
 **⚠️ STOP**: Use `ask_user_question` to let user select the result to apply.
 
-### Step 8: Apply Optimized Prompt
+### Step 7: Apply Optimized Prompt
 
 Ask user:
 ```
@@ -456,17 +395,21 @@ Extract the original function metadata from Step 2, then build the JSON config:
 }
 ```
 
+**Multimodal:** Preserve the original input types from the function DDL:
+- For VARCHAR path inputs: use `"sql_type": "STAGE_FILE_PATH"` with `"stage_name"`
+- For FILE type inputs: use `"sql_type": "FILE"` (no `stage_name` needed in the function)
+
 Generate and execute the SQL:
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
     --json '<JSON_CONFIG>'
 ```
 
 **⚠️ STOP**: Show generated SQL DDL to user for review. Once confirmed, run the script once again in execute mode to create the udf
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
     --execute --json '<JSON_CONFIG>' \
     --connection <CONNECTION_NAME> \
     --warehouse <WAREHOUSE_NAME>
@@ -479,15 +422,15 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.p
 Pass this context:
 - `{database}`, `{schema}`: Target location
 - `{function_base}`: Base function name (without DB.SCHEMA prefix)
-- `{selected_model}`: The model selected in Step 8
+- `{selected_model}`: The model selected in Step 7
 - `{best_score}`: The optimization score
 - `{metric_name}`: The metric used for optimization (from Step 4)
-- `{run_id}`: The optimization experiment ID (from Step 6 results)
+- `{run_id}`: The optimization experiment ID (from Step 5 results)
 - `{optimized_system_prompt}`: The optimized prompt from results
 - `{original_inputs_array}`, `{original_outputs_array}`: From Step 2
 - `{original_user_prompt_template}`: From Step 2
 
-### Step 9: Next Steps
+### Step 8: Next Steps
 
 Ask user:
 ```
@@ -526,7 +469,7 @@ If the user select 1 -> Load `create/SKILL.md` with context:
 - Pass the current seed prompt and error analysis so the create workflow can inform approach selection
 - Note: *"The customer is re-creating this function with a different approach. Skip to Step 4 (Select Creation Mode) — task description, clarifications, inputs, and outputs are already known. Default to Agent Research mode for the re-creation."*
 
-If the user select 2 -> Ask the customer for a new `auto_budget` and optionally new `models`. Then re-run optimization from Step 5 (Execute Optimization) with the updated settings.
+If the user select 2 -> Ask the customer for a new `auto_budget` and optionally new `models`. Then re-run optimization from Step 5 (Run Optimization) with the updated settings.
 
 If the user select 3:
 Try to run evaluation on the optimized version and see what the error types are. Then, critically reason through the following:
@@ -541,8 +484,8 @@ Critical confirmations (always stop, even if pre-provided):
 - ✋ Step 3: Confirm column mapping (input_columns, label_column)
 
 Optional confirmations:
-- ✋ Step 7: After presenting pareto-optimal results (get user selection)
-- ✋ Step 8: Before applying changes
+- ✋ Step 6: After presenting pareto-optimal results (get user selection)
+- ✋ Step 7: Before applying changes
 
 ## Troubleshooting
 
@@ -554,9 +497,8 @@ Optional confirmations:
 
 ## Output
 
-- Stage with optimizer code uploaded
-- Optimization SPROC created in Snowflake
 - VARIANT result with best prompts per model
 - Tracking table with optimization history
 - Updated AI function with optimized prompt (if applied)
 - Version metadata saved in AI_FUNCTION_VERSIONS table (if versioned)
+- No persistent artifacts — Python code is inlined into the anonymous SPROC

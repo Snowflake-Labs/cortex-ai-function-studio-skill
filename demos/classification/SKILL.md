@@ -83,7 +83,7 @@ I'll create these tables:
 
 Run the data generation script with the specified row counts:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/generate_toxicity_data.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_toxicity_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
   --schema {schema} \

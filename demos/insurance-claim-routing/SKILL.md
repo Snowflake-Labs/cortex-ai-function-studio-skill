@@ -122,7 +122,7 @@ Preview rows: 20
 
 If the default teacher model is unavailable, **load** `references/model_selection.md` and choose the strongest Claude-family option.
 
-**MANDATORY:** Do not synthesize labels ad hoc in this demo. **Load** `references/synthetic_data.md` and follow the **Pseudo-Label Input-Only Tables** workflow.
+**MANDATORY:** Do not synthesize labels ad hoc in this demo. **Load** `synthetic-data/SKILL.md` and follow the **Pseudo-Label Input-Only Tables** workflow.
 
 Pass this context into that workflow:
 - `source_table`: `{database}.{schema}.DEMO_CLAIMS_UNLABELED`
@@ -315,77 +315,7 @@ Fields and weights:
 
 Create the custom metric UDF directly in Snowflake. This follows the contract from `references/custom_metrics.md`:
 
-```sql
-CREATE OR REPLACE FUNCTION {database}.{schema}.DEMO_CLAIM_ROUTING_METRIC(
-    EXPECTED VARCHAR,
-    PREDICTED VARCHAR
-)
-RETURNS VARIANT
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.12'
-PACKAGES = ('snowflake-snowpark-python')
-HANDLER = 'evaluate'
-AS $$
-import ast
-import json
-
-def _parse_json(text):
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        pass
-    try:
-        return ast.literal_eval(text)
-    except (ValueError, SyntaxError):
-        pass
-    return None
-
-def evaluate(expected, predicted):
-    exp = _parse_json(expected)
-    pred = _parse_json(predicted)
-    if exp is None or pred is None:
-        return {"score": 0.0, "feedback": "Could not parse expected/predicted as JSON"}
-
-    sub_scores = []
-    feedback_parts = []
-
-    # claim_route: exact match (weight 0.5)
-    exp_route = str(exp.get("claim_route", "")).strip().lower()
-    pred_route = str(pred.get("claim_route", "")).strip().lower()
-    route_score = 1.0 if exp_route == pred_route else 0.0
-    sub_scores.append(("route", route_score, 0.5))
-    feedback_parts.append(f"route={'match' if route_score == 1.0 else 'MISMATCH: expected=' + exp_route + ' got=' + pred_route}")
-
-    # citation: contains check (weight 0.3)
-    exp_citation = str(exp.get("citation", "")).strip().lower()
-    pred_citation = str(pred.get("citation", "")).strip().lower()
-    if not exp_citation:
-        citation_score = 1.0
-    else:
-        citation_score = 1.0 if exp_citation in pred_citation else 0.0
-    sub_scores.append(("citation", citation_score, 0.3))
-    feedback_parts.append(f"citation={'found' if citation_score == 1.0 else 'missing'}")
-
-    # confidence: 1 - MSE (weight 0.2)
-    try:
-        exp_conf = float(exp.get("confidence", 0.5))
-        pred_conf = float(pred.get("confidence", 0.5))
-        conf_score = max(0.0, 1.0 - (exp_conf - pred_conf) ** 2)
-    except (TypeError, ValueError):
-        conf_score = 0.0
-    sub_scores.append(("confidence", conf_score, 0.2))
-    feedback_parts.append(f"confidence={conf_score:.2f}")
-
-    total_weight = sum(w for _, _, w in sub_scores)
-    combined = sum(s * w for _, s, w in sub_scores) / total_weight if total_weight > 0 else 0.0
-
-    detail = " | ".join(feedback_parts)
-    breakdown = ", ".join(f"{name}={s:.2f}*{w}" for name, s, w in sub_scores)
-    feedback = f"{detail} [weights: {breakdown}]"
-
-    return {"score": combined, "feedback": feedback}
-$$;
-```
+**Read** `demos/insurance-claim-routing/create_claim_routing_metric.sql`, substitute `{database}` and `{schema}` with the user's values, and execute the SQL.
 
 Verify the UDF was created:
 ```sql
@@ -454,7 +384,7 @@ If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passi
 - `auto_budget`: `medium`
 - `tracking_table`: `{database}.{schema}.DEMO_ROUTE_CLAIM_OPT_TRACKING`
 
-**Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`OPTIMIZE_AI_FUNCTION`) with `timeout_seconds: 1200` instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
+**Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`OPTIMIZE_AI_FUNCTION`) with `timeout_seconds: 14400` instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
 
 **Skip Step 9 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
 
@@ -471,7 +401,7 @@ ORDER BY METRIC_SCORE DESC
 LIMIT 10;
 ```
 
-**Cost savings emphasis:** Compare the best optimized model's score against the baseline from Step 7. Look up both models in `src/models.json` and use `get_model_cost()` from `scripts/filter_pareto.py` (use input ratio ~0.95 for short-output classification). Compute `cost_ratio = teacher_cost / best_model_cost`.
+**Cost savings emphasis:** Compare the best optimized model's score against the baseline from Step 7. Look up both models in `src/models.json` and use `get_model_cost()` from `src/filter_pareto.py` (use input ratio ~0.95 for short-output classification). Compute `cost_ratio = teacher_cost / best_model_cost`.
 
 If the optimized model matches or beats baseline, highlight:
 ```

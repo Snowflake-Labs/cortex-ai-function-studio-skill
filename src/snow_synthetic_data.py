@@ -18,7 +18,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from textwrap import dedent
 from typing import TypeVar
 
-from custom_ai_function_utils import with_custom_ai_function_query_tag, RobustAIComplete
+from custom_ai_function_utils import (
+    normalize_ddl_to_dollar_quoting,
+    with_custom_ai_function_query_tag,
+    RobustAIComplete,
+)
 from snowflake.snowpark import Session
 from snowflake.snowpark.functions import col, parse_json
 
@@ -246,6 +250,80 @@ def _normalize_sql_single_quotes_for_python(text: str) -> str:
     return "".join(out)
 
 
+def _parse_response_format_from_ddl(ddl: str) -> dict[str, object]:
+    """Extract the response_format dict from function DDL text.
+
+    Handles two DDL styles:
+    1. Named parameter: response_format=>PARSE_JSON('{"type":"json","schema":{...}}')
+    2. Dict literal:    'response_format': {'type': 'json', 'schema': {...}}
+    """
+    ddl = normalize_ddl_to_dollar_quoting(ddl)
+
+    # Style 1: named parameter with PARSE_JSON('...')
+    named_match = re.search(
+        r"response_format\s*=>\s*PARSE_JSON\s*\(\s*'", ddl, re.IGNORECASE
+    )
+    if named_match:
+        json_start = named_match.end()
+        # Walk forward to find the closing single quote, handling SQL-escaped ''
+        i = json_start
+        chars: list[str] = []
+        while i < len(ddl):
+            ch = ddl[i]
+            if ch == "'" and i + 1 < len(ddl) and ddl[i + 1] == "'":
+                chars.append("'")
+                i += 2
+            elif ch == "'":
+                break
+            else:
+                chars.append(ch)
+                i += 1
+        if i >= len(ddl):
+            raise ValueError(
+                "Unterminated PARSE_JSON string in function DDL: "
+                "no closing quote found after response_format=>PARSE_JSON('..."
+            )
+        json_str = "".join(chars)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Failed to parse response_format JSON from function DDL: {exc}"
+            ) from exc
+
+    # Style 2: dict-literal key inside an options object
+    rf_match = re.search(r"""['"]response_format['"]\s*:\s*""", ddl)
+    if not rf_match:
+        raise ValueError(
+            "Could not infer output schema: function DDL has no response_format. "
+            "Recreate function with a structured response_format."
+        )
+    start = rf_match.end()
+    while start < len(ddl) and ddl[start].isspace():
+        start += 1
+    if start >= len(ddl) or ddl[start] != "{":
+        raise ValueError(
+            "Could not parse response_format object from function DDL. "
+            "Recreate function with structured response_format."
+        )
+    snippet = _extract_balanced_object_literal(ddl, start)
+    if not snippet:
+        raise ValueError(
+            "Could not parse balanced response_format object in function DDL."
+        )
+    try:
+        return ast.literal_eval(snippet)
+    except (ValueError, SyntaxError):
+        pass
+    try:
+        normalized_snippet = _normalize_sql_single_quotes_for_python(snippet)
+        return ast.literal_eval(normalized_snippet)
+    except (ValueError, SyntaxError) as exc:
+        raise ValueError(
+            f"Failed to parse response_format from function DDL: {exc}"
+        ) from exc
+
+
 def _extract_response_schema_from_function(
     session: Session, function_name: str
 ) -> dict[str, object]:
@@ -309,42 +387,7 @@ def _extract_response_schema_from_function(
         raise ValueError(f"Could not retrieve DDL for function: {full_signature}")
 
     ddl = str(ddl_rows[0]["DDL"])
-    rf_match = re.search(r"""['"]response_format['"]\s*:\s*""", ddl)
-    if not rf_match:
-        raise ValueError(
-            "Could not infer output schema: function DDL has no response_format. "
-            "Recreate function with a structured response_format."
-        )
-
-    start = rf_match.end()
-    while start < len(ddl) and ddl[start].isspace():
-        start += 1
-    if start >= len(ddl) or ddl[start] != "{":
-        raise ValueError(
-            "Could not parse response_format object from function DDL. "
-            "Recreate function with structured response_format."
-        )
-
-    # The helpers above exist specifically for this DDL inference path: GET_DDL
-    # returns SQL-escaped text, so we first isolate the object literal and then
-    # normalize quoting before parsing it back into Python objects.
-    snippet = _extract_balanced_object_literal(ddl, start)
-    if not snippet:
-        raise ValueError(
-            "Could not parse balanced response_format object in function DDL."
-        )
-
-    response_format = None
-    try:
-        response_format = ast.literal_eval(snippet)
-    except (ValueError, SyntaxError):
-        try:
-            normalized_snippet = _normalize_sql_single_quotes_for_python(snippet)
-            response_format = ast.literal_eval(normalized_snippet)
-        except (ValueError, SyntaxError) as exc:
-            raise ValueError(
-                f"Failed to parse response_format from function DDL: {exc}"
-            ) from exc
+    response_format = _parse_response_format_from_ddl(ddl)
 
     if not isinstance(response_format, dict):
         raise ValueError("response_format in function DDL is not an object.")
@@ -478,9 +521,6 @@ def _prepare_generation_request(
     function_name: object | None,
     output_schema: object | None,
     num_examples: object,
-    easy_pct: object,
-    medium_pct: object,
-    batch_size: object,
     max_source_rows: object | None,
 ) -> dict[str, object]:
     """Normalize and validate all request preconditions in one place."""
@@ -495,23 +535,13 @@ def _prepare_generation_request(
     function_name_str = _normalize_optional_text(function_name)
     resolved_model = _resolve_model_name(model, pseudo_mode=is_pseudo_mode)
 
-    batch_size_int = _coerce_int("BATCH_SIZE", batch_size, minimum=1)
     num_examples_int = _coerce_int("NUM_EXAMPLES", num_examples)
-    easy_pct_int = _coerce_int("EASY_PCT", easy_pct)
-    medium_pct_int = _coerce_int("MEDIUM_PCT", medium_pct)
     max_source_rows_int = _coerce_optional_int(
         "MAX_SOURCE_ROWS", max_source_rows, minimum=1
     )
 
-    for pct_name, pct_value in (
-        ("EASY_PCT", easy_pct_int),
-        ("MEDIUM_PCT", medium_pct_int),
-    ):
-        if pct_value < 0 or pct_value > 100:
-            raise ValueError(f"{pct_name} must be between 0 and 100.")
-
     input_cols = _normalize_input_columns(input_columns)
-    reserved = {"ID", "EXPECTED", "DIFFICULTY"}
+    reserved = {"ID", "EXPECTED"}
     collisions = sorted([c for c in input_cols if c in reserved])
     if collisions:
         raise ValueError(
@@ -530,10 +560,7 @@ def _prepare_generation_request(
         "input_cols": input_cols,
         "output_cols": output_cols,
         "output_properties": output_properties,
-        "batch_size": batch_size_int,
         "num_examples": num_examples_int,
-        "easy_pct": easy_pct_int,
-        "medium_pct": medium_pct_int,
         "source_table": source_table_str,
         "max_source_rows": max_source_rows_int,
     }
@@ -543,10 +570,6 @@ def _prepare_generation_request(
 
     if num_examples_int <= 0:
         raise ValueError("NUM_EXAMPLES must be > 0.")
-    hard_pct = 100 - easy_pct_int - medium_pct_int
-    if hard_pct < 0:
-        raise ValueError("easy_pct + medium_pct cannot exceed 100")
-    request["hard_pct"] = hard_pct
     return request
 
 
@@ -675,13 +698,12 @@ def _generate_batch(
     batch_size: int,
     batch_idx: int,
     model: str,
-    difficulty: str = "medium",
     *,
     input_columns: list[str],
     output_keys: list[str],
     output_properties: dict[str, dict[str, object]] | None = None,
 ) -> list[dict]:
-    """Generate a single batch of synthetic examples at a specific difficulty.
+    """Generate a single batch of synthetic examples.
 
     Args:
         session: Snowpark session
@@ -689,7 +711,6 @@ def _generate_batch(
         batch_size: Number of examples to generate in this batch
         batch_idx: Current batch index (for diversity hints)
         model: Cortex model name to use for generation
-        difficulty: Target difficulty level ("easy", "medium", or "hard")
 
     Returns:
         List of example dicts
@@ -698,12 +719,6 @@ def _generate_batch(
     output_cols = output_keys
     output_props = output_properties or {col_name: {} for col_name in output_cols}
 
-    difficulty_guidance = {
-        "easy": "Generate straightforward, common cases with clear inputs and obvious expected outputs. These should be simple examples that any basic implementation should handle correctly.",
-        "medium": "Generate moderately complex cases that require some reasoning or handling of unusual and creative scenarios. Include cases with multiple valid interpretations or edge conditions.",
-        "hard": "Generate challenging cases with ambiguous inputs, edge cases, special characters, multi-step reasoning, or scenarios that might trip up naive implementations.",
-    }
-
     diversity_hints = [
         "Focus on realistic production-like examples.",
         "Include varied formatting and structure.",
@@ -711,8 +726,6 @@ def _generate_batch(
         "Include examples with varying input lengths.",
     ]
     hint = diversity_hints[batch_idx % len(diversity_hints)]
-
-    diff_guidance = difficulty_guidance.get(difficulty, difficulty_guidance["medium"])
 
     col_list = ", ".join(input_cols)
     col_pairs = ", ".join([f'"{c}": "..."' for c in input_cols])
@@ -753,11 +766,9 @@ def _generate_batch(
 
     base_prompt = dedent(f"""\
         Generate exactly {batch_size} UNIQUE test examples for this AI function.
-        ALL examples must be {difficulty.upper()} difficulty.
+        Include a mix of straightforward cases and moderately challenging edge cases.
 
         Function intention: {task_description}
-
-        Difficulty guidance ({difficulty}): {diff_guidance}
 
         Additional guidance: {hint}
 
@@ -832,40 +843,30 @@ def _generate_batch(
     return normalizer.normalize_examples(parsed)
 
 
-def _generate_examples_for_difficulty(
+def _generate_examples(
     session: Session,
     task_description: str,
     num_examples: int,
-    difficulty: str,
     model: str,
-    batch_size: int,
     *,
     input_columns: list[str],
     output_keys: list[str],
     output_properties: dict[str, dict[str, object]] | None = None,
 ) -> tuple[list[dict], list[str]]:
-    """Generate examples for a specified difficulty level.
+    """Generate synthetic examples using batched LLM calls with retries.
 
     Initial batches run in parallel via a thread pool. If any batch fails or
     returns fewer examples than requested, sequential retry calls fill the gap.
 
-    Args:
-        session: Snowpark session
-        task_description: Description of the AI function task
-        num_examples: Number of examples to generate
-        difficulty: Target difficulty level
-        model: Cortex model name to use for generation
-        batch_size: Maximum examples per batch
-
     Returns:
         Tuple of (examples list, errors list)
     """
+    batch_size = min(100, num_examples)
     examples: list[dict] = []
     errors: list[str] = []
 
-    # Generate in batches, allowing multiple retries across batches.
     required_batches = max(1, (num_examples + batch_size - 1) // batch_size)
-    batch_specs: list[tuple[int, int]] = []  # (batch_idx, batch_size)
+    batch_specs: list[tuple[int, int]] = []
     remaining = num_examples
     for i in range(required_batches):
         current = min(batch_size, remaining)
@@ -881,7 +882,6 @@ def _generate_examples_for_difficulty(
                 batch_size=size,
                 batch_idx=idx,
                 model=model,
-                difficulty=difficulty,
                 input_columns=input_columns,
                 output_keys=output_keys,
                 output_properties=output_properties,
@@ -894,13 +894,11 @@ def _generate_examples_for_difficulty(
             try:
                 batch_examples = future.result()
                 if batch_examples:
-                    for ex in batch_examples:
-                        ex["difficulty"] = difficulty
                     examples.extend(batch_examples)
                 else:
-                    errors.append(f"{difficulty} batch {idx + 1} returned 0 examples")
-            except Exception as e:
-                errors.append(f"{difficulty} batch {idx + 1} error: {str(e)}")
+                    errors.append(f"batch {idx + 1} returned 0 examples")
+            except Exception as e:  # noqa: BLE001 — broad catch is intentional; LLM + Snowpark calls can raise ValueError, RuntimeError, JSONDecodeError, or SnowparkSQLException
+                errors.append(f"batch {idx + 1} error: {str(e)}")
 
     max_retries = required_batches * 2
     retry_idx = 0
@@ -916,29 +914,26 @@ def _generate_examples_for_difficulty(
                 batch_size=current_batch_size,
                 batch_idx=call_offset + retry_idx,
                 model=model,
-                difficulty=difficulty,
                 input_columns=input_columns,
                 output_keys=output_keys,
                 output_properties=output_properties,
             )
-        except Exception as e:
-            errors.append(f"{difficulty} retry {retry_idx + 1} error: {str(e)}")
+        except Exception as e:  # noqa: BLE001 — broad catch is intentional; LLM + Snowpark calls can raise ValueError, RuntimeError, JSONDecodeError, or SnowparkSQLException
+            errors.append(f"retry {retry_idx + 1} error: {str(e)}")
             retry_idx += 1
             continue
 
         if not batch_examples:
-            errors.append(f"{difficulty} retry {retry_idx + 1} returned 0 examples")
+            errors.append(f"retry {retry_idx + 1} returned 0 examples")
             retry_idx += 1
             continue
 
-        for ex in batch_examples:
-            ex["difficulty"] = difficulty
         examples.extend(batch_examples)
         retry_idx += 1
 
     if len(examples) < num_examples:
         raise RuntimeError(
-            f"Failed to generate {num_examples} {difficulty} examples after "
+            f"Failed to generate {num_examples} examples after "
             f"{required_batches} parallel + {retry_idx} retry call(s) "
             f"(generated {len(examples)}). Errors: {errors}"
         )
@@ -955,8 +950,7 @@ def _create_output_table(
         CREATE OR REPLACE TABLE {output_table} (
             ID INT AUTOINCREMENT,
             {input_col_ddl},
-            EXPECTED VARIANT,
-            DIFFICULTY VARCHAR
+            EXPECTED VARIANT
         )
     """).collect()
 
@@ -967,12 +961,11 @@ def _insert_examples(
     input_cols: list[str],
     output_cols: list[str],
     examples: list[dict],
-) -> dict[str, int]:
-    """Insert normalized examples in batches and return difficulty counts."""
+) -> int:
+    """Insert normalized examples in batches and return total count."""
     if not examples:
-        return {}
+        return 0
 
-    difficulty_counts: dict[str, int] = {}
     insert_rows: list[list[object]] = []
     for example in examples:
         raw_inputs = example.get("inputs")
@@ -981,7 +974,6 @@ def _insert_examples(
         output_vals: dict[str, object] = (
             raw_outputs if isinstance(raw_outputs, dict) else {}
         )
-        difficulty = str(example.get("difficulty", "medium"))
 
         row_values: list[object] = [
             str(inputs.get(col_name, "")) for col_name in input_cols
@@ -989,13 +981,9 @@ def _insert_examples(
         expected_obj = {col_name: output_vals.get(col_name) for col_name in output_cols}
         expected_json = json.dumps(expected_obj, ensure_ascii=False)
         row_values.append(expected_json)
-        row_values.append(difficulty)
         insert_rows.append(row_values)
 
-        diff_key = difficulty.lower()
-        difficulty_counts[diff_key] = difficulty_counts.get(diff_key, 0) + 1
-
-    source_schema = [*input_cols, "EXPECTED_JSON", "DIFFICULTY"]
+    source_schema = [*input_cols, "EXPECTED_JSON"]
     batch_size = 1000
     for start_idx in range(0, len(insert_rows), batch_size):
         chunk_rows = insert_rows[start_idx : start_idx + batch_size]
@@ -1003,11 +991,10 @@ def _insert_examples(
         payload_df = chunk_df.select(
             *[col(name) for name in input_cols],
             parse_json(col("EXPECTED_JSON")).alias("EXPECTED"),
-            col("DIFFICULTY"),
         )
         payload_df.write.mode("append").save_as_table(output_table, column_order="name")
 
-    return difficulty_counts
+    return len(insert_rows)
 
 
 def _build_pseudo_label_prompt(
@@ -1178,9 +1165,7 @@ def _generate_pseudo_labeled_examples(
                 f"expected {len(batch)}, got {len(outputs)}"
             )
         for inputs, outputs_obj in zip(batch, outputs):
-            all_examples.append(
-                {"inputs": inputs, "outputs": outputs_obj, "difficulty": "pseudo"}
-            )
+            all_examples.append({"inputs": inputs, "outputs": outputs_obj})
 
     return all_examples
 
@@ -1192,10 +1177,7 @@ def generate_synthetic_data(
     output_table: str,
     input_columns: object,
     model: str | None = None,
-    num_examples: int = 500,
-    easy_pct: int = 50,
-    medium_pct: int = 30,
-    batch_size: int = 100,
+    num_examples: int = 50,
     source_table: str | None = None,
     function_name: str | None = None,
     output_schema: object | None = None,
@@ -1212,9 +1194,6 @@ def generate_synthetic_data(
         input_columns: Input columns to generate/map
         model: Cortex model name (required for synthetic mode; optional in pseudo-label mode)
         num_examples: Total number of synthetic examples to generate
-        easy_pct: Percentage of easy examples (0-100)
-        medium_pct: Percentage of medium examples (0-100)
-        batch_size: Maximum records per LLM call
         source_table: Optional source table for pseudo-label mode
         function_name: Optional function name used for output schema inference
         output_schema: Optional explicit JSON schema for outputs
@@ -1237,9 +1216,6 @@ def generate_synthetic_data(
             function_name=function_name,
             output_schema=output_schema,
             num_examples=num_examples,
-            easy_pct=easy_pct,
-            medium_pct=medium_pct,
-            batch_size=batch_size,
             max_source_rows=max_source_rows,
         )
 
@@ -1247,7 +1223,6 @@ def generate_synthetic_data(
         output_cols = request["output_cols"]
         output_properties = request["output_properties"]
         resolved_model = str(request["model"])
-        batch_size = int(request["batch_size"])
 
         if request["mode"] == "pseudo_label":
             source_table_str = str(request["source_table"])
@@ -1255,6 +1230,7 @@ def generate_synthetic_data(
             max_source_rows_int = (
                 int(max_source_rows_val) if max_source_rows_val is not None else None
             )
+            batch_size = min(100, max_source_rows_int or 100)
             all_examples = _generate_pseudo_labeled_examples(
                 session,
                 task_description=task_description,
@@ -1267,14 +1243,13 @@ def generate_synthetic_data(
                 model=resolved_model,
             )
             _create_output_table(session, output_table, input_cols)
-            difficulty_counts = _insert_examples(
+            _insert_examples(
                 session,
                 output_table=output_table,
                 input_cols=input_cols,
                 output_cols=output_cols,
                 examples=all_examples,
             )
-            difficulty_counts.setdefault("pseudo", 0)
             return {
                 "success": True,
                 "mode": "pseudo_label",
@@ -1284,80 +1259,22 @@ def generate_synthetic_data(
                 "total_generated": len(all_examples),
                 "input_columns": input_cols,
                 "expected_keys": output_cols,
-                "difficulty_distribution": difficulty_counts,
                 "is_preview": max_source_rows_val is not None,
                 "batch_errors": None,
             }
 
         # Synthetic generation mode.
         num_examples = int(request["num_examples"])
-        easy_pct = int(request["easy_pct"])
-        medium_pct = int(request["medium_pct"])
 
-        target_easy = int(num_examples * easy_pct / 100)
-        target_medium = int(num_examples * medium_pct / 100)
-        target_hard = num_examples - target_easy - target_medium
-
-        all_examples = []
-        batch_errors = []
-        effective_batch_size = min(batch_size, num_examples)
-
-        difficulty_targets = [
-            ("easy", target_easy),
-            ("medium", target_medium),
-            ("hard", target_hard),
-        ]
-        active_targets = [
-            (difficulty, target_num_examples)
-            for difficulty, target_num_examples in difficulty_targets
-            if target_num_examples > 0
-        ]
-
-        if active_targets:
-            # Difficulty levels are independent, so generate them concurrently.
-            results_by_difficulty: dict[str, tuple[list[dict], list[str]]] = {}
-            generation_errors: list[str] = []
-
-            with ThreadPoolExecutor(
-                max_workers=min(3, len(active_targets))
-            ) as executor:
-                future_to_difficulty = {
-                    executor.submit(
-                        _generate_examples_for_difficulty,
-                        session=session,
-                        task_description=task_description,
-                        num_examples=target_num_examples,
-                        difficulty=difficulty,
-                        model=resolved_model,
-                        batch_size=effective_batch_size,
-                        input_columns=input_cols,
-                        output_keys=output_cols,
-                        output_properties=output_properties,
-                    ): difficulty
-                    for difficulty, target_num_examples in active_targets
-                }
-
-                for future in as_completed(future_to_difficulty):
-                    difficulty = future_to_difficulty[future]
-                    try:
-                        examples, errors = future.result()
-                        results_by_difficulty[difficulty] = (examples, errors)
-                    except Exception as exc:
-                        generation_errors.append(
-                            f"{difficulty} generation failed: {exc}"
-                        )
-
-            if generation_errors:
-                raise RuntimeError("; ".join(generation_errors))
-
-            # Preserve stable difficulty ordering in downstream inserts/statistics.
-            for difficulty, _ in difficulty_targets:
-                result = results_by_difficulty.get(difficulty)
-                if not result:
-                    continue
-                examples, errors = result
-                all_examples.extend(examples)
-                batch_errors.extend(errors)
+        all_examples, batch_errors = _generate_examples(
+            session=session,
+            task_description=task_description,
+            num_examples=num_examples,
+            model=resolved_model,
+            input_columns=input_cols,
+            output_keys=output_cols,
+            output_properties=output_properties,
+        )
 
         if not all_examples:
             return {
@@ -1367,15 +1284,13 @@ def generate_synthetic_data(
             }
 
         _create_output_table(session, output_table, input_cols)
-        difficulty_counts = _insert_examples(
+        _insert_examples(
             session,
             output_table=output_table,
             input_cols=input_cols,
             output_cols=output_cols,
             examples=all_examples,
         )
-        for key in ("easy", "medium", "hard"):
-            difficulty_counts.setdefault(key, 0)
 
         return {
             "success": True,
@@ -1384,9 +1299,8 @@ def generate_synthetic_data(
             "output_table": output_table,
             "total_generated": len(all_examples),
             "input_columns": input_cols,
-            "expected_keys": output_cols,  # Keys within the EXPECTED VARIANT column
-            "difficulty_distribution": difficulty_counts,
+            "expected_keys": output_cols,
             "batch_errors": batch_errors if batch_errors else None,
         }
-    except (TypeError, ValueError, RuntimeError) as exc:
+    except (TypeError, ValueError, RuntimeError, KeyError) as exc:
         return {"success": False, "error": str(exc)}

@@ -21,7 +21,7 @@ Metrics are implemented as core Python functions with no external dependencies (
 | `fuzzy_match` | Minor variations, typos acceptable | 1.0 if similarity >= threshold |
 | `contains_match` | Key answer embedded in verbose output | 1.0 if expected in predicted |
 | `redaction_match` | PII redaction, placeholder content varies | 1.0 if text matches outside brackets |
-| `llm_judge` | Open-ended, paraphrases acceptable | 1.0 if LLM judges correct |
+| `llm_judge` | Open-ended, paraphrases acceptable | 1.0 if LLM judges correct, else 0.0 |
 
 ## Core Function Signatures
 

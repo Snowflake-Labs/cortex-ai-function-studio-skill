@@ -1,0 +1,32 @@
+# Copyright (c) 2026 Snowflake Inc. All rights reserved.
+# Licensed under the Snowflake Skills License.
+# Refer to the LICENSE file in the root of this repository for full terms.
+
+# Inline SPROC configuration
+#
+# Each SPROC type lists its Python source dependencies in load order
+# (dependencies first) and the handler function for inline mode.
+#
+# In IMPORTS mode the handler is "module.function" (e.g. metrics_core.evaluate_handler).
+# In inline mode all files are concatenated into one $$ block, so the
+# handler is just the bare function name.
+
+evaluate:
+  sources:
+    - custom_ai_function_utils.py
+    - metrics_core.py
+  handler: evaluate_handler
+
+optimize:
+  sources:
+    - custom_ai_function_utils.py
+    - metrics_core.py
+    - snow_gepa_adapter.py
+    - snow_gepa_optimize.py
+  handler: run_optimization
+
+synthetic:
+  sources:
+    - custom_ai_function_utils.py
+    - snow_synthetic_data.py
+  handler: generate_synthetic_data

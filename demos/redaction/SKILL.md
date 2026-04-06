@@ -84,7 +84,7 @@ I'll create these tables:
 
 Run the data generation script with the specified row counts:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/generate_redaction_data.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_redaction_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
   --schema {schema} \
@@ -140,7 +140,7 @@ Store the confirmed settings (function_name, model, system_prompt, user_prompt_t
 Create the function using `create_udf.py` with the confirmed settings:
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py --json '{
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py --json '{
   "database": "{database}",
   "schema": "{schema}",
   "function_name": "{function_name}",

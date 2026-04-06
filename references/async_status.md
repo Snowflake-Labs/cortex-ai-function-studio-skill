@@ -261,7 +261,7 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
    WHERE RUN_ID = '{run_id}';
    ```
 
-2. Present results using the same format as `evaluate/SKILL.md` Step 6:
+2. Present results using the same format as `evaluate/SKILL.md` Step 5:
    ```
    Evaluation Results
    ==================
@@ -274,9 +274,9 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
    Average Score: {score:.1%}
    ```
 
-3. Show the helpful queries (failures, score distribution, etc.) from `evaluate/SKILL.md` Step 6.
+3. Show the helpful queries (failures, score distribution, etc.) from `evaluate/SKILL.md` Step 5.
 
-4. Present the `evaluate/SKILL.md` Step 7 next-steps menu:
+4. Present the `evaluate/SKILL.md` Step 6 next-steps menu:
    ```
    What would you like to do?
    1. Optimize (recommended) - Improve the function through prompt tuning and model selection
@@ -296,6 +296,6 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
    ORDER BY BEST_SCORE DESC;
    ```
 
-2. Present results per `optimize/SKILL.md` Step 7 format: seed vs best scores, improvement, candidate count, and prompts.
+2. Present results per `optimize/SKILL.md` Step 6 format: seed vs best scores, improvement, candidate count, and prompts.
 
-3. Proceed to `optimize/SKILL.md` Step 8 (Select Best Result) to let the user choose a pareto-optimal option and apply it.
+3. Proceed to `optimize/SKILL.md` Step 7 (Select Best Result) to let the user choose a pareto-optimal option and apply it.
