@@ -22,6 +22,7 @@ Before starting the workflow, scan the user's message and conversation context f
 | `clarifications` | Yes | (gathered) | No | task_description |
 | `input_source` | Yes | - | No | - |
 | `source_table` | If from_table | - | No | input_source |
+| `source_stage` | If multimodal | @{db}.{schema}.AI_FUNCTIONS | No | input_source |
 | `inputs` | Yes | - | **Yes** | input_source |
 | `outputs` | Yes | - | **Yes** | - |
 | `creation_mode` | Yes (direct, research) | - | No | clarifications, inputs, outputs |
@@ -94,6 +95,8 @@ Questions to consider (ask only what's missing):
 
 #### Step 3: Define Inputs and Outputs
 
+**If the user explicitly asks to process images, documents, or files from a stage**, load `references/multimodal_setup.md` and follow its workflow for multimodal input handling, model selection, and UDF generation. The default is text-only — do not suggest multimodal unprompted.
+
 **Determine input source:**
 
 **If `inputs` already collected** (user provided input definitions):
@@ -118,11 +121,18 @@ DESCRIBE TABLE <table_name>
 ```
 Show columns and ask user to select which are **inputs** and what **outputs** the function should return.
 
+**Detecting file inputs from table schema:** When running `DESCRIBE TABLE`, check each selected input column's data type:
+- If type is **FILE** → use `sql_type: "FILE"` in the config. The function will accept FILE directly.
+- If type is **VARCHAR** and sample values look like stage file paths (contain `/`, end with file extensions like `.jpg`, `.pdf`, etc.) → use `sql_type: "STAGE_FILE_PATH"`. The function will cast to FILE internally via `TO_FILE()`. Ask user for the stage name.
+- Otherwise → regular text/scalar input.
+
+The function signature must match the table's column types so `SELECT func(col) FROM table` works without any extra wrapping. Load `references/multimodal_setup.md` for full detection flow and model selection when file inputs are detected.
+
 **If Manual Spec:** Collect input parameters and output fields:
 ```
 Input 1:
   - Name: (e.g., customer_message)
-  - SQL Type: [VARCHAR] (or NUMBER, FLOAT, BOOLEAN, VARIANT)
+  - SQL Type: [VARCHAR] (or NUMBER, FLOAT, BOOLEAN, VARIANT, FILE)
 
 Output 1:
   - Name: (e.g., sentiment)
@@ -140,7 +150,7 @@ Now that I understand your task, how would you like to build the function?
 
 1. **Direct** — I'll create a straightforward AI_COMPLETE function with a system prompt
    and user prompt template. Best for simple tasks where the LLM output is used as-is.
-2. **Agent Research** (recommended) — I'll research state-of-the-art techniques and
+2. **Agent Research** (experimental) — I'll research state-of-the-art techniques and
    propose implementation approaches with SQL pre- and post-processing strategies.
    You'll pick the approach that fits best, or describe your own.
 ```
@@ -283,7 +293,7 @@ After confirmation, execute the DDL.
 
 	Build the JSON configuration from confirmed system prompt, user prompt template, inputs, and outputs:
 	```bash
-	uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+	uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
 	    --execute \
 	    --json '<JSON_CONFIG>' \
 	    --connection <CONNECTION_NAME> \
@@ -294,7 +304,7 @@ After confirmation, execute the DDL.
 
 	Pass the confirmed DDL directly:
 	```bash
-	uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+	uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
 	    --execute \
 	    --sql-body '<COMPLETE_CREATE_FUNCTION_DDL>' \
 	    --connection <CONNECTION_NAME> \
@@ -326,12 +336,6 @@ What would you like to do?
 3. **Test** - Run a quick test with sample inputs via SQL
 4. **Done** - Exit for now
 ```
-
-**Before evaluating or optimizing**, set up infrastructure:
-
-**⚠️ STOP**: Get user confirmation before proceeding with infrastructure setup.
-
-**Load** `references/infrastructure_setup.md` and run the deploy script to provision stage, modules, and procedures.
 
 If evaluate → Load `evaluate/SKILL.md` with context:
 - Preserve function name, database, schema

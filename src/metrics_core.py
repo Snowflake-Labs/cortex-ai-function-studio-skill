@@ -19,7 +19,12 @@ import pandas as pd
 from snowflake.snowpark import Session
 import json
 
-from custom_ai_function_utils import with_custom_ai_function_query_tag, RobustAIComplete
+from custom_ai_function_utils import (
+    validate_stage_file_access,
+    with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc,
+    with_custom_ai_function_query_tag,
+    RobustAIComplete,
+)
 
 LLM_JUDGE_DEFAULT_MODEL = "claude-sonnet-4-5"
 LLM_JUDGE_DEFAULT_TEMP = 0.0
@@ -607,11 +612,85 @@ def redaction_match_core(
     return score, feedback
 
 
-def parse_llm_response(response: object) -> str:
-    """Convert AI_COMPLETE output into plain text."""
-    if response is None:
-        return ""
-    return str(response)
+_LLM_JUDGE_BINARY_TEMPLATE = (
+    "Evaluate if the prediction is semantically correct.\n\n"
+    "Task: {task_description}\n"
+    "Expected: {expected}\n"
+    "Predicted: {predicted}\n\n"
+    "Score 1 if the prediction is correct, 0 if incorrect."
+)
+
+_LLM_JUDGE_BINARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "description": "1 if correct, 0 if incorrect",
+        },
+        "feedback": {
+            "type": "string",
+            "description": "Brief explanation for the score",
+        },
+    },
+    "required": ["score", "feedback"],
+    "additionalProperties": False,
+}
+
+_LLM_JUDGE_CONTINUOUS_TEMPLATE = (
+    "You are a precise grading assistant. Evaluate how well the prediction "
+    "matches the expected output for the given task.\n\n"
+    "Task: {task_description}\n"
+    "Expected: {expected}\n"
+    "Predicted: {predicted}\n\n"
+    "Score from 0.0 to 1.0. Use the full range — assign any value that "
+    "reflects the degree of correctness.\n\n"
+    "Rubric:\n"
+    "- 1.0: Semantically identical or fully correct.\n"
+    "- 0.7-0.9: Mostly correct with minor differences that don't change meaning.\n"
+    "- 0.4-0.6: Partially correct — captures some key information but misses important parts.\n"
+    "- 0.1-0.3: Mostly wrong but contains a small relevant element.\n"
+    "- 0.0: Completely wrong or unrelated.\n\n"
+    "Use these as guidelines, not hard boundaries. "
+    "Prioritize semantic meaning over surface-level wording."
+)
+
+_LLM_JUDGE_CONTINUOUS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "number",
+            "description": "Score from 0.0 to 1.0",
+        },
+        "feedback": {
+            "type": "string",
+            "description": "Brief explanation for the score",
+        },
+    },
+    "required": ["score", "feedback"],
+    "additionalProperties": False,
+}
+
+
+def _parse_binary_result(raw: object) -> tuple[float, str]:
+    """Parse a structured JSON judge response into a binary (0/1) score."""
+    score, feedback = _parse_metric_result(raw)
+    return (1.0 if score >= 0.5 else 0.0), feedback
+
+
+def _parse_continuous_result(raw: object) -> tuple[float, str]:
+    """Parse a structured JSON judge response into (score, feedback).
+
+    Reuses ``_parse_metric_result`` (shared with custom metric UDFs) and
+    clamps the score to [0.0, 1.0].
+    """
+    score, feedback = _parse_metric_result(raw)
+    return max(0.0, min(1.0, score)), feedback
+
+
+_LLM_JUDGE_FILE_ADDENDUM = (
+    "\n\nThe attached file shows the actual input. "
+    "Use it to verify the prediction."
+)
 
 
 def llm_judge_batch(
@@ -621,41 +700,63 @@ def llm_judge_batch(
     model_name: str = LLM_JUDGE_DEFAULT_MODEL,
     temperature: float = LLM_JUDGE_DEFAULT_TEMP,
     max_tokens: int = LLM_JUDGE_DEFAULT_MAX_TOKENS,
+    scoring_mode: str = "binary",
+    file_paths: list[str] | None = None,
+    stage_name: str | list[str] | None = None,
+    **_kwargs,
 ) -> list[tuple[float, str]]:
-    """Batched LLM judge - evaluates all items in a single SQL query.
+    """Batched LLM judge -- evaluates all items in a single SQL query.
 
     This is the core implementation that all llm_judge calls use.
     Even single-item calls go through this for consistency.
 
     Args:
-        items: List of (expected, predicted) tuples to evaluate
-        session: Snowpark session for calling AI_COMPLETE
-        task_description: Description of the task for context
-        model_name: Model to use for evaluation
-        temperature: Temperature for model inference
-        max_tokens: Maximum tokens for response
+        items: List of (expected, predicted) tuples to evaluate.
+        session: Snowpark session for calling AI_COMPLETE.
+        task_description: Description of the task for context.
+        model_name: Model to use for evaluation.
+        temperature: Temperature for model inference.
+        max_tokens: Maximum tokens for response.
+        scoring_mode: ``"binary"`` (default) returns 1.0/0.0.
+            ``"continuous"`` returns 0.0--1.0, giving GEPA richer
+            gradient for prompt optimization.  Both modes use
+            structured JSON output.
+        file_paths: Optional list of stage-relative file paths,
+            one per item.  When provided together with ``stage_name``,
+            the judge receives the file via ``TO_FILE()`` for
+            multimodal evaluation.
+        stage_name: Snowflake stage for the files. Pass a ``str``
+            for a single stage or ``list[str]`` for per-row stages.
 
     Returns:
-        List of (score, feedback) tuples in the same order as input items
+        List of (score, feedback) tuples in the same order as input items.
     """
     if not items:
         return []
 
-    judge_prompts: list[str] = []
-    for expected, predicted in items:
-        judge_prompts.append(
-            dedent(
-                f"""
-            Evaluate if the prediction is semantically correct.
+    continuous = scoring_mode == "continuous"
+    template = _LLM_JUDGE_CONTINUOUS_TEMPLATE if continuous else _LLM_JUDGE_BINARY_TEMPLATE
+    parser = _parse_continuous_result if continuous else _parse_binary_result
 
-            Task: {task_description}
-            Expected: {expected}
-            Predicted: {predicted}
+    multimodal = bool(file_paths and stage_name)
+    if multimodal:
+        if len(file_paths) != len(items):
+            raise ValueError(
+                f"file_paths length ({len(file_paths)}) "
+                f"must match items length ({len(items)})"
+            )
 
-            Respond with exactly: CORRECT: <reason> or INCORRECT: <reason>
-        """
-            ).strip()
+    file_addendum = _LLM_JUDGE_FILE_ADDENDUM if multimodal else ""
+
+    judge_prompts = [
+        template.format(
+            task_description=task_description,
+            expected=expected,
+            predicted=predicted,
         )
+        + file_addendum
+        for expected, predicted in items
+    ]
 
     responses = RobustAIComplete.call_ai_complete(
         session,
@@ -663,18 +764,13 @@ def llm_judge_batch(
         user_prompts=judge_prompts,
         temperature=temperature,
         max_tokens=max_tokens,
-        response_schema=None,
+        response_schema=_LLM_JUDGE_CONTINUOUS_SCHEMA if continuous else _LLM_JUDGE_BINARY_SCHEMA,
+        file_paths=file_paths if multimodal else None,
+        stage_name=stage_name if multimodal else None,
     )
 
-    outputs: list[tuple[float, str]] = []
-    for response_json in responses or []:
-        response_text = parse_llm_response(response_json)
-        if response_text.strip().upper().startswith("CORRECT"):
-            outputs.append((1.0, response_text.split(":", 1)[-1].strip()))
-        else:
-            outputs.append((0.0, response_text.split(":", 1)[-1].strip()))
+    outputs = [parser(r) for r in (responses or [])]
 
-    # AI_COMPLETE is invoked row-per-prompt, so we expect cardinality to match.
     if len(outputs) != len(items):
         raise RuntimeError(
             f"LLM judge returned {len(outputs)} responses for {len(items)} inputs"
@@ -692,10 +788,14 @@ def llm_judge_core(
     model_name: str = LLM_JUDGE_DEFAULT_MODEL,
     temperature: float = LLM_JUDGE_DEFAULT_TEMP,
     max_tokens: int = LLM_JUDGE_DEFAULT_MAX_TOKENS,
+    scoring_mode: str = "binary",
+    **kwargs,
 ) -> tuple:
     """Uses an LLM to evaluate semantic correctness.
 
     Internally uses batched evaluation for consistency (even for single items).
+    Extra ``kwargs`` (e.g. ``file_paths``, ``stage_name``) are
+    forwarded to :func:`llm_judge_batch`.
     """
     if session is None:
         raise ValueError("llm_judge requires a session")
@@ -706,6 +806,8 @@ def llm_judge_core(
         model_name,
         temperature,
         max_tokens,
+        scoring_mode=scoring_mode,
+        **kwargs,
     )
     return results[0] if results else (0.0, "Evaluation failed")
 
@@ -728,7 +830,7 @@ def compute_classification_objectives(items: list[tuple[str, str]]) -> dict[str,
         return {}
 
     expected_labels, predicted_labels = zip(
-        *[(e.strip().lower(), p.strip().lower()) for e, p in items]
+        *[(str(e).strip().lower(), str(p).strip().lower()) for e, p in items]
     )
 
     accuracy = sum(
@@ -857,6 +959,8 @@ BATCH_FUNCTIONS: dict[str, Callable[..., list[tuple[float, str]]]] = {
     "llm_judge": llm_judge_batch,
 }
 
+PredictionExecutor = Callable[[list[dict[str, object]]], list[object]]
+
 
 def compute_metric_batch(
     metric_name: str,
@@ -894,6 +998,68 @@ def compute_metric_batch(
         compute_metric(metric_name, exp, pred, session, **kwargs) for exp, pred in items
     ]
 
+def _collect_eval_rows(
+    session,
+    *,
+    test_table: str,
+    input_columns: list,
+    label_column: str,
+    metric_name: str,
+    metric_options: dict | None,
+    sample_size: int | None,
+    function_name: str | None = None,
+    include_predicted: bool = False,
+) -> tuple[list[str], str | None, dict, list]:
+    metric_opts, output_field, multi_expected_cols = parse_metric_options(
+        metric_options
+    )
+
+    input_cols = [col.strip('"').strip("'") for col in input_columns]
+    table_columns = get_table_column_names(session, test_table)
+    validate_input_columns(table_columns, input_cols, test_table)
+
+    expected_col_name = resolve_expected_column(table_columns, label_column)
+
+    columns = ", ".join([quote_identifier(col) for col in input_cols])
+    expected_expr = f"{quote_identifier(expected_col_name)} AS EXPECTED"
+
+    if metric_name == "llm_judge" and len(multi_expected_cols) > 1:
+        resolved_pairs = resolve_multi_output_columns(
+            table_columns, multi_expected_cols
+        )
+        if resolved_pairs:
+            output_field = None
+            expected_expr = build_object_construct_expr(resolved_pairs, "EXPECTED")
+        elif table_columns and expected_col_name.upper() not in table_columns:
+            raise ValueError(
+                "Expected output columns not found in test table. "
+                f"Provided expected_columns={multi_expected_cols}, label_column={label_column}, "
+                f"available_columns={sorted(table_columns)}"
+            )
+
+    predicted_expr = ""
+    if include_predicted:
+        if not function_name:
+            raise ValueError("function_name is required when include_predicted=True")
+        base_function_name = (
+            function_name.split("(")[0] if "(" in function_name else function_name
+        )
+        udf_call = f"{base_function_name}({columns})"
+        predicted_expr = f",\n            {udf_call} AS PREDICTED"
+
+    query = f"""
+        SELECT
+            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS ROW_ID,
+            {columns},
+            {expected_expr}{predicted_expr}
+        FROM {test_table}
+    """
+    if sample_size:
+        query += f" LIMIT {sample_size}"
+
+    results_data = session.sql(query).collect()
+    return input_cols, output_field, metric_opts, results_data
+
 
 def evaluate(
     session,
@@ -909,6 +1075,7 @@ def evaluate(
     max_length: int = 500,
     custom_metric_udf: str | None = None,
     run_id: str | None = None,
+    executor: PredictionExecutor | None = None,
 ) -> float:
     """Evaluate an AI function against a test dataset.
 
@@ -932,53 +1099,47 @@ def evaluate(
         custom_metric_udf: Fully qualified name of a custom metric UDF.
         run_id: Optional external run ID for tracking (auto-generated if None).
     """
-    metric_opts, output_field, multi_expected_cols = parse_metric_options(
-        metric_options
+    input_cols, output_field, metric_opts, results_data = _collect_eval_rows(
+        session,
+        test_table=test_table,
+        input_columns=input_columns,
+        label_column=label_column,
+        metric_name=metric_name,
+        metric_options=metric_options,
+        sample_size=sample_size,
+        function_name=function_name,
+        include_predicted=executor is None,
     )
 
-    input_cols = [col.strip('"').strip("'") for col in input_columns]
-    table_columns = get_table_column_names(session, test_table)
-    validate_input_columns(table_columns, input_cols, test_table)
-
-    expected_col_name = resolve_expected_column(table_columns, label_column)
-
-    columns = ", ".join([quote_identifier(col) for col in input_cols])
-    base_function_name = (
-        function_name.split("(")[0] if "(" in function_name else function_name
+    validate_stage_file_access(
+        session,
+        stage_name=metric_opts.get("stage_name"),
+        file_columns=metric_opts.get("file_columns"),
+        table_name=test_table,
     )
-    expected_expr = f"{quote_identifier(expected_col_name)} AS EXPECTED"
-
-    if metric_name == "llm_judge" and len(multi_expected_cols) > 1:
-        resolved_pairs = resolve_multi_output_columns(
-            table_columns, multi_expected_cols
-        )
-        if resolved_pairs:
-            output_field = None
-            expected_expr = build_object_construct_expr(resolved_pairs, "EXPECTED")
-        elif table_columns and expected_col_name.upper() not in table_columns:
-            raise ValueError(
-                "Expected output columns not found in test table. "
-                f"Provided expected_columns={multi_expected_cols}, label_column={label_column}, "
-                f"available_columns={sorted(table_columns)}"
-            )
-
-    udf_call = f"{base_function_name}({columns})"
-
-    query = f"""
-        SELECT 
-            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS ROW_ID,
-            {columns},
-            {expected_expr},
-            {udf_call} AS PREDICTED
-        FROM {test_table}
-    """
-    if sample_size:
-        query += f" LIMIT {sample_size}"
-
-    results_data = session.sql(query).collect()
 
     if not results_data:
         return 0.0
+
+    if executor is None:
+        predicted_raw_list = []
+        for row in results_data:
+            try:
+                v = row["PREDICTED"]
+            except Exception:
+                v = None
+            predicted_raw_list.append(v if v is not None else "")
+    else:
+        executor_rows: list[dict[str, object]] = []
+        for row in results_data:
+            d = {c: row[c] if c in row else None for c in input_cols}
+            executor_rows.append(d)
+        predicted_raw_list = executor(executor_rows)
+
+    if len(predicted_raw_list) != len(results_data):
+        raise ValueError(
+            f"Executor returned {len(predicted_raw_list)} predictions for {len(results_data)} rows"
+        )
 
     results = []
     total_score = 0.0
@@ -990,8 +1151,20 @@ def evaluate(
     for idx, row in enumerate(results_data):
         row_id = row["ROW_ID"]
         expected = to_text(row["EXPECTED"])
-        predicted_raw = row["PREDICTED"] if row["PREDICTED"] is not None else ""
+
+        predicted_raw_obj = predicted_raw_list[idx]
+        error_message = None
+        if (
+            isinstance(predicted_raw_obj, str)
+            and predicted_raw_obj.startswith("INFERENCE_ERROR:")
+        ):
+            error_message = predicted_raw_obj
+            predicted_raw = ""
+        else:
+            predicted_raw = predicted_raw_obj if predicted_raw_obj is not None else ""
+
         predicted = _extract_output_field(predicted_raw, output_field)
+
         input_summary = "; ".join(
             [f"{col}={str(row[col])[:max_length]}" for col in input_cols]
         )
@@ -1002,6 +1175,7 @@ def evaluate(
                 "expected": expected,
                 "predicted": predicted,
                 "input_summary": input_summary,
+                "error_message": error_message,
             }
         )
 
@@ -1027,6 +1201,8 @@ def evaluate(
     for idx, meta in enumerate(row_metadata):
         if not meta["expected"]:
             score, feedback = 0.0, "Empty expected value"
+        elif meta.get("error_message"):
+            score, feedback = 0.0, meta["error_message"]
         elif not meta["predicted"]:
             score, feedback = 0.0, "Empty predicted value"
         elif idx in batch_result_map:
@@ -1043,7 +1219,7 @@ def evaluate(
                 meta["predicted"][:max_length],
                 score,
                 feedback[:max_length] if feedback else None,
-                None,
+                meta.get("error_message"),
             )
         )
 
@@ -1110,6 +1286,7 @@ def evaluate(
     return avg_score
 
 
+@with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc()
 @with_custom_ai_function_query_tag("SPROC_EVALUATE")
 def evaluate_handler(
     session,

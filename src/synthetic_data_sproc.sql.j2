@@ -7,20 +7,17 @@
 -- Generates test data server-side using Cortex LLM
 -- =============================================================================
 --
--- Use scripts/create_sproc.py to generate this SPROC with correct stage paths:
---   uv run python scripts/create_sproc.py synthetic DATABASE SCHEMA STAGE_NAME
+-- Use src/create_sproc.py to generate this SPROC with correct stage paths:
+--   uv run python src/create_sproc.py synthetic DATABASE SCHEMA STAGE_NAME
 --
 -- =============================================================================
 
-CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.GENERATE_SYNTHETIC_DATA(
+{% if anonymous %}WITH GENERATE_SYNTHETIC_DATA AS PROCEDURE ({% else %}CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.GENERATE_SYNTHETIC_DATA({% endif %}
     TASK_DESCRIPTION VARCHAR,
     OUTPUT_TABLE VARCHAR,
     INPUT_COLUMNS ARRAY,
     MODEL VARCHAR DEFAULT NULL,
-    NUM_EXAMPLES INTEGER DEFAULT 500,
-    EASY_PCT INTEGER DEFAULT 50,
-    MEDIUM_PCT INTEGER DEFAULT 30,
-    BATCH_SIZE INTEGER DEFAULT 100,
+    NUM_EXAMPLES INTEGER DEFAULT 50,
     SOURCE_TABLE VARCHAR DEFAULT NULL,
     FUNCTION_NAME VARCHAR DEFAULT NULL,
     OUTPUT_SCHEMA VARIANT DEFAULT NULL,
@@ -30,9 +27,17 @@ RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.12'
 PACKAGES = ('snowflake-snowpark-python')
+{% if inline -%}
+HANDLER = '{{ inline_handler }}'
+EXECUTE AS CALLER
+AS $$
+{{ inline_body }}
+$${% if not anonymous %};{% endif %}
+{%- else -%}
 IMPORTS = (
     '@{{ database }}.{{ schema }}.{{ stage_name }}/custom_ai_function_utils.py',
     '@{{ database }}.{{ schema }}.{{ stage_name }}/snow_synthetic_data.py'
 )
 HANDLER = 'snow_synthetic_data.generate_synthetic_data'
-EXECUTE AS CALLER;
+EXECUTE AS CALLER{% if not anonymous %};{% endif %}
+{%- endif %}

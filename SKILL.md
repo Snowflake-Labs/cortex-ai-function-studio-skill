@@ -1,6 +1,6 @@
 ---
 name: cortex-ai-function-studio
-description: "Create, evaluate, and optimize custom AI functions using Snowflake Cortex AI Complete. Use when: building LLM-powered functions, evaluating AI function performance, tuning prompts, selecting models, checking async job status. Triggers: ai function builder, custom ai function, user defined ai function, build my own llm function, evaluate ai function, tune ai function, optimize ai function, demo ai function, resume ai function job."
+description: "Create, evaluate, and optimize custom AI functions using Snowflake Cortex AI Complete. Supports text, image, and document inputs. Use when: building LLM-powered functions, evaluating AI function performance, tuning prompts, selecting models, checking async job status. Triggers: ai function builder, custom ai function, user defined ai function, build my own llm function, evaluate ai function, tune ai function, optimize ai function, demo ai function, resume ai function job, image classification, document analysis, multimodal ai function."
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
@@ -41,15 +41,17 @@ If any prerequisites or privileges are missing, follow the instructions in the p
 
 ### Step 2: Route
 
-**If CREATE:** Load `create/SKILL.md`
+**⚠️ MANDATORY**: You MUST read the sub-skill file before responding. The sub-skill contains the actual command syntax, parameter formats, and execution details. Do NOT generate commands, SQL, or CLI invocations from memory — always read the sub-skill first.
 
-**If EVALUATE:** Load `evaluate/SKILL.md`
+**If CREATE:** Read `create/SKILL.md` before responding.
 
-**If OPTIMIZE:** Load `optimize/SKILL.md`
+**If EVALUATE:** Read `evaluate/SKILL.md` before responding.
 
-**If DEMO:** Load `demos/SKILL.md`
+**If OPTIMIZE:** Read `optimize/SKILL.md` before responding.
 
-**If CHECK_STATUS:** Load `references/async_status.md` with the run_id from the user's message (if provided).
+**If DEMO:** Read `demos/SKILL.md` before responding.
+
+**If CHECK_STATUS:** Read `references/async_status.md` with the run_id from the user's message (if provided).
 
 **If unclear**, ask:
 ```
@@ -65,19 +67,22 @@ What would you like to do?
 
 - **Create**: Two modes — Direct (simple AI_COMPLETE) or Agent Research (research + propose SQL UDF structures, with option to specify your own)
 - **Evaluate**: Measure with pre-built or custom metrics via SQL
-- **Optimize**: Improve functions using prompt optimization and perform cost/quality model comparison 
+- **Optimize**: Improve functions using prompt optimization and perform cost/quality model comparison. Pass ALL models in a single call — the optimizer runs them concurrently. Do NOT make separate calls per model.
 - **Demo**: Interactive walkthroughs with example use cases
 - **Data Preparation**: Prepare train/test data (`references/data_preparation.md`)
-- **Synthetic Data**: Generate training/test data with multi-hop reasoning (`references/synthetic_data.md`)
-- **Pseudo Labels**: Label input-only tables using strong-model inference and reuse for evaluate/optimize (`references/synthetic_data.md`)
+- **Synthetic Data**: Generate data for evaluation and optimization (`synthetic-data/SKILL.md`)
+- **Pseudo Labels**: Label input-only tables using strong-model inference and reuse for evaluate/optimize (`synthetic-data/SKILL.md`)
 - **Version Management**: Track and manage function versions (`references/version_management.md`)
 
 ## Data Suggestions
 
-| Workflow | Training Rows | Test Rows | Notes |
-|----------|---------------|-----------|-------|
-| Evaluate | - | ~200 (min 50) | Test data only |
-| Optimize | ~300 (min 50) | ~200 (min 50) | Training internally split into train/dev |
+| Workflow | Quick Start | Production |
+|----------|-------------|------------|
+| Evaluate | ~50 rows | 200+ rows |
+| Optimize | ~50 rows | 300+ rows |
+
+> **Quick Start** sizes are enough to try the tool and iterate fast.
+> **Production** sizes give better statistical signal for optimization and more reliable evaluation scores.
 
 ## Stopping Points
 

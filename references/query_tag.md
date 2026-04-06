@@ -1,8 +1,3 @@
----
-name: query-tag-wrapper
-description: "Agent-oriented SQL pattern to set a temporary QUERY_TAG for custom AI function SPROC calls. Always loaded automatically by evaluate/optimize workflows; not user-invocable."
-parent_skill: cortex-ai-function-studio
----
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
@@ -26,20 +21,20 @@ SELECT CURRENT_QUERY_TAG() AS CURRENT_QUERY_TAG;
 
 ### 2) Set a temporary tag, call the SPROC, then restore
 
-**Hard agent requirement**: The agent MUST render the SQL with a literal session id string before sending it to Snowflake
-    by injecting its local `CORTEX_SESSION_ID` value into the SQL below (replace `<CORTEX_SESSION_ID>`).
-    Do not leave placeholders like <CORTEX_SESSION_ID> and do not output ${CORTEX_SESSION_ID} / &{var} for the user to substitute later.
-    If the SQL shown still contains a placeholder, it is not compliant with this wrapper.
+**Hard agent requirement**: The agent MUST look up the real session ID from the `CORTEX_SESSION_ID` environment variable and
+    inline it as a string literal in the SQL below. Every occurrence of the placeholder `YOUR_SESSION_ID` must be
+    replaced with the actual UUID value. Do not leave ANY placeholder, template variable, or angle-bracket token
+    in the output — the SQL must contain only the resolved literal value.
 
 This pattern:
 - saves the original tag
 - **if the original tag is a JSON string**, merges `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID`
-- otherwise appends `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID=<CORTEX_SESSION_ID>` to the string tag
+- otherwise appends `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID=` plus the session ID to the string tag
 - restores the original tag after the call
 
 ```sql
--- Agent must substitute <CORTEX_SESSION_ID> with the actual local session id value by inlining it as a string literal
-SET cortex_session_id = '<CORTEX_SESSION_ID>';
+-- Inline the real CORTEX_SESSION_ID value here (a UUID like 'abcd1234-...')
+SET cortex_session_id = 'YOUR_SESSION_ID';
 
 -- Save original query tag (string)
 SET orig_query_tag = (SELECT CURRENT_QUERY_TAG());

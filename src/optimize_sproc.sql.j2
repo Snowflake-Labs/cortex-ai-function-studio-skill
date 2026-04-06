@@ -13,12 +13,12 @@
 --    PUT file://src/snow_gepa_adapter.py @<STAGE> AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 --    PUT file://src/snow_gepa_optimize.py @<STAGE> AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 --
--- Use scripts/create_sproc.py to generate this SPROC:
---   uv run python scripts/create_sproc.py optimize DATABASE SCHEMA STAGE_NAME
+-- Use src/create_sproc.py to generate this SPROC:
+--   uv run python src/create_sproc.py optimize DATABASE SCHEMA STAGE_NAME
 --
 -- =============================================================================
 
-CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION(
+{% if anonymous %}WITH OPTIMIZE_AI_FUNCTION AS PROCEDURE ({% else %}CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION({% endif %}
     FUNCTION_NAME VARCHAR,
     TRAINING_TABLE VARCHAR,
     LABEL_COLUMN VARCHAR,
@@ -30,7 +30,7 @@ CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION(
     AUTO_BUDGET VARCHAR DEFAULT 'light',
     TRACKING_TABLE VARCHAR DEFAULT NULL,
     RESULTS_TABLE VARCHAR DEFAULT NULL,
-    VALIDATION_FRACTION FLOAT DEFAULT 0.667,
+    VALIDATION_FRACTION FLOAT DEFAULT 0.5,
     TEMPERATURE FLOAT DEFAULT 0.7,
     MAX_TOKENS INTEGER DEFAULT 8192,
     METRIC_OPTIONS VARIANT DEFAULT NULL,
@@ -43,6 +43,13 @@ RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.12'
 PACKAGES = ('snowflake-snowpark-python', 'gepa')
+{% if inline -%}
+HANDLER = '{{ inline_handler }}'
+EXECUTE AS CALLER
+AS $$
+{{ inline_body }}
+$${% if not anonymous %};{% endif %}
+{%- else -%}
 IMPORTS = (
     '@{{ database }}.{{ schema }}.{{ stage_name }}/custom_ai_function_utils.py',
     '@{{ database }}.{{ schema }}.{{ stage_name }}/metrics_core.py',
@@ -50,4 +57,5 @@ IMPORTS = (
     '@{{ database }}.{{ schema }}.{{ stage_name }}/snow_gepa_optimize.py'
 )
 HANDLER = 'snow_gepa_optimize.run_optimization'
-EXECUTE AS CALLER;
+EXECUTE AS CALLER{% if not anonymous %};{% endif %}
+{%- endif %}

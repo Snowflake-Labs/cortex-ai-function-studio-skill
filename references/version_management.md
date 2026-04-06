@@ -5,7 +5,7 @@
 
 ## When to Load
 
-Load from optimize/SKILL.md Step 8 when user selects "Save as new version". Also load for: "list versions", "compare versions", "rollback", "promote version", "delete version".
+Load from optimize/SKILL.md Step 7 when user selects "Save as new version". Also load for: "list versions", "compare versions", "rollback", "promote version", "delete version".
 
 This reference covers how to manage versions of AI functions.
 
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS {database}.{schema}.AI_FUNCTION_VERSIONS (
 
 ## Save New Version
 
-Use this workflow when saving an optimized function as a new version (called from `optimize/SKILL.md` Step 8).
+Use this workflow when saving an optimized function as a new version (called from `optimize/SKILL.md` Step 7).
 
 **Expected context from optimize workflow:**
 - `{database}`, `{schema}`: Target location
@@ -101,14 +101,14 @@ Build the JSON configuration:
 
 Generate the SQL:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
     --json '<JSON_CONFIG>'
 ```
 
 **⚠️ STOP**: Show generated SQL DDL to user for review. Once confirmed, run the script once again in execute mode
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
     --execute --json '<JSON_CONFIG>' \
     --connection <CONNECTION_NAME> \
     --warehouse <WAREHOUSE_NAME>
@@ -118,7 +118,7 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.p
 
 Optionally ask for notes:
 ```
-Add notes for this version (or press Enter to skip):
+Would you like to add notes for this version? (y/n)
 ```
 
 Insert the metadata:
@@ -193,7 +193,7 @@ Versions of {function_base}:
 To show only versions where no other version is both cheaper AND better, use the pareto filter:
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/filter_pareto.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
     --json '[{"model": "llama3.1-8b", "score": 0.82, "name": "MY_FUNC_V2"}, ...]' \
     --prompt-chars 200 \
     --avg-input-chars 500 \
@@ -201,7 +201,7 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/filter_paret
     --format table
 ```
 
-The character count arguments are used to calculate the input/output ratio for cost weighting. See `optimize/SKILL.md` Step 7.2 for how to get these values from your test data.
+The character count arguments are used to calculate the input/output ratio for cost weighting. See `optimize/SKILL.md` Step 6.2 for how to get these values from your test data.
 
 This filters out dominated versions (e.g., if V2 with llama3.1-8b has 82% and V3 with claude-sonnet-4-5 has only 80%, V3 is filtered out since V2 is both cheaper and better).
 
@@ -312,7 +312,7 @@ WHERE FUNCTION_NAME = '{versioned_function_name}';
 
 2. **Recreate the original function** using `create_udf.py` with the retrieved prompt:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/create_udf.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
     --json '{
         "database": "{database}",
         "schema": "{schema}",

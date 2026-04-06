@@ -19,9 +19,12 @@ from typing import Callable, Literal, TypedDict
 import gepa as gepa_pkg
 from gepa import NoImprovementStopper
 from gepa.core.result import GEPAResult
+from gepa.core.state import GEPAState
 from snowflake.snowpark import Session
 
 from metrics_core import (
+    _LLM_JUDGE_CONTINUOUS_TEMPLATE,
+    _LLM_JUDGE_FILE_ADDENDUM,
     evaluate as evaluate_ai_function,
     get_table_column_names,
     parse_metric_options,
@@ -37,11 +40,37 @@ from snow_gepa_adapter import (
     load_dataset,
 )
 from custom_ai_function_utils import (
+    TempAIFunction,
     build_temp_function_name,
+    extract_file_type_params,
+    extract_to_file_refs,
+    normalize_ddl_to_dollar_quoting,
+    validate_stage_file_access,
+    with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc,
     with_custom_ai_function_query_tag,
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Default configuration values
+# ---------------------------------------------------------------------------
+
+DEFAULT_REFLECTION_MINIBATCH_SIZE = 10
+DEFAULT_AUTO_BUDGET: Literal["light", "medium", "heavy"] = "light"
+DEFAULT_VALIDATION_FRACTION = 0.5
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MAX_TOKENS = 8192
+DEFAULT_PERFECT_SCORE = 1.0
+DEFAULT_MAX_MERGE_INVOCATIONS = 5
+DEFAULT_REFLECTION_CALL_WEIGHT = 1
+DEFAULT_SPLIT_SEED = 42
+
+AUTO_BUDGET_SETTINGS: dict[str, dict[str, int]] = {
+    "light": {"n": 6},
+    "medium": {"n": 12},
+    "heavy": {"n": 18},
+}
 
 
 class PythonLoggingAdapter:
@@ -54,11 +83,218 @@ class PythonLoggingAdapter:
         self._logger.info(message)
 
 
-AUTO_BUDGET_SETTINGS = {
-    "light": {"n": 6},
-    "medium": {"n": 12},
-    "heavy": {"n": 18},
-}
+class MaxTotalBudgetStopper:
+    """Budget-aware stopper that accounts for both metric and reflection calls.
+
+    Stop criteria
+    -------------
+    The stopper is invoked by the GEPA engine at the top of every
+    iteration via ``_should_stop(state)``.  It computes a *weighted total*
+    of all work done so far and compares it to the budget::
+
+        weighted_total = metric_calls + reflection_calls * W
+
+    where:
+    - ``metric_calls`` = ``gepa_state.total_num_evals`` — the number of
+      individual metric/adapter evaluations (each row in a batched UDF
+      call counts as one).
+    - ``reflection_calls`` = ``reflection_lm.call_count`` — the number of
+      reflection LLM invocations (one per proposal iteration).
+    - ``W`` = ``reflection_call_weight`` — estimated dynamically via
+      ``estimate_reflection_weight`` by comparing the character length of
+      a representative reflection prompt to the average metric prompt.
+      LLM inference cost scales roughly with input token count, so the
+      prompt-length ratio is a good proxy for relative wall-clock cost.
+
+    Optimization stops when ``weighted_total >= max_budget``.  A budget is
+    always required — use ``resolve_budget`` to compute one from an auto
+    preset before constructing the stopper.
+
+    Budget calculation
+    ------------------
+    For auto presets ("light" / "medium" / "heavy"), the budget is computed
+    as::
+
+        budget = V + N * (2*M + V + W)
+
+    where V = valset size, M = minibatch size, W = reflection weight,
+    N = number of proposal iterations (derived from the preset).
+
+    Each proposal iteration is budgeted at its maximum (all-accepted) cost
+    so that total resource consumption is consistent regardless of the
+    candidate acceptance rate:
+
+    - All accepted (case 1): N iterations, each consuming ``2*M + V + W``
+      weighted units.  Budget is exhausted in exactly N iterations.
+    - All rejected (case 2): each iteration consumes only ``2*M + W``
+      weighted units (no full eval).  The same budget funds
+      ``N * (2*M + V + W) / (2*M + W)`` iterations — more iterations,
+      but each is cheaper.
+
+    In both cases the total weighted budget consumed is the same, which
+    translates to similar wall-clock time and token usage (verified by
+    ``test_budget_weight_end_to_end_latency``).
+    """
+
+    AUTO_BUDGET_SETTINGS = AUTO_BUDGET_SETTINGS
+
+    def __init__(
+        self,
+        reflection_lm: "SnowflakeLLM",
+        *,
+        max_budget: int,
+        reflection_call_weight: int = DEFAULT_REFLECTION_CALL_WEIGHT,
+    ) -> None:
+        self.reflection_lm = reflection_lm
+        self.reflection_call_weight = reflection_call_weight
+        self.max_budget = max_budget
+
+    @classmethod
+    def resolve_budget(
+        cls,
+        auto: Literal["light", "medium", "heavy"],
+        num_components: int,
+        valset_size: int,
+        reflection_minibatch_size: int = DEFAULT_REFLECTION_MINIBATCH_SIZE,
+        reflection_call_weight: int = DEFAULT_REFLECTION_CALL_WEIGHT,
+    ) -> int:
+        """Compute a budget from an auto preset without a live ``reflection_lm``.
+
+        Each proposal iteration costs (in weighted budget units):
+          - ``2 * M``  metric calls  (current + new candidate on minibatch)
+          - ``W``      weighted reflection cost  (LLM proposes new candidate)
+          - ``V``      metric calls  (full valset eval, only if accepted)
+
+        The budget is ``V + N * (2*M + V + W)`` so that N proposals are
+        fully funded in the all-accepted case.  In the all-rejected case
+        the same budget funds more iterations via cheaper reflection-only
+        rounds.
+        """
+        import math
+
+        if auto not in cls.AUTO_BUDGET_SETTINGS:
+            raise ValueError(
+                f"auto must be one of {list(cls.AUTO_BUDGET_SETTINGS.keys())}"
+            )
+
+        num_candidates = cls.AUTO_BUDGET_SETTINGS[auto]["n"]
+        N = int(max(
+            2 * (num_components * 2) * math.log2(num_candidates),
+            1.5 * num_candidates,
+        ))
+
+        V = valset_size
+        M = reflection_minibatch_size
+        W = reflection_call_weight
+
+        return V + N * (2 * M + V + W)
+
+    # ------------------------------------------------------------------
+    # Dynamic weight estimation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def estimate_reflection_weight(
+        seed_candidate: dict[str, str],
+        trainset: list["SnowflakeDataInst"],
+        reflection_minibatch_size: int = DEFAULT_REFLECTION_MINIBATCH_SIZE,
+        metric_name: str = "exact_match",
+        metric_kwargs: dict | None = None,
+    ) -> int:
+        """Estimate reflection_call_weight from prompt-length ratio.
+
+        Compares the character length of a representative reflection prompt
+        (built with GEPA's real ``InstructionProposalSignature`` template)
+        to the total prompt length of a single metric call.  LLM inference
+        cost scales roughly with input token count, so the prompt-length
+        ratio is a practical proxy for relative wall-clock cost without
+        needing to call Snowflake.
+
+        When ``metric_name`` is ``"llm_judge"`` (or a custom metric UDF),
+        each metric call involves two LLM invocations — the task UDF plus
+        the judge evaluation.  The judge prompt length is added to the
+        per-metric-call cost so the weight correctly reflects the higher
+        cost of judge-based metrics.
+
+        Returns at least 1.
+        """
+        from gepa.strategies.instruction_proposal import InstructionProposalSignature
+
+        instruction = next(iter(seed_candidate.values()))
+
+        # --- Per-metric-call prompt cost ---
+        # Task prompt: instruction + one user input
+        if trainset:
+            avg_input_len = sum(
+                sum(len(str(v)) for v in item["inputs"].values())
+                for item in trainset
+            ) / len(trainset)
+            avg_answer_len = sum(
+                len(str(item.get("answer", ""))) for item in trainset
+            ) / len(trainset)
+        else:
+            avg_input_len = 0
+            avg_answer_len = 0
+
+        task_prompt_len = len(instruction) + avg_input_len
+
+        # Judge prompt (only for llm_judge): adds a second LLM call per item
+        judge_prompt_len = 0
+        if metric_name == "llm_judge":
+            task_desc = (metric_kwargs or {}).get("task_description", "")
+            judge_template_overhead = len(_LLM_JUDGE_CONTINUOUS_TEMPLATE)
+            if (metric_kwargs or {}).get("file_columns"):
+                judge_template_overhead += len(_LLM_JUDGE_FILE_ADDENDUM)
+            judge_prompt_len = (
+                judge_template_overhead
+                + len(task_desc)
+                + avg_answer_len
+                + avg_answer_len  # predicted ≈ answer length
+            )
+
+        metric_prompt_len = task_prompt_len + judge_prompt_len
+
+        if metric_prompt_len == 0:
+            return 1
+
+        # --- Reflection prompt cost ---
+        sample = trainset[:reflection_minibatch_size]
+        dataset_with_feedback = [
+            {
+                "Inputs": "\n".join(
+                    f"{k}: {v}" for k, v in item["inputs"].items()
+                ),
+                "Generated Outputs": item.get("answer", ""),
+                "Feedback": "Needs improvement.",
+            }
+            for item in sample
+        ]
+        reflection_prompt = InstructionProposalSignature.prompt_renderer({
+            "current_instruction_doc": instruction,
+            "dataset_with_feedback": dataset_with_feedback,
+            "prompt_template": None,
+        })
+        reflection_prompt_len = (
+            len(reflection_prompt)
+            if isinstance(reflection_prompt, str)
+            else sum(
+                len(str(part.get("content", "")))
+                for part in reflection_prompt
+            )
+        )
+
+        return max(1, round(reflection_prompt_len / metric_prompt_len))
+
+    # ------------------------------------------------------------------
+    # Stop condition
+    # ------------------------------------------------------------------
+
+    def __call__(self, gepa_state: GEPAState) -> bool:
+        total = (
+            gepa_state.total_num_evals
+            + self.reflection_lm.call_count * self.reflection_call_weight
+        )
+        return total >= self.max_budget
 
 
 class TrackingDetail(TypedDict):
@@ -73,70 +309,6 @@ class TrackingDetail(TypedDict):
     metric_feedback: str
 
 
-def _resolve_budget(
-    auto: Literal["light", "medium", "heavy"] | None,
-    max_metric_calls: int | None,
-    num_components: int,
-    valset_size: int,
-    full_eval_steps: int = 5,
-) -> int | None:
-    """Resolves the optimization budget based on auto setting or explicit value.
-
-    Matches DSPy's auto_budget calculation logic:
-    1. Compute num_trials based on num_components and num_candidates
-    2. Account for initial full evaluation, bootstrapping, minibatch evaluations,
-       and periodic full evals
-
-    Args:
-        auto: Budget preset ("light", "medium", "heavy") or None for explicit budget
-        max_metric_calls: Explicit budget (used if auto is None)
-        num_components: Number of prompt components being optimized
-        valset_size: Size of validation set
-        full_eval_steps: How often to run full evaluation (default 5)
-
-    Returns:
-        Maximum number of metric calls allowed
-    """
-    import math
-
-    if auto is None:
-        return max_metric_calls
-
-    if auto not in AUTO_BUDGET_SETTINGS:
-        raise ValueError(f"auto must be one of {list(AUTO_BUDGET_SETTINGS.keys())}")
-
-    num_candidates = AUTO_BUDGET_SETTINGS[auto]["n"]
-
-    # DSPy formula for num_trials
-    num_trials = int(
-        max(2 * (num_components * 2) * math.log2(num_candidates), 1.5 * num_candidates)
-    )
-
-    V = valset_size
-    N = num_trials
-    M = 35  # DSPy uses fixed minibatch size of 35
-
-    # Initial full evaluation on the seed candidate
-    total = V
-
-    # Bootstrapping: 5 trials per candidate
-    total += num_candidates * 5
-
-    # N minibatch evaluations (reflection steps)
-    total += N * M
-
-    if N == 0:
-        return total
-
-    # Periodic full evals: occur when trial_num % full_eval_steps == 0
-    periodic_fulls = (N + 1) // full_eval_steps + 1
-    # Extra final eval if N < full_eval_steps
-    extra_final = 1 if N < full_eval_steps else 0
-    total += (periodic_fulls + extra_final) * V
-
-    return total
-
-
 def optimize(
     seed_candidate: dict[str, str],
     trainset: list[SnowflakeDataInst],
@@ -147,27 +319,32 @@ def optimize(
     input_columns: list[str],
     model: str,
     reflection_model: str,
-    auto: Literal["light", "medium", "heavy"] | None,
-    max_metric_calls: int | None,
+    reflection_lm: SnowflakeLLM,
+    max_metric_calls: int,
+    reflection_call_weight: int,
     original_ddl: str = "",
     temp_function_name: str = "",
-    reflection_minibatch_size: int = 10,
+    reflection_minibatch_size: int = DEFAULT_REFLECTION_MINIBATCH_SIZE,
     skip_perfect_score: bool = True,
-    perfect_score: float = 1.0,
+    perfect_score: float = DEFAULT_PERFECT_SCORE,
     candidate_selection_strategy: Literal[
         "pareto", "current_best", "epsilon_greedy"
     ] = "pareto",
     use_merge: bool = True,
-    max_merge_invocations: int = 5,
+    max_merge_invocations: int = DEFAULT_MAX_MERGE_INVOCATIONS,
     no_improvement_patience: int | None = None,
     seed: int = 0,
     log_dir: str | None = None,
     tracking_callback: Callable[[dict[str, str], float, int], None] | None = None,
     detailed_tracking_callback: Callable[[dict], None] | None = None,
-    temperature: float = 0.7,
-    max_tokens: int = 8192,
+    file_type_params: list[str] | None = None,
+    stage_name: str | None = None,
 ) -> GEPAResult:
     """Optimizes prompts using the GEPA algorithm with Snowflake AI function invocation.
+
+    The stopping condition uses a combined budget that accounts for both
+    metric evaluation calls and reflection LLM calls, so that optimization
+    stops when the total of both exceeds the resolved budget.
 
     Args:
         seed_candidate: Initial candidate mapping component names to prompt
@@ -183,9 +360,14 @@ def optimize(
         function_name: Fully qualified UDF name (DB.SCHEMA.FUNC) to optimize.
         input_columns: List of input column names that map to UDF parameters.
         model: Snowflake Cortex model for task execution.
-        reflection_model: Model for reflection/mutation. Defaults to same as model.
-        auto: Auto budget preset. One of "light", "medium", "heavy".
-        max_metric_calls: Maximum total evaluations (budget limit).
+        reflection_model: Model for reflection/mutation.
+        reflection_lm: SnowflakeLLM instance for reflection calls. Its
+            call_count is used by the budget stopper to track reflection cost.
+        max_metric_calls: Pre-resolved budget limit (weighted total of metric
+            and reflection calls). Computed by
+            ``MaxTotalBudgetStopper.resolve_budget``.
+        reflection_call_weight: Weight of one reflection call relative to one
+            metric call, from ``MaxTotalBudgetStopper.estimate_reflection_weight``.
         original_ddl: DDL of the original function for creating temp functions.
         temp_function_name: Fully qualified name for the temp function.
         reflection_minibatch_size: Examples per reflection step. Default 3.
@@ -195,14 +377,12 @@ def optimize(
         use_merge: Whether to use merge-based optimization. Default True.
         max_merge_invocations: Maximum merge operations. Default 5.
         no_improvement_patience: Stop optimization if no improvement after this
-            many iterations. Set to None to disable (DSPy default). Default None.
+            many iterations. Set to None to disable. Default None.
         seed: Random seed for reproducibility. Default 0.
         log_dir: Directory for saving logs (optional).
         tracking_callback: Optional callback function called after each candidate
             evaluation with (candidate_dict, average_score).
         detailed_tracking_callback: Optional callback for per-row evaluation details.
-        temperature: LLM sampling temperature for reflection. Default 0.7.
-        max_tokens: Maximum tokens for reflection responses. Default 8192.
 
     Returns:
         GEPAResult containing:
@@ -211,17 +391,7 @@ def optimize(
             - best_candidate: The highest-scoring candidate.
             - best_idx: Index of best candidate.
     """
-    if auto is not None and max_metric_calls is not None:
-        raise ValueError("Cannot specify both 'auto' and 'max_metric_calls'")
-
     reflection_model = reflection_model or model
-
-    resolved_budget = _resolve_budget(
-        auto=auto,
-        max_metric_calls=max_metric_calls,
-        num_components=len(seed_candidate),
-        valset_size=len(valset),
-    )
 
     adapter = SnowflakeAdapter(
         session=session,
@@ -233,16 +403,17 @@ def optimize(
         temp_function_name=temp_function_name,
         tracking_callback=tracking_callback,
         detailed_tracking_callback=detailed_tracking_callback,
+        file_type_params=file_type_params,
+        stage_name=stage_name,
     )
 
-    reflection_lm = SnowflakeLLM(
-        session=session,
-        model=reflection_model,
-        temperature=temperature,
-        max_tokens=max_tokens,
+    stopper = MaxTotalBudgetStopper(
+        reflection_lm,
+        max_budget=max_metric_calls,
+        reflection_call_weight=reflection_call_weight,
     )
 
-    stop_callbacks = []
+    stop_callbacks: list[Callable] = [stopper]
     if no_improvement_patience is not None:
         stop_callbacks.append(
             NoImprovementStopper(
@@ -250,33 +421,30 @@ def optimize(
             )
         )
 
-    try:
-        return gepa_pkg.optimize(
-            seed_candidate=seed_candidate,
-            trainset=trainset,
-            valset=valset,
-            adapter=adapter,
-            reflection_lm=reflection_lm,
-            candidate_selection_strategy=candidate_selection_strategy,
-            skip_perfect_score=skip_perfect_score,
-            reflection_minibatch_size=reflection_minibatch_size,
-            perfect_score=perfect_score,
-            use_merge=use_merge,
-            max_merge_invocations=max_merge_invocations,
-            max_metric_calls=resolved_budget,
-            stop_callbacks=stop_callbacks if stop_callbacks else None,
-            logger=PythonLoggingAdapter(logger),
-            seed=seed,
-            run_dir=log_dir,
-        )
-    finally:
-        adapter.cleanup()
+    return gepa_pkg.optimize(
+        seed_candidate=seed_candidate,
+        trainset=trainset,
+        valset=valset,
+        adapter=adapter,
+        reflection_lm=reflection_lm,
+        candidate_selection_strategy=candidate_selection_strategy,
+        skip_perfect_score=skip_perfect_score,
+        reflection_minibatch_size=reflection_minibatch_size,
+        perfect_score=perfect_score,
+        use_merge=use_merge,
+        max_merge_invocations=max_merge_invocations,
+        max_metric_calls=None,
+        stop_callbacks=stop_callbacks,
+        logger=PythonLoggingAdapter(logger),
+        seed=seed,
+        run_dir=log_dir,
+    )
 
 
 def split_dataset(
     dataset: list[SnowflakeDataInst],
     validation_fraction: float,
-    seed: int = 42,
+    seed: int = DEFAULT_SPLIT_SEED,
 ) -> tuple[list[SnowflakeDataInst], list[SnowflakeDataInst]]:
     """Split dataset into validation and training sets.
 
@@ -641,6 +809,7 @@ def create_opt_results_table(session: Session, results_table: str) -> None:
             NUM_VAL_EXAMPLES INTEGER,
             TOTAL_CANDIDATES INTEGER,
             TOTAL_METRIC_CALLS INTEGER,
+            TOTAL_REFLECTION_CALLS INTEGER,
             ELAPSED_SECONDS FLOAT,
             REFLECTION_MODEL VARCHAR,
             CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
@@ -671,6 +840,7 @@ def save_opt_results(
         elapsed = model_output.get("elapsed_seconds", 0)
         total_candidates = model_output.get("total_candidates", 0)
         total_metric_calls = model_output.get("total_metric_calls", 0)
+        total_reflection_calls = model_output.get("total_reflection_calls", 0)
         num_test = model_output.get("num_test_examples")
 
         # Seed row
@@ -680,8 +850,9 @@ def save_opt_results(
                 INSERT INTO {results_table}
                 (RUN_ID, FUNCTION_NAME, MODEL_NAME, EVAL_TYPE, PROMPT_TEXT,
                  TEST_SCORE, VAL_SCORE, NUM_TEST_EXAMPLES, NUM_VAL_EXAMPLES,
-                 TOTAL_CANDIDATES, TOTAL_METRIC_CALLS, ELAPSED_SECONDS, REFLECTION_MODEL)
-                VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 TOTAL_CANDIDATES, TOTAL_METRIC_CALLS, TOTAL_REFLECTION_CALLS,
+                 ELAPSED_SECONDS, REFLECTION_MODEL)
+                VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 params=[
                     run_id,
@@ -694,6 +865,7 @@ def save_opt_results(
                     valset_size,
                     total_candidates,
                     total_metric_calls,
+                    total_reflection_calls,
                     elapsed,
                     reflection_model,
                 ],
@@ -708,8 +880,9 @@ def save_opt_results(
                 INSERT INTO {results_table}
                 (RUN_ID, FUNCTION_NAME, MODEL_NAME, EVAL_TYPE, PROMPT_TEXT,
                  TEST_SCORE, VAL_SCORE, NUM_TEST_EXAMPLES, NUM_VAL_EXAMPLES,
-                 TOTAL_CANDIDATES, TOTAL_METRIC_CALLS, ELAPSED_SECONDS, REFLECTION_MODEL)
-                VALUES (?, ?, ?, 'optimized', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 TOTAL_CANDIDATES, TOTAL_METRIC_CALLS, TOTAL_REFLECTION_CALLS,
+                 ELAPSED_SECONDS, REFLECTION_MODEL)
+                VALUES (?, ?, ?, 'optimized', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 params=[
                     run_id,
@@ -722,12 +895,33 @@ def save_opt_results(
                     valset_size,
                     total_candidates,
                     total_metric_calls,
+                    total_reflection_calls,
                     elapsed,
                     reflection_model,
                 ],
             ).collect()
         except Exception:
             pass
+
+
+def _extract_balanced_paren_content(text: str) -> str:
+    """Extract the content inside the outermost parentheses, handling nesting."""
+    start = text.find("(")
+    if start < 0:
+        raise ValueError(f"Could not parse function signature: {text}")
+    depth = 0
+    content_start = -1
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                content_start = idx + 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and content_start >= 0:
+                return text[content_start:idx]
+    raise ValueError(f"Could not parse function signature: {text}")
 
 
 def get_function_ddl(
@@ -781,10 +975,7 @@ def get_function_ddl(
     else:
         arguments = rows[0]["arguments"]
 
-    match = re.search(r"\((.*?)\)", arguments)
-    if not match:
-        raise ValueError(f"Could not parse function signature: {arguments}")
-    param_types = match.group(1)
+    param_types = _extract_balanced_paren_content(arguments)
 
     full_signature = f"{base_name}({param_types})"
     result = session.sql(f"SELECT GET_DDL('FUNCTION', '{full_signature}')").collect()
@@ -797,32 +988,17 @@ def get_function_ddl(
     return ddl
 
 
-def _get_prompt_from_ddl(session: Session, function_name: str) -> str:
-    """Extract the system prompt from a UDF's DDL.
-
-    Parses the hardcoded system prompt from the function body where it appears
-    as the 'content' value in the system message OBJECT_CONSTRUCT.
-
-    Args:
-        session: Snowpark session
-        function_name: Fully qualified function name (e.g., DB.SCHEMA.FUNC or
-            DB.SCHEMA.FUNC(VARCHAR, ARRAY))
-
-    Returns:
-        The system prompt extracted from the DDL
-
-    Raises:
-        ValueError: If the DDL cannot be retrieved or parsed
-    """
-    ddl = get_function_ddl(session, function_name)
-    return extract_prompt_from_ddl_string(ddl, function_name)
-
 
 def extract_prompt_from_ddl_string(ddl: str, function_name: str = "") -> str:
     """Extract the system prompt from a raw DDL string.
 
     Looks for the pattern: 'role', 'system', 'content', '<prompt>'
+
+    The DDL is first normalized to ``$$`` quoting so that SQL-level ``''``
+    escaping inside the body is preserved for the regex to handle correctly.
+    The captured group is then unescaped (``''`` -> ``'``).
     """
+    ddl = normalize_ddl_to_dollar_quoting(ddl)
     prompt_pattern = r"'role'\s*,\s*'system'\s*,\s*'content'\s*,\s*'((?:[^']|'')*)'"
     match = re.search(prompt_pattern, ddl, re.DOTALL)
 
@@ -832,34 +1008,19 @@ def extract_prompt_from_ddl_string(ddl: str, function_name: str = "") -> str:
             f"Expected hardcoded system prompt in OBJECT_CONSTRUCT('role', 'system', 'content', '...')."
         )
 
-    return match.group(1)
+    return match.group(1).replace("''", "'")
 
-
-def get_model_from_ddl(session: Session, function_name: str) -> str:
-    """Extract the model name from a UDF's DDL.
-
-    Parses the hardcoded model from the function body where it appears
-    as ``model=>'model_name'``.
-
-    Args:
-        session: Snowpark session
-        function_name: Fully qualified function name
-
-    Returns:
-        The model name extracted from the DDL
-
-    Raises:
-        ValueError: If the DDL cannot be retrieved or parsed
-    """
-    ddl = get_function_ddl(session, function_name)
-    return extract_model_from_ddl_string(ddl, function_name)
 
 
 def extract_model_from_ddl_string(ddl: str, function_name: str = "") -> str:
     """Extract the model name from a raw DDL string.
 
     Looks for the pattern: model=>'model_name'
+
+    The DDL is first normalized to ``$$`` quoting so that ``AS '...'``
+    body-level escaping does not interfere with the regex.
     """
+    ddl = normalize_ddl_to_dollar_quoting(ddl)
     model_pattern = r"model\s*=>\s*'([^']*)'"
     match = re.search(model_pattern, ddl, re.IGNORECASE)
 
@@ -872,91 +1033,9 @@ def extract_model_from_ddl_string(ddl: str, function_name: str = "") -> str:
     return match.group(1)
 
 
-def normalize_ddl_to_dollar_quoting(raw_ddl: str) -> str:
-    """Convert function DDL body to use ``$$`` delimiters.
-
-    ``GET_DDL`` may return the body wrapped in ``'...'`` with internal
-    single-quotes doubled (``''``).  Converting to ``$$`` delimiters
-    removes the escaping so the body can be manipulated with simple
-    regex patterns.
-
-    If the DDL already uses ``$$`` delimiters it is returned unchanged.
-    """
-    if "$$" in raw_ddl:
-        return raw_ddl
-
-    match = re.search(r"(\bAS\s+)'(.*)'(\s*;?\s*)$", raw_ddl, re.DOTALL | re.IGNORECASE)
-    if not match:
-        return raw_ddl
-
-    prefix = raw_ddl[: match.start(0)] + match.group(1)
-    body = match.group(2).replace("''", "'")
-    suffix = match.group(3)
-
-    return f"{prefix}$$\n{body}\n$${suffix}"
 
 
-def create_temp_function_ddl(
-    original_ddl: str,
-    temp_function_name: str,
-    candidate_model: str,
-    candidate_prompt: str,
-) -> str:
-    """Create DDL for a temporary function by substituting model and prompt.
 
-    Takes the original function's DDL (raw from ``GET_DDL`` or locally
-    generated) and produces a new ``CREATE OR REPLACE FUNCTION`` statement
-    with:
-
-    - The function name replaced by ``temp_function_name``
-    - The model literal replaced by ``candidate_model``
-    - The system prompt replaced by ``candidate_prompt``
-
-    The DDL is first normalized to use ``$$`` body delimiters so that
-    internal single-quote patterns can be matched without double-escaping
-    issues.
-
-    Args:
-        original_ddl: The DDL of the original function (raw or normalized)
-        temp_function_name: Fully qualified name for the temp function
-        candidate_model: Model to substitute
-        candidate_prompt: System prompt to substitute
-
-    Returns:
-        SQL DDL string for the temp function
-    """
-    ddl = normalize_ddl_to_dollar_quoting(original_ddl)
-
-    # Replace function name in CREATE ... FUNCTION <name>(
-    ddl = re.sub(
-        r"(CREATE\s+OR\s+REPLACE\s+FUNCTION\s+)\S+(\s*\()",
-        rf"\g<1>{temp_function_name}\2",
-        ddl,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-
-    # Replace model literal: model=>'old' -> model=>'new'
-    escaped_model = candidate_model.replace("'", "''")
-    ddl = re.sub(
-        r"(model\s*=>\s*')[^']*(')",
-        rf"\g<1>{escaped_model}\2",
-        ddl,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-
-    # Replace system prompt: the content value in OBJECT_CONSTRUCT('role', 'system', 'content', '...')
-    escaped_prompt = candidate_prompt.replace("'", "''")
-    ddl = re.sub(
-        r"('role'\s*,\s*'system'\s*,\s*'content'\s*,\s*')(?:[^']|'')*(')",
-        rf"\g<1>{escaped_prompt}\2",
-        ddl,
-        count=1,
-        flags=re.DOTALL,
-    )
-
-    return ddl
 
 
 def _run_single_model_optimization(
@@ -967,6 +1046,7 @@ def _run_single_model_optimization(
     valset: list,
     evaluator: Callable,
     resolved_budget: int,
+    reflection_call_weight: int,
     reflection_model: str,
     temperature: float,
     max_tokens: int,
@@ -981,6 +1061,8 @@ def _run_single_model_optimization(
     enable_detailed_tracking: bool = False,
     aggregation_metric: str | None = None,
     original_ddl: str = "",
+    file_type_params: list[str] | None = None,
+    stage_name: str | None = None,
 ) -> dict:
     """Run optimization for a single model. Designed to be called in parallel.
 
@@ -992,6 +1074,7 @@ def _run_single_model_optimization(
         valset: Validation examples
         evaluator: Evaluation function
         resolved_budget: Pre-calculated budget
+        reflection_call_weight: Weight of one reflection call vs one metric call
         reflection_model: Reflection model name
         temperature: LLM temperature
         max_tokens: Max tokens
@@ -1038,6 +1121,13 @@ def _run_single_model_optimization(
 
     temp_fn = build_temp_function_name(function_name, "__OPT_TEMP")
 
+    reflection_lm = SnowflakeLLM(
+        session=session,
+        model=reflection_model or model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
     try:
         result = optimize(
             seed_candidate=seed_candidate,
@@ -1047,17 +1137,18 @@ def _run_single_model_optimization(
             valset=valset,
             function_name=function_name,
             input_columns=input_columns,
-            auto=None,
-            max_metric_calls=resolved_budget,
-            original_ddl=original_ddl,
-            temp_function_name=temp_fn,
             model=model,
             reflection_model=reflection_model or model,
+            reflection_lm=reflection_lm,
+            max_metric_calls=resolved_budget,
+            reflection_call_weight=reflection_call_weight,
+            original_ddl=original_ddl,
+            temp_function_name=temp_fn,
             no_improvement_patience=None,
-            temperature=temperature,
-            max_tokens=max_tokens,
             tracking_callback=tracking_callback,
             detailed_tracking_callback=detailed_tracking_callback,
+            file_type_params=file_type_params,
+            stage_name=stage_name,
         )
 
         if tracking_table:
@@ -1088,6 +1179,7 @@ def _run_single_model_optimization(
 
         best_prompt_raw = result.best_candidate.get("instruction", "")
 
+        total_reflection_calls = reflection_lm.call_count
         model_output = {
             "model": model,
             "status": "completed",
@@ -1097,6 +1189,7 @@ def _run_single_model_optimization(
             "seed_val_score": seed_val_score,
             "total_candidates": len(result.candidates),
             "total_metric_calls": result.total_metric_calls,
+            "total_reflection_calls": total_reflection_calls,
             "all_val_scores": result.val_aggregate_scores,
             "reflection_model": reflection_model or model,
         }
@@ -1109,65 +1202,67 @@ def _run_single_model_optimization(
         ):
             model_output["best_val_subscores"] = subscores[result.best_idx]
 
-        # Test set evaluation using temp functions
+        # Test set evaluation using temp functions.
+        # Uses binary scoring so results match standalone EVALUATE_AI_FUNCTION.
         if test_table and original_ddl:
             eval_metric_options = (
                 dict(evaluator.kwargs) if hasattr(evaluator, "kwargs") else {}
             )
+            if evaluator.metric_name == "llm_judge":
+                eval_metric_options["scoring_mode"] = "binary"
             if expected_columns:
                 eval_metric_options["expected_columns"] = expected_columns
 
             test_temp_fn = build_temp_function_name(function_name, "__OPT_TEST")
 
-            try:
-                # Evaluate seed: create temp function with seed model+prompt
-                seed_ddl = create_temp_function_ddl(
-                    original_ddl, test_temp_fn, model, seed_prompt
-                )
-                session.sql(seed_ddl).collect()
-                seed_test_score = evaluate_ai_function(
-                    session=session,
-                    function_name=test_temp_fn,
-                    test_table=test_table,
-                    input_columns=input_columns,
-                    label_column=label_column,
-                    metric_name=evaluator.metric_name,
-                    custom_metric_udf=evaluator.custom_metric_udf,
-                    metric_options=eval_metric_options,
-                    model_name=model,
-                )
+            # Evaluate seed: create temp function with seed model+prompt
+            seedInst = TempAIFunction(
+                session=session,
+                original_ddl=original_ddl,
+                temp_function_name=test_temp_fn,
+                candidate_model=model,
+                candidate_prompt=seed_prompt,
+            )
+            seed_test_score = evaluate_ai_function(
+                session=session,
+                function_name=test_temp_fn,
+                test_table=test_table,
+                input_columns=input_columns,
+                label_column=label_column,
+                metric_name=evaluator.metric_name,
+                custom_metric_udf=evaluator.custom_metric_udf,
+                metric_options=eval_metric_options,
+                model_name=model,
+                executor=seedInst.call_rows,
+            )
 
-                # Evaluate best: create temp function with best model+prompt
-                best_ddl = create_temp_function_ddl(
-                    original_ddl,
-                    test_temp_fn,
-                    model,
-                    result.best_candidate["instruction"],
-                )
-                session.sql(best_ddl).collect()
-                best_test_score = evaluate_ai_function(
-                    session=session,
-                    function_name=test_temp_fn,
-                    test_table=test_table,
-                    input_columns=input_columns,
-                    label_column=label_column,
-                    metric_name=evaluator.metric_name,
-                    custom_metric_udf=evaluator.custom_metric_udf,
-                    metric_options=eval_metric_options,
-                    model_name=model,
-                )
+            # Evaluate best: create temp function with best model+prompt
+            bestInst = TempAIFunction(
+                session=session,
+                original_ddl=original_ddl,
+                temp_function_name=test_temp_fn,
+                candidate_model=model,
+                candidate_prompt=result.best_candidate["instruction"],
+            )
+            best_test_score = evaluate_ai_function(
+                session=session,
+                function_name=test_temp_fn,
+                test_table=test_table,
+                input_columns=input_columns,
+                label_column=label_column,
+                metric_name=evaluator.metric_name,
+                custom_metric_udf=evaluator.custom_metric_udf,
+                metric_options=eval_metric_options,
+                model_name=model,
+                executor=bestInst.call_rows,
+            )
 
-                model_output["seed_test_score"] = seed_test_score
-                model_output["best_test_score"] = best_test_score
-                test_count = session.sql(
-                    f"SELECT COUNT(*) FROM {test_table}"
-                ).collect()[0][0]
-                model_output["num_test_examples"] = test_count
-            finally:
-                try:
-                    session.sql(f"DROP FUNCTION IF EXISTS {test_temp_fn}").collect()
-                except Exception:
-                    pass
+            model_output["seed_test_score"] = seed_test_score
+            model_output["best_test_score"] = best_test_score
+            test_count = session.sql(
+                f"SELECT COUNT(*) FROM {test_table}"
+            ).collect()[0][0]
+            model_output["num_test_examples"] = test_count
 
         return model_output
 
@@ -1199,6 +1294,7 @@ def _run_single_model_optimization(
         }
 
 
+@with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc()
 @with_custom_ai_function_query_tag("SPROC_OPTIMIZATION")
 def run_optimization(
     session: Session,
@@ -1210,12 +1306,12 @@ def run_optimization(
     models: list,
     reflection_model: str,
     test_table: str = None,
-    auto_budget: Literal["light", "medium", "heavy"] = "light",
+    auto_budget: Literal["light", "medium", "heavy"] = DEFAULT_AUTO_BUDGET,
     tracking_table: str = None,
     results_table: str = None,
-    validation_fraction: float = 0.667,
-    temperature: float = 0.7,
-    max_tokens: int = 8192,
+    validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     metric_options: dict = None,
     custom_metric_udf: str = None,
     enable_detailed_tracking: bool = False,
@@ -1279,11 +1375,9 @@ def run_optimization(
         return {"error": "reflection_model parameter is required", "status": "failed"}
 
     try:
-        parsed_ddl = get_function_ddl(session, function_name, unescape=True)
-        seed_prompt = extract_prompt_from_ddl_string(parsed_ddl, function_name)
-        seed_model = extract_model_from_ddl_string(parsed_ddl, function_name)
-        # Raw DDL (not unescaped) is valid SQL for creating temp functions
         original_ddl = get_function_ddl(session, function_name, unescape=False)
+        seed_prompt = extract_prompt_from_ddl_string(original_ddl, function_name)
+        seed_model = extract_model_from_ddl_string(original_ddl, function_name)
     except ValueError as e:
         return {"error": str(e), "status": "failed"}
 
@@ -1350,28 +1444,68 @@ def run_optimization(
             "status": "failed",
         }
 
-    evaluator = Evaluator(
-        metric_name,
-        session=session,
-        custom_metric_udf=custom_metric_udf,
-        aggregation_metric=aggregation_metric,
-        **metric_opts,
-    )
+    gepa_metric_opts = dict(metric_opts)
+    if metric_name == "llm_judge":
+        gepa_metric_opts.setdefault("scoring_mode", "continuous")
+
+        # Auto-detect multimodal file inputs from DDL (both patterns)
+        if "file_columns" not in gepa_metric_opts:
+            all_file_columns: list[str] = []
+
+            detected = extract_to_file_refs(original_ddl)
+            if detected:
+                stage, columns = detected
+                gepa_metric_opts.setdefault("stage_name", stage)
+                all_file_columns.extend(columns)
+
+            file_params = extract_file_type_params(original_ddl)
+            if file_params:
+                all_file_columns.extend(
+                    p for p in file_params if p not in all_file_columns
+                )
+                gepa_metric_opts.setdefault("file_type_params", file_params)
+
+            if all_file_columns:
+                gepa_metric_opts["file_columns"] = all_file_columns
 
     dataset_expected_columns = expected_columns if len(expected_columns) > 1 else None
-    full_dataset = load_dataset(
+    dataset_result = load_dataset(
         session,
         training_table,
         input_columns,
         label_column,
         expected_columns=dataset_expected_columns,
     )
-    if not full_dataset:
+    if not dataset_result:
         return {
             "error": f"No data found in training table: {training_table}",
             "status": "failed",
         }
 
+    # If load_dataset detected FILE-typed columns, use the stage name
+    # extracted from the FILE variant values (no extra SQL needed).
+    if dataset_result.file_stage_name:
+        gepa_metric_opts.setdefault("stage_name", dataset_result.file_stage_name)
+
+    evaluator = Evaluator(
+        metric_name,
+        session=session,
+        custom_metric_udf=custom_metric_udf,
+        aggregation_metric=aggregation_metric,
+        **gepa_metric_opts,
+    )
+
+    full_dataset = dataset_result.dataset
+
+    try:
+        validate_stage_file_access(
+            session,
+            stage_name=gepa_metric_opts.get("stage_name"),
+            file_columns=gepa_metric_opts.get("file_columns"),
+            dataset=full_dataset,
+        )
+    except ValueError as e:
+        return {"error": str(e), "status": "failed"}
     valset, trainset = split_dataset(full_dataset, validation_fraction)
 
     seed_candidate = {"instruction": seed_prompt}
@@ -1382,11 +1516,17 @@ def run_optimization(
 
     # Calculate budget once upfront - same budget for ALL models
     # This ensures consistent budget across all models regardless of run order
-    resolved_budget = _resolve_budget(
+    reflection_weight = MaxTotalBudgetStopper.estimate_reflection_weight(
+        seed_candidate=seed_candidate,
+        trainset=trainset,
+        metric_name=evaluator.metric_name,
+        metric_kwargs=dict(evaluator.kwargs),
+    )
+    resolved_budget = MaxTotalBudgetStopper.resolve_budget(
         auto=auto_budget,
-        max_metric_calls=None,
         num_components=len(seed_candidate),
         valset_size=len(valset),
+        reflection_call_weight=reflection_weight,
     )
 
     # Run optimization for each model IN PARALLEL using ThreadPoolExecutor
@@ -1400,6 +1540,9 @@ def run_optimization(
     # max_workers=len(models) allows all models to run simultaneously
     with ThreadPoolExecutor(max_workers=len(models)) as executor:
         # Submit all model optimization tasks
+        file_type_params = gepa_metric_opts.get("file_type_params")
+        file_stage_name = gepa_metric_opts.get("stage_name")
+
         future_to_model = {
             executor.submit(
                 _run_single_model_optimization,
@@ -1410,6 +1553,7 @@ def run_optimization(
                 valset=valset,
                 evaluator=evaluator,
                 resolved_budget=resolved_budget,
+                reflection_call_weight=reflection_weight,
                 reflection_model=reflection_model,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -1424,6 +1568,8 @@ def run_optimization(
                 enable_detailed_tracking=enable_detailed_tracking,
                 aggregation_metric=aggregation_metric,
                 original_ddl=original_ddl,
+                file_type_params=file_type_params,
+                stage_name=file_stage_name,
             ): model
             for model in models
         }
@@ -1518,3 +1664,4 @@ def run_optimization(
             pass  # Cleanup failure should not break optimization
 
     return output
+

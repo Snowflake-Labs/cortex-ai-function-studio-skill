@@ -27,7 +27,14 @@ from metrics_core import (
     resolve_multi_output_columns,
     validate_input_columns,
 )
-from custom_ai_function_utils import RobustAIComplete
+from custom_ai_function_utils import (
+    STAGE_KEY_PREFIX,
+    RobustAIComplete,
+    TempAIFunction,
+    extract_file_type_params,
+    parse_file_value,
+    stage_key,
+)
 from snowflake.snowpark import Session
 
 
@@ -131,6 +138,10 @@ class Evaluator:
         Metrics with optimized batch implementations (e.g., llm_judge) are
         evaluated in a single call. Others fall back to sequential evaluation.
 
+        When ``file_columns`` and ``stage_name`` are present in kwargs,
+        file paths are extracted from the input data and forwarded to
+        the metric so the LLM judge can see the actual files (images, PDFs, etc.).
+
         Args:
             items: List of (data, response) tuples to evaluate
 
@@ -140,12 +151,35 @@ class Evaluator:
         if not items:
             return []
         batch_items = [(data["answer"], response) for data, response in items]
+
+        metric_kwargs = dict(self.kwargs)
+        file_columns = metric_kwargs.pop("file_columns", None)
+        has_files = (
+            file_columns
+            and self.metric_name == "llm_judge"
+        )
+        if has_files:
+            fc = file_columns[0]
+            sk = stage_key(fc)
+            metric_kwargs["file_paths"] = [
+                str(data["inputs"].get(fc, ""))
+                for data, _ in items
+            ]
+            per_row_stages = [
+                str(data["inputs"].get(sk, ""))
+                for data, _ in items
+            ]
+            if any(per_row_stages):
+                metric_kwargs["stage_name"] = per_row_stages
+        else:
+            metric_kwargs.pop("stage_name", None)
+
         results = compute_metric_batch(
             self.metric_name,
             batch_items,
             self.session,
             self.custom_metric_udf,
-            **self.kwargs,
+            **metric_kwargs,
         )
         eval_results = [EvaluationResult(score=s, feedback=f) for s, f in results]
 
@@ -190,8 +224,10 @@ class SnowflakeLLM:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.call_count: int = 0
 
     def __call__(self, prompt: str) -> str:
+        self.call_count += 1
         responses = RobustAIComplete.call_ai_complete(
             self.session,
             model=self.model,
@@ -225,6 +261,8 @@ class SnowflakeAdapter(
         temp_function_name: str,
         tracking_callback: Callable[[dict[str, str], float], None] | None = None,
         detailed_tracking_callback: Callable[[dict], None] | None = None,
+        file_type_params: list[str] | None = None,
+        stage_name: str | None = None,
     ) -> None:
         self.session = session
         self.evaluator = evaluator
@@ -236,27 +274,22 @@ class SnowflakeAdapter(
         self.tracking_callback = tracking_callback
         self.detailed_tracking_callback = detailed_tracking_callback
 
+        if file_type_params is None:
+            file_type_params = extract_file_type_params(original_ddl) or []
+        self._file_type_params = {p.upper() for p in file_type_params}
+        self._stage_name = stage_name
+
+    def cleanup(self) -> None:
+        """Release resources after optimization.
+
+        Temporary functions are ``TEMPORARY`` and auto-drop at session end,
+        so this is a no-op.  The method exists because ``run_gepa_optimize``
+        calls ``adapter.cleanup()`` in its ``finally`` block.
+        """
+
     def _format_inputs_for_display(self, inputs: dict[str, str]) -> str:
         """Formats inputs dict as string for tracking/reflection."""
         return "\n".join(f"{k}: {v}" for k, v in inputs.items())
-
-    def _ensure_temp_function(self, system_prompt: str) -> None:
-        """Create or replace the temp function with the given model and prompt."""
-        from snow_gepa_optimize import create_temp_function_ddl
-
-        ddl = create_temp_function_ddl(
-            self.original_ddl, self.temp_function_name, self.model, system_prompt
-        )
-        self.session.sql(ddl).collect()
-
-    def cleanup(self) -> None:
-        """Drop the temporary function used during optimization."""
-        try:
-            self.session.sql(
-                f"DROP FUNCTION IF EXISTS {self.temp_function_name}"
-            ).collect()
-        except Exception:
-            pass
 
     def _call_udf_batch(
         self,
@@ -267,53 +300,33 @@ class SnowflakeAdapter(
 
         Creates (or replaces) a temporary function with the candidate
         model and prompt baked in, then calls it without overrides.
+
+        For FILE-type parameters, TempAIFunction wraps the VARCHAR
+        values with ``TO_FILE(stage, value)`` at call time.
         """
         if not batch:
             return []
 
-        self._ensure_temp_function(system_prompt)
-
-        input_col_refs = ", ".join(
-            [f"t.{quote_identifier(col)}" for col in self.input_columns]
+        inst = TempAIFunction(
+            session=self.session,
+            original_ddl=self.original_ddl,
+            temp_function_name=self.temp_function_name,
+            candidate_model=self.model,
+            candidate_prompt=system_prompt,
+            file_type_params=self._file_type_params,
+            stage_name=self._stage_name,
         )
 
-        # Build UNION ALL clause with all input data
-        # Format: SELECT idx AS idx, col1_val AS col1, col2_val AS col2, ...
-        select_statements = []
-        bind_params: list[object] = []
+        inputRows = []
+        for data in batch:
+            row = {c: data["inputs"].get(c, '') for c in self.input_columns}
+            for k, v in data["inputs"].items():
+                if k.startswith(STAGE_KEY_PREFIX):
+                    row[k] = v
+            inputRows.append(row)
 
-        for idx, data in enumerate(batch):
-            col_exprs = []
-            for col in self.input_columns:
-                val = data["inputs"].get(col, "")
-                if isinstance(val, (list, tuple)):
-                    col_exprs.append(f"PARSE_JSON(?) AS {quote_identifier(col)}")
-                    bind_params.append(json.dumps(val))
-                else:
-                    col_exprs.append(f"? AS {quote_identifier(col)}")
-                    bind_params.append(val)
-            select_statements.append(f"SELECT {idx} AS idx, {', '.join(col_exprs)}")
-
-        subquery = " UNION ALL ".join(select_statements)
-
-        sql = f"""
-            SELECT
-                t.idx,
-                {self.temp_function_name}(
-                    {input_col_refs}
-                ) AS result
-            FROM ({subquery}) AS t
-            ORDER BY t.idx
-        """
-
-        results = self.session.sql(sql, params=bind_params).collect()
-
-        responses = []
-        for row in results:
-            result_val = row["RESULT"]
-            responses.append(to_text(result_val))
-
-        return responses
+        # Call with error handling 3 retries
+        return inst.call_rows(inputRows)
 
     def evaluate(
         self,
@@ -412,13 +425,33 @@ class SnowflakeAdapter(
         return ret_d
 
 
+class DatasetResult:
+    """Result of loading a dataset, including auto-detected FILE stage info."""
+
+    def __init__(
+        self,
+        dataset: list[SnowflakeDataInst],
+        file_stage_name: str | None = None,
+        file_columns: list[str] | None = None,
+    ):
+        self.dataset = dataset
+        self.file_stage_name = file_stage_name
+        self.file_columns = file_columns or []
+
+    def __bool__(self) -> bool:
+        return bool(self.dataset)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+
 def load_dataset(
     session: Session,
     table_name: str,
     input_columns: list[str],
     label_column: str,
     expected_columns: list[str] | None = None,
-) -> list[SnowflakeDataInst]:
+) -> DatasetResult:
     """Load data from a Snowflake table into SnowflakeDataInst format.
 
     Args:
@@ -431,7 +464,10 @@ def load_dataset(
             object-level evaluation (used by multi-output llm_judge).
 
     Returns:
-        List of SnowflakeDataInst dictionaries
+        DatasetResult with the dataset, auto-detected FILE stage name (from
+        the first FILE value), and the list of FILE-typed columns.  Each
+        row's ``inputs`` dict contains ``__STAGE_{col}`` keys so that
+        downstream callers can build per-row ``TO_FILE()`` expressions.
 
     Raises:
         ValueError: If any input column is not found in the table
@@ -451,6 +487,8 @@ def load_dataset(
 
     rows = session.sql(query).collect()
 
+    file_stage_name: str | None = None
+    detected_file_cols: set[str] = set()
     dataset = []
     for row in rows:
         inputs = {}
@@ -458,6 +496,20 @@ def load_dataset(
             val = row[col]
             if val is None:
                 inputs[col] = ""
+                continue
+
+            # FILE-typed columns are collected as dicts with STAGE and
+            # RELATIVE_PATH keys.  Extract the relative path and store
+            # the stage in a companion __STAGE_{col} key so call_rows()
+            # can build per-row TO_FILE() expressions.
+            parsed = parse_file_value(val)
+            if parsed:
+                row_stage, rel_path = parsed
+                inputs[col] = rel_path
+                inputs[stage_key(col)] = row_stage
+                detected_file_cols.add(col)
+                if file_stage_name is None:
+                    file_stage_name = row_stage
             elif isinstance(val, str) and val.strip().startswith("["):
                 try:
                     inputs[col] = json.loads(val)
@@ -468,4 +520,8 @@ def load_dataset(
         answer = to_text(row["ANSWER"])
         dataset.append(SnowflakeDataInst(inputs=inputs, answer=answer))
 
-    return dataset
+    return DatasetResult(
+        dataset=dataset,
+        file_stage_name=file_stage_name,
+        file_columns=sorted(detected_file_cols),
+    )

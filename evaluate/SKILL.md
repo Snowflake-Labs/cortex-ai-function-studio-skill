@@ -21,14 +21,13 @@ Load from main skill when user intent matches EVALUATE: "evaluate", "test", "mea
 | `test_table` | Yes | - | No | - |
 | `input_columns` | Yes | - | **Yes** | test_table |
 | `label_column` | Yes | - | **Yes** | test_table |
-| `stage` | Yes | (generated) | No | - |
 | `sample_size` | No | all | No | - |
 | `metric` | Yes | - | **Yes** | - |
 | `results_table` | No | (generated) | No | function_name |
 
 **Critical fields** (always confirm even if pre-provided): `input_columns`, `label_column`, `metric`
 
-**Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `stage`, `sample_size`, `results_table`
+**Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `sample_size`, `results_table`
 
 ## Pre-Collection
 
@@ -86,7 +85,7 @@ Store this as `{function_model}` for use when calling EVALUATE_AI_FUNCTION.
 ```
 The optimize workflow used test table: {test_table_from_optimize}
 For consistent results, we recommend using the same test data.
-Press Enter to confirm, or provide a different table name.
+Confirm this table? (y/n) If no, provide a different table name.
 ```
 
 **If returning from synthetic data generation or pseudo-label generation:** After data has been created, you MUST confirm which table to use:
@@ -118,17 +117,18 @@ Store the column list from the DESCRIBE output — you will need it for column m
 
 After confirmation, **Load** `references/data_preparation.md` Step 5 to validate that all mapped columns exist in the relevant tables. Do NOT proceed if columns don't match.
 
+**⚠️ Column mismatch handling**: If any mapped column does not exist in the test table, you MUST present the mismatch to the user via `ask_user_question` (not prose text). Include the mismatched column names, the actual table columns, and remediation options. Do NOT silently remap or proceed — always surface the mismatch through `ask_user_question` so the user can decide.
+
 **Multi-key output handling:** If the user's test table has multiple truth columns that correspond to keys in a multi-key function output (e.g., separate `SENTIMENT`, `CONFIDENCE` columns instead of a single VARIANT), help them combine these into a single VARIANT `label_column` using `OBJECT_CONSTRUCT` in a view before evaluation. See `references/data_preparation.md` "Multi-Column Truth Aggregation" for the SQL pattern.
 
 ### Step 3: Configure Evaluation
 
-**If `stage` and `sample_size` already collected**, skip this step. Use defaults for any not provided: sample_size=all.
+**If `sample_size` already collected**, skip this step. Use defaults for any not provided: sample_size=all.
 
 **If not collected**, ask user:
 ```
 Evaluation configuration:
 
-- Stage: [e.g., DB.SCHEMA.AI_FUNCTIONS] - Stage for metrics code
 - Sample size: [all] - Number of rows to evaluate (or 'all')
 - Save detailed results? [yes/no] - Results saved to function-specific table
 ```
@@ -137,27 +137,9 @@ Evaluation configuration:
 
 Note: The metric is selected at runtime when calling the SPROC, not at creation time.
 
-### Step 4: Setup Infrastructure
+### Step 4: Run Evaluation
 
-**If infrastructure was already set up** (e.g., from a prior create or optimize workflow in this session), skip this step — proceed directly to Step 5.
-
-**Otherwise**, explain to the user:
-```
-To evaluate your AI function, I need to set up infrastructure:
-1. Create a stage for Python code
-2. Upload metrics code for scoring
-3. Create the evaluation procedure
-
-Stage location: {stage_name}
-```
-
-**⚠️ STOP**: Get user confirmation before proceeding.
-
-**Load** `references/infrastructure_setup.md` and run the deploy script shortcut to provision stage, modules, and procedures before evaluation.
-
-### Step 5: Run Evaluation
-
-**MANDATORY**: Wrap the SPROC `CALL ...` in the query tag wrapper from `references/query_tag.md` (set/restore `QUERY_TAG`). The agent MUST inject its local `CORTEX_SESSION_ID` into the wrapper and record it under the canonical key `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID` (merge into JSON tags when possible; otherwise append to string tags).
+**MANDATORY**: Wrap the SPROC `CALL ...` in the query tag wrapper from `references/query_tag.md` (set/restore `QUERY_TAG`). The agent MUST inject its local `CORTEX_SESSION_ID` into the wrapper and record it under the canonical key `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID` (merge into JSON tags when possible; otherwise append to string tags). **You MUST reproduce the full wrapper SQL from `references/query_tag.md` verbatim** — including `CURRENT_QUERY_TAG()`, `TRY_PARSE_JSON`, `OBJECT_INSERT`, and both `ALTER SESSION SET QUERY_TAG` statements (set and restore). Do NOT simplify or abbreviate the wrapper. The agent MUST also inline the actual `CORTEX_SESSION_ID` value as a string literal — do NOT leave ANY placeholder such as `<CORTEX_SESSION_ID>`, `${CORTEX_SESSION_ID}`, `YOUR_SESSION_ID_HERE`, `YOUR_ACTUAL_SESSION_ID_HERE`, or similar. Look up the real session ID and substitute it directly into the SQL.
 
 **Load** `references/metrics.md` and present the metric selection prompt.
 
@@ -192,62 +174,59 @@ Would you like to use a different timeout?
 ```
 If user provides a custom value, store as `timeout_minutes`. Otherwise use the default (240).
 
-**Sync execution** (default): Runs directly and returns results. 
+**Sync execution** (default): Runs directly and returns results via an anonymous stored procedure (no persistent objects). Python metrics code is inlined into the SPROC body. Use `timeout_seconds: 14400` (4 hours) to prevent the query from timing out before completion.
 
-**Async execution**: Uses a Snowflake Task to run the evaluation in the background. This prevents Cortex Code from timing out on long-running evaluations.
+**Async execution**: Uses a Snowflake Task to run the evaluation in the background. The Task body contains the anonymous SPROC with inlined Python, so no named procedures are created and no stage upload is required.
 
-#### Sync Evaluation
+#### Running the Evaluation Script
 
-```sql
-CALL EVALUATE_AI_FUNCTION(
-    '{function_name}',                    -- Fully qualified AI function name (DB.SCHEMA.FUNC)
-    '{test_table}',                       -- Fully qualified test data table
-    ARRAY_CONSTRUCT('{input_col1}', '{input_col2}'),  -- Input columns passed to function (in order)
-    '{label_column}',                     -- Column containing expected outputs
-    '{metric_name}',                      -- 'exact_match', 'fuzzy_match', 'contains_match', 'llm_judge', or custom
-    '{function_model}',                   -- Model used by function (extracted from DDL in Step 1)
-    NULL,                                 -- sample_size: rows to evaluate (NULL = all)
-    '{results_table}',                    -- results_table: where to save detailed results (NULL = don't save)
-    NULL,                                 -- metric_options: OBJECT_CONSTRUCT('threshold', 0.9) for fuzzy_match, etc.
-    500,                                  -- max_length: truncation limit for fields (default 500)
-    NULL,                                 -- custom_metric_udf: fully qualified UDF name if using custom metric
-    NULL                                  -- run_id: external ID for tracking (auto-generated if NULL)
-);
+Run the evaluation script. It generates a `CALL EVALUATE_AI_FUNCTION(...)` stored procedure (anonymous SPROC) and executes it in a single Snowpark session. When showing SQL to users, always reference this `EVALUATE_AI_FUNCTION` SPROC name — do NOT invent manual SQL or alternative evaluation approaches. **Always pass every flag** — use `none` for unused optional parameters. For sync execution, use `timeout_seconds: 14400` (4 hours) to prevent the query from timing out.
+
+```bash
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py evaluate \
+    --database {database} \
+    --schema {schema} \
+    --connection <CONNECTION_NAME> \
+    --function-name {function_name} \
+    --test-table {test_table} \
+    --input-columns {input_col1} {input_col2} \
+    --label-column {label_column} \
+    --metric-name {metric_name} \
+    --model-name {function_model} \
+    --sample-size none \
+    --results-table {results_table or none} \
+    --metric-options none \
+    --max-length 500 \
+    --custom-metric-udf none \
+    --run-id none
+    # For async execution, also append:
+    #   --async --warehouse {warehouse} --timeout-minutes {timeout_minutes}
 ```
 
-#### Async Evaluation
+Run `run.py evaluate --help` to see all flags and their descriptions.
 
-For async execution, use `EVALUATE_AI_FUNCTION_ASYNC` which creates and executes a Snowflake Task:
+#### Sync Output
 
-```sql
-CALL EVALUATE_AI_FUNCTION_ASYNC(
-    '{function_name}',                    -- Fully qualified AI function name (DB.SCHEMA.FUNC)
-    '{test_table}',                       -- Fully qualified test data table
-    ARRAY_CONSTRUCT('{input_col1}', '{input_col2}'),  -- Input columns passed to function (in order)
-    '{label_column}',                  -- Column containing expected outputs
-    '{metric_name}',                      -- 'exact_match', 'fuzzy_match', 'contains_match', 'llm_judge', or custom
-    '{function_model}',                   -- Model used by function (extracted from DDL in Step 1)
-    NULL,                                 -- sample_size: rows to evaluate (NULL = all)
-    '{results_table}',                    -- results_table: REQUIRED for async - results go here
-    NULL,                                 -- metric_options: OBJECT_CONSTRUCT('threshold', 0.9) for fuzzy_match, etc.
-    500,                                  -- max_length: truncation limit for fields (default 500)
-    NULL,                                 -- custom_metric_udf: fully qualified UDF name if using custom metric
-    NULL,                                 -- warehouse_name: warehouse to run task (NULL = current)
-    NULL,                                 -- run_id: custom run ID (auto-generated if NULL)
-    240                                   -- timeout_minutes: max task runtime in minutes (default 240 = 4 hours)
-);
+The script prints a JSON result to stdout:
+```json
+{"status": "success", "score": 0.85, "metric": "exact_match", "function": "DB.SCHEMA.MY_FUNC"}
 ```
 
-The SPROC returns immediately with a **run_id** like `ai_func_eval_MY_AI_FUNCTION_1709234567890`.
+#### Async Output
 
-**⚠️ WAREHOUSE NOTE**: If the SPROC returns a string starting with `ERROR:` instead of a run_id, it means the current role lacks a direct USAGE grant on the target warehouse. Snowflake Tasks require an explicit grant — session-level access via role hierarchy is not sufficient. Display the full error to the user. It includes the exact `GRANT` command needed and instructions for finding usable warehouses.
+For async execution, the script creates a Snowflake Task whose body is the anonymous SPROC (with inlined Python) + CALL. No named procedures are created.
+```json
+{"status": "submitted", "run_id": "ai_func_eval_MY_FUNC_1739919133000", "task": "DB.SCHEMA.ai_func_eval_MY_FUNC_1739919133000"}
+```
+
+**⚠️ WAREHOUSE NOTE**: If the script returns `{"status": "error", ...}` instead of `{"status": "submitted", "run_id": "..."}`, it likely means the current role lacks a direct USAGE grant on the target warehouse. Snowflake Tasks require an explicit grant — session-level access via role hierarchy is not sufficient. Display the `message` field to the user. It includes the exact `GRANT` command needed and instructions for finding usable warehouses.
 
 **⚠️ IMPORTANT**: Display the run_id prominently to the user:
 
 ```
 Evaluation started in background!
 
-RUN_ID: ai_func_eval_MY_AI_FUNCTION_1709234567890
+RUN_ID: {run_id}
 
 Save this run_id to track your evaluation.
 
@@ -255,9 +234,23 @@ Check status:  See references/async_status.md
 View results:  SELECT * FROM {results_table} WHERE RUN_ID = '{run_id}';
 ```
 
-You can close this session and return later. To resume, load the custom AI function skill and say "check status of {run_id}" — it will pick up where you left off and present your results.
+**⚠️ IMPORTANT**: For async evaluation, `--results-table` is required since the return value isn't directly accessible.
 
 **Load** `references/async_status.md` if user wants to check status.
+
+**Cleanup after async completes:** Before dropping anything, verify the Task has finished:
+
+```sql
+SELECT STATE FROM TABLE({database}.INFORMATION_SCHEMA.TASK_HISTORY(
+    TASK_NAME => '{run_id}', RESULT_LIMIT => 1
+));
+```
+
+Only proceed with cleanup when `STATE` is `SUCCEEDED`, `FAILED`, or `CANCELLED`. If still `EXECUTING` or `SCHEDULED`, inform the user and wait.
+
+```sql
+DROP TASK IF EXISTS {database}.{schema}.{run_id};
+```
 
 **Results Table Schema:**
 
@@ -287,7 +280,7 @@ When saving results, the SPROC automatically:
 | fuzzy_match | threshold | FLOAT | 0.85 | Minimum similarity score |
 | llm_judge | task_description | VARCHAR | '' | Task context for the judge |
 
-### Step 6: Present Results
+### Step 5: Present Results
 
 Display the returned score:
 ```
@@ -326,7 +319,7 @@ Compare evaluation runs:
   ORDER BY EVAL_TIMESTAMP DESC;
 ```
 
-### Step 7: Next Steps
+### Step 6: Next Steps
 
 Present to user:
 ```
@@ -350,13 +343,11 @@ Critical confirmations (always stop, even if pre-provided):
 - ✋ Step 2: Confirm column mapping (input_columns, label_column)
 
 Optional confirmations:
-- ✋ Step 4: Before setting up infrastructure
-- ✋ Step 5: Before creating SPROC
-- ✋ Step 7: After presenting results
+- ✋ Step 4: Before running evaluation
+- ✋ Step 5: After presenting results
 
 ## Output
 
-- Stage with metrics.zip uploaded
-- Generic evaluation SPROC created in Snowflake
 - Average score returned (float between 0.0 and 1.0)
 - Detailed results table (optional) for debugging
+- No persistent artifacts — Python code is inlined into the anonymous SPROC

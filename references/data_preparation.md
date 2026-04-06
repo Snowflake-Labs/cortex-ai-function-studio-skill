@@ -1,8 +1,3 @@
----
-name: data-preparation
-description: "Prepare train/test data for AI function evaluation and optimization."
-parent_skill: cortex-ai-function-studio
----
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
@@ -52,11 +47,13 @@ Note: The optimization step internally splits training data into train/dev sets 
 
 ## Recommended Data Sizes
 
-| Workflow | Table | Recommended | Minimum |
-|----------|-------|-------------|---------|
-| Evaluate | Test | ~200 rows | 50 |
-| Optimize | Training | ~300 rows | 50 |
-| Optimize | Test | ~200 rows | 50 |
+| Workflow | Table | Quick Start | Production | Minimum |
+|----------|-------|-------------|------------|---------|
+| Evaluate | Test | ~50 rows | 200+ rows | 20 |
+| Optimize | Training | ~50 rows | 300+ rows | 20 |
+
+> **Quick Start** sizes are enough to try the tool and iterate fast.
+> **Production** sizes give better statistical signal for optimization and more reliable evaluation scores.
 
 ## Data Acquisition Flow
 
@@ -90,7 +87,7 @@ After splitting, use:
 
 #### Option 3: Generate Synthetic Data
 
-**Load** `references/synthetic_data.md` for comprehensive guidelines.
+**Load** `synthetic-data/SKILL.md` for comprehensive guidelines.
 
 After generation, return here to validate the created table.
 
@@ -98,11 +95,11 @@ After generation, return here to validate the created table.
 
 Use this when the user has inputs but no expected labels.
 
-**Load** `references/synthetic_data.md` and follow the pseudo-label workflow in pseudo-label mode.
+**Load** `synthetic-data/SKILL.md` and follow the pseudo-label workflow in pseudo-label mode.
 
 Requirements:
 - Preserve parent workflow context (`evaluate` or `optimize`) and function context if available.
-- Collect output shape via `OUTPUT_SCHEMA` or `FUNCTION_NAME` per `synthetic_data.md`.
+- Collect output shape via `OUTPUT_SCHEMA` or `FUNCTION_NAME` per `synthetic-data/SKILL.md`.
 - Use preview/revise before full-run labeling.
 
 After pseudo-label generation:

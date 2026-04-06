@@ -7,8 +7,8 @@
 -- Creates and executes a Snowflake Task to run optimization in the background
 -- =============================================================================
 --
--- Use scripts/create_sproc.py to generate this SPROC:
---   uv run python scripts/create_sproc.py optimize_async DATABASE SCHEMA STAGE_NAME
+-- Use src/create_sproc.py to generate this SPROC:
+--   uv run python src/create_sproc.py optimize_async DATABASE SCHEMA STAGE_NAME
 --
 -- =============================================================================
 
@@ -24,7 +24,7 @@ CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION_ASY
     AUTO_BUDGET VARCHAR DEFAULT 'light',
     TRACKING_TABLE VARCHAR DEFAULT NULL,
     RESULTS_TABLE VARCHAR DEFAULT NULL,
-    VALIDATION_FRACTION FLOAT DEFAULT 0.667,
+    VALIDATION_FRACTION FLOAT DEFAULT 0.5,
     TEMPERATURE FLOAT DEFAULT 0.7,
     MAX_TOKENS INTEGER DEFAULT 8192,
     METRIC_OPTIONS VARIANT DEFAULT NULL,
