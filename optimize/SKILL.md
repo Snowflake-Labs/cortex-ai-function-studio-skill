@@ -334,23 +334,21 @@ If tracking table used, query candidate history:
 SELECT ROW_NUMBER() OVER (PARTITION BY MODEL_NAME ORDER BY CREATED_AT) AS IDX, MODEL_NAME, METRIC_SCORE, LEFT(PROMPT_TEXT, 100) FROM {tracking_table} WHERE METRIC_SCORE IS NOT NULL ORDER BY METRIC_SCORE DESC;
 ```
 
-**6.2. Get character length statistics:**
+**6.2. Get average output length:**
 
-For each input column, compute average length separately. If there are multiple input columns, sum their averages (e.g., `AVG(LENGTH(COL_A)) + AVG(LENGTH(COL_B))`):
 ```sql
-SELECT
-    {sum_of_AVG_LENGTH_per_input_column} AS avg_input_chars,
-    AVG(LENGTH({label_column})) AS avg_output_chars
-FROM {test_table};
+SELECT AVG(LENGTH({label_column})) AS avg_output_chars FROM {test_table};
 ```
 
 **6.3. Filter to pareto-optimal options:**
 ```bash
 uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
     --json '[{"model": "model1", "score": 0.85}, ...]' \
-    --prompt-chars {prompt_chars} --avg-input-chars {avg_input_chars} --avg-output-chars {avg_output_chars} \
+    --prompt-chars {prompt_chars} --avg-output-chars {avg_output_chars} \
     --seed-score {seed_test_score} --format table
 ```
+
+Where `{prompt_chars}` is the character length of the best prompt from the optimization results.
 
 **6.4. Present pareto-optimal results:**
 

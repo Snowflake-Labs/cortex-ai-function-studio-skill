@@ -29,7 +29,7 @@ SHOW PARAMETERS LIKE 'cortex_models_allowlist' IN ACCOUNT
 SHOW MODELS IN SNOWFLAKE.MODELS
 ```
 
-Filter out non-chat models and task-specific models. Keep only general-purpose chat/completion models suitable for AI functions.
+Intersect the results with the models defined in `src/models.json`. Only models that appear in **both** the `SHOW MODELS` output **and** `models.json` are considered available.
 
 **IF `SHOW MODELS` fails or returns empty:**
 
@@ -78,9 +78,32 @@ Present using `ask_user_question` with 3-4 recommended models (one per family) p
 
 Add a final option: **"See all models"** — "View the complete list of available models grouped by family."
 
+**After presenting options, inform the user:**
+
+> Not all models may be available in every region or cloud provider. I can run a quick test after you choose to make sure the model works in your account.
+
 #### If user selects "See all models":
 
 Display **all** available chat models organized by family in a list format. For each family, show all available models with a brief note (size/speed/quality). Let the user pick from the full list.
+
+### Step 5: Verify Model Availability
+
+After the user selects a model (from Step 4, "See all models", or free-text input), run a lightweight test call to confirm the model is actually callable in this account's region and cloud provider:
+
+```sql
+SELECT AI_COMPLETE('<selected_model>', 'test') AS test_response
+```
+
+**IF the call succeeds:** The model is confirmed available. Proceed with the selected model.
+
+**IF the call fails** (e.g., model not deployed in this region, permission error, unsupported cloud provider):
+
+⚠️ **SAY THIS TO THE USER** (do not paraphrase):
+> The model `<selected_model>` is not available in your account's region or cloud provider. Let's pick a different model.
+
+Then return to **Step 4** and re-present the model options, **excluding the failed model** from the list. Continue this loop until the user selects a model that passes verification.
+
+**Note:** Keep a running list of failed models for the duration of the selection workflow so they are excluded from all subsequent presentations (Steps 3, 4, and "See all models").
 
 ## Model Validation & Auto-Correction
 

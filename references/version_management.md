@@ -195,13 +195,11 @@ To show only versions where no other version is both cheaper AND better, use the
 ```bash
 uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
     --json '[{"model": "llama3.1-8b", "score": 0.82, "name": "MY_FUNC_V2"}, ...]' \
-    --prompt-chars 200 \
-    --avg-input-chars 500 \
-    --avg-output-chars 10 \
+    --prompt-chars 200 --avg-output-chars 10 \
     --format table
 ```
 
-The character count arguments are used to calculate the input/output ratio for cost weighting. See `optimize/SKILL.md` Step 6.2 for how to get these values from your test data.
+Cost is calculated as `input_price × prompt_chars + output_price × avg_output_chars`.
 
 This filters out dominated versions (e.g., if V2 with llama3.1-8b has 82% and V3 with claude-sonnet-4-5 has only 80%, V3 is filtered out since V2 is both cheaper and better).
 
@@ -245,7 +243,7 @@ WHERE v1.FUNCTION_NAME = '{version_1}'
   AND v2.FUNCTION_NAME = '{version_2}';
 ```
 
-**Note:** For cost comparison, use `filter_pareto.py` with both versions to determine if one dominates the other. Cost is calculated from `models.json` based on model name and the input/output ratio (derived from character counts).
+**Note:** For cost comparison, use `filter_pareto.py` with both versions to determine if one dominates the other. Cost is calculated as `input_price × prompt_chars + output_price × avg_output_chars`.
 
 ### List Versions by Experiment
 

@@ -27,8 +27,9 @@ Which demo would you like to try?
 3. **Insurance Claim Routing** - Build and optimize a claim routing AI function with async task execution
 4. **Policy conditioned routing** - dynamically route ticket according to company's policies
 5. **Clothing Condition Classification** - Classify garment condition from images using multimodal AI
-6. **Image Summarization** - Summarize image content as text (coming soon)
-7. **Sentiment Analysis** - Analyze text sentiment (coming soon)
+6. **Legal Document Extraction** - Extract structured fields from real legal contracts with GEPA optimization
+7. **Image Summarization** - Summarize image content as text (coming soon)
+8. **Sentiment Analysis** - Analyze text sentiment (coming soon)
 ```
 
 ### Step 2: Route
@@ -42,6 +43,8 @@ Which demo would you like to try?
 **If Policy conditioned routing:** Load `policy-conditioned-routing/SKILL.md`
 
 **If Clothing Condition Classification:** Load `clothing-classification/SKILL.md`
+
+**If Legal Document Extraction:** Load `legal-doc-extraction/SKILL.md`
 
 **If Image Summarization:** Inform user this demo is coming soon, offer to try another demo instead.
 

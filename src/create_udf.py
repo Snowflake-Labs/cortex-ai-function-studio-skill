@@ -51,7 +51,7 @@ Multimodal (images/documents from a Snowflake stage):
     "model": "claude-sonnet-4-5",
     "stage_name": "@MY_DB.MY_SCHEMA.AI_FUNCTIONS",
     "inputs": [
-        {"name": "FILE_PATH", "sql_type": "VARCHAR", "is_file_path": true},
+        {"name": "FILE_PATH", "sql_type": "STAGE_FILE_PATH"},
         {"name": "QUESTION", "sql_type": "VARCHAR"}
     ],
     "outputs": [
@@ -61,8 +61,7 @@ Multimodal (images/documents from a Snowflake stage):
     "user_prompt_template": "Analyze this file: {FILE_PATH}\\nQuestion: {QUESTION}"
 }
 
-The stage_name defaults to @{database}.{schema}.AI_FUNCTIONS — the same stage used by
-the infrastructure setup for evaluate/optimize modules.
+The stage_name field is required when any input uses sql_type STAGE_FILE_PATH.
 """
 
 from __future__ import annotations
@@ -513,11 +512,18 @@ def parse_config(config: dict[str, Any]) -> UDFSpec:
     for inp in config["inputs"]:
         if "name" not in inp:
             raise ValueError("Each input must have a 'name' field")
+        raw_sql_type = inp.get("sql_type", "VARCHAR").upper()
+        # Accept sql_type "STAGE_FILE_PATH" as the canonical way to declare
+        # a file-path input.  Normalise to VARCHAR (the actual SQL param type)
+        # and set is_file_path automatically.  The legacy is_file_path boolean
+        # is still honoured for backward compatibility.
+        is_file_path = raw_sql_type == "STAGE_FILE_PATH" or inp.get("is_file_path", False)
+        sql_type = "VARCHAR" if raw_sql_type == "STAGE_FILE_PATH" else raw_sql_type
         inputs.append(
             InputParam(
                 name=inp["name"].upper(),
-                sql_type=inp.get("sql_type", "VARCHAR").upper(),
-                is_file_path=inp.get("is_file_path", False),
+                sql_type=sql_type,
+                is_file_path=is_file_path,
             )
         )
 
@@ -527,7 +533,10 @@ def parse_config(config: dict[str, Any]) -> UDFSpec:
     has_file_inputs = any(inp.is_file_path for inp in inputs)
     stage_name = config.get("stage_name")
     if has_file_inputs and not stage_name:
-        raise ValueError("stage_name is required when any input has is_file_path: true")
+        raise ValueError(
+            "stage_name is required when any input has "
+            "sql_type: STAGE_FILE_PATH (or is_file_path: true)"
+        )
 
     outputs = []
     for out in config["outputs"]:

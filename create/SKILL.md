@@ -381,4 +381,4 @@ Planning:
 Create:
 - ✋ Step 8: (direct) Confirm system prompt and user prompt template
 - ✋ Step 8: (research) Confirm complete DDL before execution
-- ✋ Step 10: Before setting up infrastructure
+- ✋ Step 10: Before presenting next steps
