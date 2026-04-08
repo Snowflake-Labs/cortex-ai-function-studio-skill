@@ -21,7 +21,7 @@ test = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 markers = [
     "e2e: end-to-end tests requiring a Snowflake connection",
 ]

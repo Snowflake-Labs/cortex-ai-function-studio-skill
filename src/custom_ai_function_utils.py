@@ -645,7 +645,7 @@ class RobustAIComplete:
             response_schema=None,
         )
         return (
-            cls._parse_json(fallback_result[0], allow_text_recovery)
+            cls._parse_json(fallback_result[0], allow_text_recovery=allow_text_recovery)
             if fallback_result
             else None
         )

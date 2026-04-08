@@ -145,21 +145,7 @@ WHERE ARRAY_SIZE(SPLIT(RELATIVE_PATH, '/')) = 2
 GROUP BY LABEL ORDER BY FILE_COUNT DESC;
 ```
 
-### Step 4: Set Up Infrastructure
-
-Explain to user:
-```
-Before evaluation and optimization, I need to provision the shared stage and
-procedures for:
-1. Evaluation
-2. Optimization
-```
-
-**⚠️ STOP**: Get user confirmation before provisioning infrastructure.
-
-**Load** `references/infrastructure_setup.md` and run the deploy shortcut for `{database}` and `{schema}`.
-
-### Step 5: Create the Classification AI Function
+### Step 4: Create the Classification AI Function
 
 Present the function configuration:
 ```
@@ -187,16 +173,16 @@ User prompt template: "{FILE_PATH}"
 - `function_intention`: `Classify second-hand garment condition from images.`
 - `model`: `gemini-2.5-flash-lite`
 - `stage_name`: `@{database}.{schema}.DEMO_CLOTHING_STAGE`
-- `inputs`: `[{"name": "FILE_PATH", "sql_type": "VARCHAR", "is_file_path": true}]`
+- `inputs`: `[{"name": "FILE_PATH", "sql_type": "STAGE_FILE_PATH"}]`
 - `outputs`: `[{"name": "condition", "json_type": "string", "description": "One of: like_new, good, fair, poor, unsalvageable"}]`
 - `system_prompt`: confirmed prompt
 - `user_prompt_template`: `{FILE_PATH}`
 
-Because infrastructure is already set up, skip the infrastructure setup portion if it appears again. Return here after the smoke test succeeds.
+Return here after the smoke test succeeds.
 
 **Troubleshooting:** If the smoke test fails, verify the stage has SSE encryption and the model supports vision inputs. Try a different vision model (see `references/multimodal_setup.md` for the full list).
 
-### Step 6: Evaluate the Classification Function
+### Step 5: Evaluate the Classification Function
 
 Present the evaluation configuration:
 ```
@@ -219,7 +205,7 @@ Results table: DEMO_CLASSIFY_CLOTHING_EVAL_RESULTS
 
 **Async by default:** When the evaluate workflow reaches the execution mode selection, choose **async** (`EVALUATE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), fall back to sync execution. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session. **Load** `references/async_status.md` for polling patterns.
 
-**Skip Step 7 (next steps)** in the evaluate workflow — return here after results are presented.
+**Skip Step 6 (next steps)** in the evaluate workflow — return here after results are presented.
 
 Once evaluation is done, review the results. Show the scores to the user. Offer to see misclassifications:
 ```
@@ -241,9 +227,9 @@ LIMIT 10;
 
 Discuss common failure patterns: adjacent classes are easily confused (e.g., `good` vs `fair`), condition grading is inherently subjective from a single image, and a generic prompt doesn't tell the model what visual cues distinguish each grade. This is exactly what GEPA can improve.
 
-After reviewing results, continue to Step 7.
+After reviewing results, continue to Step 6.
 
-### Step 7: Optimize with GEPA
+### Step 6: Optimize with GEPA
 
 Present the optimization configuration:
 ```
@@ -273,7 +259,7 @@ Options:
 
 **⚠️ STOP**: Wait for user confirmation before starting optimization.
 
-If user chooses No, skip to Step 9.
+If user chooses No, skip to Step 8.
 
 If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passing:
 - `function_name`: `{database}.{schema}.DEMO_CLASSIFY_CLOTHING`
@@ -289,13 +275,13 @@ If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passi
 
 **Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error, fall back to sync with `timeout_seconds: 14400`. After kicking off the async job, poll `TASK_HISTORY()` for completion. **Load** `references/async_status.md` for polling patterns.
 
-**Skip Step 9 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
+**Skip Step 8 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
 
-### Step 8: Summarize GEPA Results
+### Step 7: Summarize GEPA Results
 
 After optimization completes, present results and compare before/after.
 
-**8.1. Show the optimization journey:**
+**7.1. Show the optimization journey:**
 
 ```sql
 SELECT
@@ -310,7 +296,7 @@ ORDER BY MODEL_NAME, CREATED_AT;
 
 Highlight how prompts evolve — early candidates use generic language ("classify this garment"), later candidates include specific visual cues (pilling, stains, holes, fabric integrity, color fading) that GEPA learned from misclassification feedback.
 
-**8.2. Compare baseline vs. optimized:**
+**7.2. Compare baseline vs. optimized:**
 
 ```sql
 SELECT MODEL_NAME, MAX(METRIC_SCORE) AS BEST_SCORE
@@ -320,26 +306,18 @@ GROUP BY MODEL_NAME
 ORDER BY BEST_SCORE DESC;
 ```
 
-**8.3. Pareto analysis for cost/quality:**
-
-Calculate character lengths from the test table:
-```sql
-SELECT
-    AVG(LENGTH(FILE_PATH)) AS avg_input_chars,
-    5 AS avg_output_chars
-FROM {database}.{schema}.DEMO_CLOTHING_TEST;
-```
+**7.3. Pareto analysis for cost/quality:**
 
 Note: for multimodal functions, actual cost is dominated by image token count, not text chars. The Pareto filter gives a relative cost ordering which is still directionally useful.
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/scripts/filter_pareto.py \
+uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
     --json '[{"model": "model1", "score": 0.85}, ...]' \
-    --prompt-chars {prompt_chars} --avg-input-chars {avg_input_chars} --avg-output-chars {avg_output_chars} \
+    --prompt-chars {prompt_chars} --avg-output-chars 5 \
     --seed-score {baseline_score} --format table
 ```
 
-**8.4. Summarize key findings:**
+**7.4. Summarize key findings:**
 
 ```
 Key result: {best_model} achieves {optimized_score}% classification accuracy
@@ -354,7 +332,7 @@ What GEPA learned:
   align with expert textile sorting standards
 ```
 
-### Step 9: Cleanup
+### Step 8: Cleanup
 
 Ask user:
 ```
@@ -383,7 +361,7 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLASSIFY_CLOTHING_EVAL_RESULTS;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_TRACKING;
 ```
 
-### Step 10: Next Steps
+### Step 9: Next Steps
 
 Summarize the workflow: expert-labeled images → multimodal classification function → baseline evaluation → GEPA optimization → cost/quality Pareto analysis.
 
@@ -427,8 +405,7 @@ and mention that you want to process images.
 - ✋ Step 2: After choosing database and schema
 - ✋ Step 3: Dataset consent (yes/no — if no, show expected results and end demo)
 - ✋ Step 3: Before loading data (confirm per-class count)
-- ✋ Step 4: Before infrastructure setup
-- ✋ Step 5: Before creating the classification function
-- ✋ Step 6: Before evaluation
-- ✋ Step 7: Before GEPA optimization
-- ✋ Step 9: Before cleanup
+- ✋ Step 4: Before creating the classification function
+- ✋ Step 5: Before evaluation
+- ✋ Step 6: Before GEPA optimization
+- ✋ Step 8: Before cleanup

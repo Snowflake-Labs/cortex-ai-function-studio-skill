@@ -106,20 +106,7 @@ JOIN {database}.{schema}.DEMO_TICKETS_HARD_GOLD_V6_SMALL h
 
 Expected: 0.
 
-### Step 4: Set Up Infrastructure
-
-Explain to user:
-```
-Before evaluation and optimization, I need to set up the infrastructure:
-1. Create the AI_FUNCTIONS stage
-2. Upload the shared Python modules
-```
-
-**⚠️ STOP**: Get user confirmation before provisioning infrastructure.
-
-**Load** `references/infrastructure_setup.md` and run the deploy script shortcut for `{database}` and `{schema}`.
-
-### Step 5: Create the Routing AI Function
+### Step 4: Create the Routing AI Function
 
 Present the function configuration:
 ```
@@ -148,9 +135,9 @@ Output: route (string)
 - `system_prompt`: `You are a support ticket router. Given a ticket subject, body, customer tier, company name, policy profile, company policy text, and entitlement notes, classify it into exactly one category: billing, account_access, bug_or_outage, feature_request, refund_or_cancel, or security_or_abuse. The company policy is written in internal handling language rather than the route labels themselves. Infer the best route from the ticket and company policy, and only use company context when it changes the default interpretation. Return only the label in the route field.`
 - `user_prompt_template`: `Subject: {SUBJECT}\nBody: {BODY}\nCustomer tier: {CUSTOMER_TIER}\nCompany name: {COMPANY_NAME}\nPolicy profile: {POLICY_PROFILE}\nCompany policy: {POLICY_TEXT}\nEntitlement notes: {ENTITLEMENT_TEXT}`
 
-Because infrastructure is already set up from Step 4, skip the infrastructure setup portion if it is offered again. Return here after the smoke test succeeds.
+Return here after the smoke test succeeds.
 
-### Step 6: Prepare Evaluation Table
+### Step 5: Prepare Evaluation Table
 
 Create the eval table from the holdout set, renaming the gold label column to `EXPECTED_OUTPUT`:
 ```sql
@@ -174,7 +161,7 @@ FROM {database}.{schema}.DEMO_TICKETS_EVAL;
 
 Expected: 24 rows, 21 overrides.
 
-### Step 7: Evaluate Baselines
+### Step 6: Evaluate Baselines
 
 Present to user:
 ```
@@ -229,7 +216,7 @@ ORDER BY ACCURACY DESC;
 
 Highlight that cheap models typically score well below the strong reference on this hard benchmark because the policy vocabulary is unfamiliar.
 
-### Step 8: Optimize Prompts
+### Step 7: Optimize Prompts
 
 Present the optimization configuration:
 ```
@@ -264,19 +251,19 @@ Tracking table: DEMO_ROUTE_TICKET_OPT_TRACKING
 
 Return here after optimization results are presented.
 
-### Step 9: Summarize Results
+### Step 8: Summarize Results
 
-**9.1.** Join baseline results from `DEMO_ROUTE_TICKET_BASELINE_RESULTS` with the best optimized score per model from `DEMO_ROUTE_TICKET_OPT_TRACKING`. Show each model's baseline accuracy, optimized accuracy, gain, and whether it meets or exceeds the strong reference (`claude-sonnet-4-5`) baseline. The strong reference itself was not optimized — include it as the reference row.
+**8.1.** Join baseline results from `DEMO_ROUTE_TICKET_BASELINE_RESULTS` with the best optimized score per model from `DEMO_ROUTE_TICKET_OPT_TRACKING`. Show each model's baseline accuracy, optimized accuracy, gain, and whether it meets or exceeds the strong reference (`claude-sonnet-4-5`) baseline. The strong reference itself was not optimized — include it as the reference row.
 
-**9.2.** Calculate relative cost using the Pareto filter script (`src/filter_pareto.py`). Include all models: optimized cheap models at their best optimized score and `claude-sonnet-4-5` at its baseline score. Compute input/output character lengths from the eval table and system prompt length for the `--prompt-chars`, `--avg-input-chars`, and `--avg-output-chars` arguments. Use the strong reference baseline as `--seed-score`. Present the Pareto-optimal table to the user.
+**8.2.** Calculate relative cost using the Pareto filter script (`src/filter_pareto.py`). Include all models: optimized cheap models at their best optimized score and `claude-sonnet-4-5` at its baseline score. Use the system prompt character length for `--prompt-chars` and average expected output length from the eval table for `--avg-output-chars`. Use the strong reference baseline as `--seed-score`. Present the Pareto-optimal table to the user.
 
-**9.3.** Summarize key findings:
+**8.3.** Summarize key findings:
 - Which model gained the most accuracy from prompt optimization.
 - If any optimized cheap model beats or matches the strong reference, call it out along with its relative cost — better quality at lower cost.
 - If `claude-sonnet-4-5` is dominated on the Pareto frontier (a cheaper model has equal or higher score), note that the strong model is no longer the best option at any price point.
 - If no cheap model beats the strong reference, note the remaining gap and suggest heavier optimization budgets or different models.
 
-### Step 10: Cleanup
+### Step 9: Cleanup
 
 Ask user:
 ```
@@ -307,7 +294,7 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET_BASELINE_RESULTS;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET_OPT_TRACKING;
 ```
 
-### Step 11: Next Steps
+### Step 10: Next Steps
 
 Explain to user:
 ```
@@ -347,8 +334,7 @@ Key takeaways:
 - ✋ Step 1: After introduction
 - ✋ Step 2: After choosing database and schema
 - ✋ Step 3: Before loading seed data
-- ✋ Step 4: Before infrastructure setup
-- ✋ Step 5: Before creating the routing function
-- ✋ Step 7: Before running baseline evaluations
-- ✋ Step 8: Before optimization
-- ✋ Step 10: Before cleanup
+- ✋ Step 4: Before creating the routing function
+- ✋ Step 6: Before running baseline evaluations
+- ✋ Step 7: Before optimization
+- ✋ Step 9: Before cleanup

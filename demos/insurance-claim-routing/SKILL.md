@@ -87,21 +87,7 @@ FROM {database}.{schema}.DEMO_CLAIMS_UNLABELED
 LIMIT 5;
 ```
 
-### Step 4: Set Up Infrastructure
-
-Explain to user:
-```
-Before pseudo-labeling, I need to provision the shared stage and procedures for:
-1. Label generation
-2. Evaluation
-3. Optimization
-```
-
-**⚠️ STOP**: Get user confirmation before provisioning infrastructure.
-
-**Load** `references/infrastructure_setup.md` and run the deploy shortcut for `{database}` and `{schema}`.
-
-### Step 5: Pseudo-Label with Teacher Model
+### Step 4: Pseudo-Label with Teacher Model
 
 Present the pseudo-label configuration:
 ```
@@ -158,8 +144,8 @@ LIMIT 5;
 ```
 
 Flatten and split the labeled data. We keep two label columns:
-- `EXPECTED_OUTPUT` — just the route string, used for exact_match evaluation in Step 7
-- `EXPECTED_JSON` — full JSON with all 3 fields, used for composite metric optimization in Step 8
+- `EXPECTED_OUTPUT` — just the route string, used for exact_match evaluation in Step 6
+- `EXPECTED_JSON` — full JSON with all 3 fields, used for composite metric optimization in Step 7
 
 ```sql
 CREATE OR REPLACE TEMPORARY TABLE DEMO_CLAIMS_SPLIT_TEMP AS
@@ -199,7 +185,7 @@ SELECT 'TEST' AS SPLIT, COUNT(*) AS ROWS
 FROM {database}.{schema}.DEMO_CLAIMS_TEST;
 ```
 
-### Step 6: Create the Student AI Function
+### Step 5: Create the Student AI Function
 
 Present the function configuration:
 ```
@@ -238,9 +224,9 @@ User prompt template:
 - `system_prompt`: confirmed prompt
 - `user_prompt_template`: `Claim summary: {CLAIM_SUMMARY}\nIncident channel: {INCIDENT_CHANNEL}\nCustomer segment: {CUSTOMER_SEGMENT}`
 
-Because infrastructure is already set up, skip the infrastructure setup portion if it appears again. Return here after the smoke test succeeds.
+Return here after the smoke test succeeds.
 
-### Step 7: Evaluate the Student AI Function
+### Step 6: Evaluate the Student AI Function
 
 Present the evaluation configuration:
 ```
@@ -270,7 +256,7 @@ Results table: DEMO_ROUTE_CLAIM_EVAL_RESULTS
 
 **Async by default:** When the evaluate workflow reaches the execution mode selection, choose **async** (`EVALUATE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`EVALUATE_AI_FUNCTION`) instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
 
-**Skip Step 7 (next steps)** in the evaluate workflow — return here after results are presented.
+**Skip Step 6 (next steps)** in the evaluate workflow — return here after results are presented.
 
 Once evaluation is done, review the results. Show the scores to the user. Offer to see what cases did not match:
 ```
@@ -293,9 +279,9 @@ LIMIT 20;
 
 Discuss common failure patterns. Explain that labels are teacher-generated (pseudo-labels), not human ground truth.
 
-After reviewing results, continue to Step 7.5.
+After reviewing results, continue to Step 6.5.
 
-### Step 7.5: Create Custom Composite Metric
+### Step 6.5: Create Custom Composite Metric
 
 Explain to user:
 ```
@@ -334,9 +320,9 @@ Expected: score close to 1.0 (exact route match, citation substring found, small
 
 Present the result to the user and confirm the metric is working before proceeding.
 
-After confirmation, continue to Step 8.
+After confirmation, continue to Step 7.
 
-### Step 8: Optimize the Student AI Function
+### Step 7: Optimize the Student AI Function
 
 Present the optimization configuration:
 ```
@@ -348,7 +334,7 @@ better results. This could take anywhere between 2 to 20 minutes depending
 on the budget selected.
 
 We'll use the custom composite metric (DEMO_CLAIM_ROUTING_METRIC) created in
-Step 7.5, which scores all three output fields — route accuracy (50%), citation
+Step 6.5, which scores all three output fields — route accuracy (50%), citation
 quality (30%), and confidence calibration (20%). The label column is EXPECTED_JSON
 which contains the full structured output for comparison.
 
@@ -369,7 +355,7 @@ Options:
 
 **⚠️ STOP**: Wait for user confirmation before starting optimization.
 
-If user chooses No, skip to Step 9.
+If user chooses No, skip to Step 8.
 
 If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passing:
 - `function_name`: `{database}.{schema}.DEMO_ROUTE_CLAIM`
@@ -386,7 +372,7 @@ If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passi
 
 **Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`OPTIMIZE_AI_FUNCTION`) with `timeout_seconds: 14400` instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
 
-**Skip Step 9 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
+**Skip Step 8 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
 
 After optimization completes, present the results and compare the before and after scores. Query the tracking table to show the optimization journey:
 ```sql
@@ -401,7 +387,7 @@ ORDER BY METRIC_SCORE DESC
 LIMIT 10;
 ```
 
-**Cost savings emphasis:** Compare the best optimized model's score against the baseline from Step 7. Look up both models in `src/models.json` and use `get_model_cost()` from `src/filter_pareto.py` (use input ratio ~0.95 for short-output classification). Compute `cost_ratio = teacher_cost / best_model_cost`.
+**Cost savings emphasis:** Compare the best optimized model's score against the baseline from Step 6. Look up both models in `src/models.json` and use `get_model_cost(model, prompt_len)` from `src/filter_pareto.py` with the prompt character length. Compute `cost_ratio = teacher_cost / best_model_cost`.
 
 If the optimized model matches or beats baseline, highlight:
 ```
@@ -409,9 +395,9 @@ Massive cost savings: {best_model} is ~{cost_ratio}x cheaper than {teacher_model
 while achieving {optimized_score}% accuracy (vs {baseline_score}% baseline).
 ```
 
-Continue to Step 9.
+Continue to Step 8.
 
-### Step 9: Cleanup
+### Step 8: Cleanup
 
 Ask user:
 ```
@@ -444,7 +430,7 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM_OPT_TRACKING;
 ```
 
-### Step 10: Next Steps
+### Step 9: Next Steps
 
 Summarize the workflow: unlabeled data → teacher pseudo-labels → cheap student function → evaluation → custom composite metric → multi-model optimization → cost/quality Pareto analysis.
 
@@ -461,11 +447,10 @@ If the optimized model beat baseline, reiterate cost savings: `{best_model}` ach
 - ✋ Step 1: After introduction
 - ✋ Step 2: After choosing database and schema
 - ✋ Step 3: Before generating input-only data
-- ✋ Step 4: Before infrastructure setup
-- ✋ Step 5: Before pseudo-label preview
-- ✋ Step 5: Before full pseudo-labeling
-- ✋ Step 6: Before creating the student function
-- ✋ Step 7: Before evaluation
-- ✋ Step 7.5: Before creating custom metric
-- ✋ Step 8: Before optimization
-- ✋ Step 9: Before cleanup
+- ✋ Step 4: Before pseudo-label preview
+- ✋ Step 4: Before full pseudo-labeling
+- ✋ Step 5: Before creating the student function
+- ✋ Step 6: Before evaluation
+- ✋ Step 6.5: Before creating custom metric
+- ✋ Step 7: Before optimization
+- ✋ Step 8: Before cleanup

@@ -20,7 +20,13 @@ There are two AI_COMPLETE calling conventions for multimodal:
 
 Files must be stored in a Snowflake stage with `ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')`. The default encryption (`SNOWFLAKE_FULL`) is NOT compatible with `TO_FILE()`.
 
-**Use the existing `AI_FUNCTIONS` stage** — the same stage created by the infrastructure setup (`references/infrastructure_setup.md`).
+**Use an existing stage** with `ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')`, or create one (default name: `AI_FUNCTIONS`):
+
+```sql
+CREATE STAGE IF NOT EXISTS {database}.{schema}.AI_FUNCTIONS
+    ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')
+    DIRECTORY = (ENABLE = TRUE);
+```
 
 **Upload image/document files to the stage:**
 ```sql

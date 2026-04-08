@@ -25,7 +25,7 @@ from snowflake.snowpark import Session
 from metrics_core import (
     _LLM_JUDGE_CONTINUOUS_TEMPLATE,
     _LLM_JUDGE_FILE_ADDENDUM,
-    evaluate as evaluate_ai_function,
+    evaluate,
     get_table_column_names,
     parse_metric_options,
     resolve_expected_column,
@@ -1223,7 +1223,7 @@ def _run_single_model_optimization(
                 candidate_model=model,
                 candidate_prompt=seed_prompt,
             )
-            seed_test_score = evaluate_ai_function(
+            seed_test_score = evaluate(
                 session=session,
                 function_name=test_temp_fn,
                 test_table=test_table,
@@ -1244,7 +1244,7 @@ def _run_single_model_optimization(
                 candidate_model=model,
                 candidate_prompt=result.best_candidate["instruction"],
             )
-            best_test_score = evaluate_ai_function(
+            best_test_score = evaluate(
                 session=session,
                 function_name=test_temp_fn,
                 test_table=test_table,
