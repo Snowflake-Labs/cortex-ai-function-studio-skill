@@ -40,33 +40,43 @@ For each piece found:
 ## Overview
 
 Proper data splitting ensures:
-- **Training data**: Used by optimizer to tune prompts (internally split into train/dev during optimization)
+- **Training data**: Used by optimizer to tune the function body (internally split into train/dev during optimization)
 - **Test data**: Held-out data for final evaluation (never seen during optimization)
 
 Note: The optimization step internally splits training data into train/dev sets for its genetic algorithm. You only need to provide train and test splits.
 
 ## Recommended Data Sizes
 
-| Workflow | Table | Quick Start | Production | Minimum |
-|----------|-------|-------------|------------|---------|
-| Evaluate | Test | ~50 rows | 200+ rows | 20 |
-| Optimize | Training | ~50 rows | 300+ rows | 20 |
+| Workflow | Table | Recommended Rows | Minimum |
+|----------|-------|-----------------|---------|
+| Evaluate | Test | 20–50 rows | 20 |
+| Optimize | Training | 30–50 rows | 20 |
 
-> **Quick Start** sizes are enough to try the tool and iterate fast.
-> **Production** sizes give better statistical signal for optimization and more reliable evaluation scores.
+> These sizes are enough for fast iteration. Larger datasets (200+ rows) improve statistical signal but are not required to get started.
 
 ## Data Acquisition Flow
 
 ### Step 1: Determine Data Situation
 
-Present to user:
-```
-How is your data organized?
+**Default to option 1** — most users already have a table. Only present the full menu if the user says they don't have data or asks about data generation.
 
-1. **I have tables ready** - Pre-split or single table to use directly
-2. **I have a single table to split** - Need to create train/test splits
-3. **I need to generate data** - Create synthetic training/test data
-4. **I have input-only data** - Generate pseudo labels first
+If the user has already provided a table name, skip this step entirely and proceed to validation (Step 3).
+
+Otherwise, ask:
+```
+Do you have a labeled table ready, or do you need help preparing data?
+
+1. **I have a table ready** - Provide your table name
+2. **I need to generate or prepare data** - Synthetic data, pseudo labels, or table splitting
+```
+
+If the user selects option 2, expand with details:
+```
+What kind of data preparation do you need?
+
+1. **Split an existing table** - Create train/test splits from one table
+2. **Generate synthetic data** - Create labeled examples from scratch
+3. **Label input-only data** - Generate pseudo labels using a strong model
 ```
 
 ### Step 2: Acquire Data

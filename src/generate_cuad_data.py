@@ -14,9 +14,9 @@ contract along with expert-annotated answers for 41 clause categories.
 CUAD is licensed under CC BY 4.0 by The Atticus Project (NeurIPS 2021).
 
 Example usage:
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/src/generate_cuad_data.py \
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/generate_cuad_data.py \
         --connection MY_CONNECTION --database TEMP --schema PUBLIC
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/src/generate_cuad_data.py \
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/generate_cuad_data.py \
         --connection MY_CONNECTION --database TEMP --schema PUBLIC --train 25 --test 25
 """
 
@@ -228,6 +228,8 @@ def main(
     train: int = 25,
     test: int = 25,
     seed: int = 42,
+    train_table: str = "DEMO_CONTRACT_TRAIN",
+    test_table: str = "DEMO_CONTRACT_TEST",
 ) -> None:
     """Download CUAD, extract fields, and create train/test tables in Snowflake."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -257,21 +259,23 @@ def main(
     )
 
     try:
-        create_table(conn, database, schema, "DEMO_CONTRACT_TRAIN")
-        insert_data(conn, database, schema, "DEMO_CONTRACT_TRAIN", train_df)
+        create_table(conn, database, schema, train_table)
+        insert_data(conn, database, schema, train_table, train_df)
 
-        create_table(conn, database, schema, "DEMO_CONTRACT_TEST")
-        insert_data(conn, database, schema, "DEMO_CONTRACT_TEST", test_df)
+        if test > 0:
+            create_table(conn, database, schema, test_table)
+            insert_data(conn, database, schema, test_table, test_df)
 
         logger.info("Done!")
         logger.info(
-            f"  Training table: {database}.{schema}.DEMO_CONTRACT_TRAIN "
+            f"  Training table: {database}.{schema}.{train_table} "
             f"({len(train_df)} rows)"
         )
-        logger.info(
-            f"  Test table: {database}.{schema}.DEMO_CONTRACT_TEST "
-            f"({len(test_df)} rows)"
-        )
+        if test > 0:
+            logger.info(
+                f"  Test table: {database}.{schema}.{test_table} "
+                f"({len(test_df)} rows)"
+            )
     finally:
         conn.close()
 
@@ -316,6 +320,18 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--train-table",
+        type=str,
+        default="DEMO_CONTRACT_TRAIN",
+        help="Name for the training table (default: DEMO_CONTRACT_TRAIN)",
+    )
+    parser.add_argument(
+        "--test-table",
+        type=str,
+        default="DEMO_CONTRACT_TEST",
+        help="Name for the test table (default: DEMO_CONTRACT_TEST)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -329,4 +345,6 @@ if __name__ == "__main__":
         train=args.train,
         test=args.test,
         seed=args.seed,
+        train_table=args.train_table,
+        test_table=args.test_table,
     )

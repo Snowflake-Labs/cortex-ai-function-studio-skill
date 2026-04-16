@@ -2,7 +2,7 @@
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
 # cortex-ai-function-studio-skill
-Build, evaluate, and optimize custom AI functions powered by Snowflake Cortex Complete. Create LLM-powered UDFs from your data, measure performance with built-in or custom metrics, and automatically tune prompts and select models to balance quality and cost.
+Build, evaluate, and optimize custom AI functions powered by Snowflake Cortex Complete. Create LLM-powered UDFs from your data, measure performance with built-in or custom metrics, and automatically optimize function bodies and select models to balance quality and cost.
 
 ## License
 Copyright (c) Snowflake Inc. All rights reserved.
@@ -35,7 +35,7 @@ Once the skill is installed, start a Cortex Code session and ask it to create, e
 
 - *"Create a custom AI function that classifies support tickets"*
 - *"Evaluate my AI function against labeled test data"*
-- *"Optimize the prompt for my AI function"*
+- *"Optimize my AI function"*
 - *"Show me a demo of custom AI functions"*
 
 The skill will guide you through the full **create → evaluate → optimize** workflow.

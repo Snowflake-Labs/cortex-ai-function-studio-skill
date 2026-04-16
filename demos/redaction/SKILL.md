@@ -30,18 +30,16 @@ Welcome to the PII Redaction Demo!
 
 This hands-on demo will guide you through the complete lifecycle of a custom AI function:
 
-1. **Create Sample Data** - Load real-world PII examples from the ai4privacy dataset
+1. **Create Sample Data** - Load French-language PII examples from the ai4privacy dataset
 2. **Build the Function** - Create a DEMO_REDACT_PII function using Snowflake AI_COMPLETE
 3. **Evaluate Performance** - Measure accuracy against expected outputs
-4. **Optimize the Prompt** - Use GEPA optimization to improve results
+4. **Optimize the Function** - Use GEPA optimization to improve results
 
 By the end, you'll have a working PII redaction function and understand how to evaluate and optimize any custom AI function.
 
 **Estimated time:** 10-20 minutes
 **Objects created:** All prefixed with DEMO_ for easy cleanup
 ```
-
-**⚠️ STOP**: Ask user if they want to proceed before continuing.
 
 
 ### Step 1: Setup - Choose Location
@@ -62,34 +60,27 @@ Store the database and schema for use throughout the demo.
 
 Explain to user:
 ```
-First, I'll create a sample dataset with text containing PII that needs to be redacted.
+First, I'll create a sample dataset with French-language text containing PII that needs to be redacted.
 
-The data comes from the ai4privacy/pii-masking-300k dataset and includes:
+The data comes from the ai4privacy/pii-masking-300k dataset, filtered to French entries, and includes:
 - Names, emails, phone numbers, addresses, IDs, and more
-- Multilingual examples (English, French, Italian, German, etc.)
 - Both the original text (INPUT_TEXT) and expected redacted output (EXPECTED_OUTPUT)
 - A PRIVACY_MASK column showing exactly which PII entities were redacted
 
-How many rows would you like in each table?
-
-Training rows: [default: 300] - Used for optimization
-Test rows: [default: 200] - Used for evaluation
-
-I'll create these tables:
+I'll create 50 training rows and 30 test rows in these tables:
 - {database}.{schema}.DEMO_REDACTION_TRAIN
 - {database}.{schema}.DEMO_REDACTION_TEST
 ```
 
-**⚠️ STOP**: Wait for user to specify row counts (or confirm defaults) before proceeding.
-
-Run the data generation script with the specified row counts:
+Run the data generation script with 50 training and 30 test rows:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_redaction_data.py \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_redaction_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
   --schema {schema} \
   --train {train_rows} \
-  --test {test_rows}
+  --test {test_rows} \
+  --language French
 ```
 
 **Note:** Replace `<SKILL_DIRECTORY>` with the absolute path to the cortex-ai-function-studio skill directory, and `<CONNECTION_NAME>` with the active Snowflake connection.
@@ -140,17 +131,17 @@ Store the confirmed settings (function_name, model, system_prompt, user_prompt_t
 Create the function using `create_udf.py` with the confirmed settings:
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py --json '{
-  "database": "{database}",
-  "schema": "{schema}",
-  "function_name": "{function_name}",
-  "function_intention": "Redact all PII from input text.",
-  "model": "{model}",
-  "inputs": [{"name": "TEXT", "sql_type": "VARCHAR"}],
-  "outputs": [{"name": "redacted_text", "json_type": "string", "description": "Redacted text with all PII replaced by [REDACTED]"}],
-  "system_prompt": "{system_prompt}",
-  "user_prompt_template": "{user_prompt_template}"
-}'
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
+    --database {database} \
+    --schema {schema} \
+    --function-name {function_name} \
+    --function-intention 'Redact all PII from input text.' \
+    --model {model} \
+    --system-prompt '{system_prompt}' \
+    --user-prompt-template '{user_prompt_template}' \
+    --inputs '[{"name": "TEXT", "sql_type": "VARCHAR"}]' \
+    --outputs '[{"name": "redacted_text", "json_type": "string", "description": "Redacted text with all PII replaced by [REDACTED]"}]' \
+    --execute --connection <CONNECTION_NAME>
 ```
 
 This generates a function with the model and system prompt hardcoded in the body:
@@ -178,11 +169,11 @@ Present the test example to the user:
 ```
 Now let's test the function with a quick example to see it in action.
 
-I'll run a simple query that passes text containing PII (a name, email, and phone number) 
+I'll run a simple query that passes French text containing PII (a name, email, and phone number) 
 to the function. The function should return the same text with all PII replaced by [REDACTED].
 
 Example input:
-  "Please contact John Smith at john.smith@email.com or 555-123-4567"
+  "Veuillez contacter Jean Dupont à jean.dupont@email.com ou au 01 23 45 67 89"
 
 Would you like to:
 1. Run with this example
@@ -202,22 +193,17 @@ Show the result and explain what the function did.
 
 ### Step 4: Evaluate the Function
 
-Present the evaluation configuration to the user:
+Present the evaluation plan to the user:
 
 ```
-Let's evaluate how well the function performs on our test data.
-
-For now I'll use these settings. Please confirm or modify any you'd like to change:
+Let's evaluate how well the function performs on our test data (30 rows).
 
 Metric: redaction_match
-Sample size: 200
 Results table: DEMO_REDACTION_EVAL_RESULTS
 
 Note: redaction_match compares text structure while ignoring content inside brackets,
 so [NAME] and [REDACTED] are treated as equivalent placeholders.
 ```
-
-**⚠️ STOP**: Wait for user confirmation or modifications before running evaluation.
 
 Follow the evaluate workflow (`evaluate/SKILL.md`) with these values:
 - Function: `{database}.{schema}.DEMO_REDACT_PII`
@@ -229,14 +215,9 @@ Follow the evaluate workflow (`evaluate/SKILL.md`) with these values:
 
 Present the evaluation results.
 
-### Step 5: Review Failures (Optional)
+### Step 5: Review Failures
 
-If accuracy < 100%, offer to review failures:
-```
-Would you like to review the cases where redaction didn't match expectations?
-```
-
-If yes:
+If accuracy < 100%, automatically query and present failures:
 ```sql
 SELECT 
     INPUT_TEXT,
@@ -262,8 +243,8 @@ that improve redaction accuracy. Takes ~2-10 minutes to run.
 
 For now I'll use these settings. Please confirm or modify any you'd like to change:
 
-Auto budget: heavy
-Tracking table: DEMO_REDACT_PII_OPT_TRACKING
+Auto budget: demo
+Experiment: DEMO_REDACT_PII_OPT_EXP
 
 Options:
 1. Yes - Run GEPA optimization with these settings
@@ -280,8 +261,8 @@ If yes, follow the optimize workflow (`optimize/SKILL.md`) with these values:
 - Input column: `INPUT_TEXT`
 - Label column: `EXPECTED_OUTPUT`
 - Metric: `redaction_match`
-- Auto budget: heavy
-- Tracking table: `{database}.{schema}.DEMO_REDACT_PII_OPT_TRACKING`
+- Auto budget: demo
+- Experiment: `{database}.{schema}.DEMO_REDACT_PII_OPT_EXP`
 
 Present results and compare before/after scores.
 
@@ -296,7 +277,7 @@ This will drop:
 - {database}.{schema}.DEMO_REDACTION_TEST
 - {database}.{schema}.DEMO_REDACT_PII
 - {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS (if created)
-- {database}.{schema}.DEMO_REDACT_PII_OPT_TRACKING (if created)
+- {database}.{schema}.DEMO_REDACT_PII_OPT_EXP (if created)
 
 Options:
 1. Yes - Clean up all demo objects
@@ -309,7 +290,7 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_TRAIN;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_TEST;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_REDACT_PII(VARCHAR);
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACT_PII_OPT_TRACKING;
+DROP EXPERIMENT IF EXISTS {database}.{schema}.DEMO_REDACT_PII_OPT_EXP;
 ```
 
 ### Step 8: Next Steps
@@ -320,7 +301,7 @@ Thanks for trying the PII Redaction demo!
 You've learned how to:
 - Create an AI function for text processing
 - Evaluate function performance with metrics
-- Optimize prompts using GEPA
+- Optimize functions using GEPA
 
 Ready to build your own AI function? Just say "create an AI function" to get started.
 ```

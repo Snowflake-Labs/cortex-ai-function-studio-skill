@@ -54,15 +54,14 @@ SELECT RELATIVE_PATH, SIZE FROM DIRECTORY(@{database}.{schema}.AI_FUNCTIONS);
 | PNG | `.png` | All vision models |
 | GIF | `.gif` | All vision models |
 | WebP | `.webp` | All vision models |
-| BMP | `.bmp` | `pixtral-large` and `llama4` models only |
+| BMP | `.bmp` | `llama4` and `pixtral-large` models only |
 
 ### Documents (Preview)
 
 | Format | Extensions | Notes |
 |--------|-----------|-------|
-| PDF | `.pdf` | All document models |
-| Plain text | `.txt` | All document models |
-| Markdown | `.md` | All document models |
+| PDF | `.pdf` | Gemini and Claude models only |
+| Plain text | `.txt` | Gemini and Claude models only |
 | Word | `.doc`, `.docx` | Claude models only |
 | Excel | `.xls`, `.xlsx` | Claude models only |
 | CSV | `.csv` | Claude models only |
@@ -70,41 +69,42 @@ SELECT RELATIVE_PATH, SIZE FROM DIRECTORY(@{database}.{schema}.AI_FUNCTIONS);
 
 ## File Size Limits
 
-| Model Family | Max Image Size | Max Doc Size | Max Images per Prompt |
-|-------------|---------------|-------------|----------------------|
-| Claude (`claude-sonnet-4-5`, `claude-sonnet-4-6`, etc.) | 3.75 MB | 4.5 MB | 20 |
-| OpenAI (`openai-gpt-5.2`, `openai-o4-mini`) | 10 MB | — | 5 |
-| Gemini (`gemini-2.5-flash`, `gemini-2.5-flash-lite`) | 10 MB | 10 MB | — |
-| Pixtral (`pixtral-large`) | 10 MB | — | 1 |
-| Gemini (`gemini-3-pro`) | — | 10 MB | — |
+### Images
 
-Claude models also require image resolution ≤ 8000×8000 pixels.
+| Model | Context Window | File Size | Images per Prompt |
+|-------|---------------|-----------|-------------------|
+| `openai-gpt-4.1` | 1,047,576 | 5 MB | 5 |
+| `openai-gpt-5.2` | 1,047,576 | 5 MB | 5 |
+| `gemini-3.1-pro` | 1,000,000 | 37.5 MB | 20 |
+| `gemini-2.5-flash` | 1,000,000 | 37.5 MB | 20 |
+| `gemini-2.5-flash-lite` | 1,000,000 | 37.5 MB | 20 |
+| `claude-opus-4-5` | 200,000 | 3.75 MB | 20 |
+| `claude-opus-4-6` | 200,000 | 3.75 MB | 20 |
+| `claude-sonnet-4-6` | 200,000 | 3.75 MB | 20 |
+| `claude-sonnet-4-5` | 200,000 | 3.75 MB | 20 |
+| `claude-haiku-4-5` | 200,000 | 3.75 MB | 20 |
+| `llama4-maverick` | 128,000 | 10 MB | 10 |
+| `llama4-scout` | 128,000 | 10 MB | 10 |
+| `pixtral-large` | 128,000 | 10 MB | 8 |
 
-## Vision Models (Image Support)
+### Documents
 
-| Model | Context Window | Notes |
-|-------|---------------|-------|
-| `claude-sonnet-4-6` | 200,000 | Newest Claude Sonnet, up to 20 images |
-| `claude-opus-4-6` | 200,000 | Newest Claude Opus, up to 20 images |
-| `claude-sonnet-4-5` | 200,000 | Balanced quality/cost, up to 20 images |
-| `claude-opus-4-5` | 200,000 | High quality, up to 20 images |
-| `openai-gpt-5.2` | 1,047,576 | Latest GPT, up to 5 images |
-| `openai-o4-mini` | 1,047,576 | Reasoning model, up to 5 images |
-| `gemini-2.5-flash` | 1,048,576 | Fast and affordable |
-| `gemini-2.5-flash-lite` | 1,048,576 | Fastest, lowest cost |
-| `pixtral-large` | 128,000 | 1 image per prompt |
+| Model | Context Window | File Size | Max Pages | Docs per Prompt |
+|-------|---------------|-----------|-----------|-----------------|
+| `gemini-3.1-pro` | 1,000,000 | 37.5 MB | 3,000 | 20 |
+| `gemini-2.5-flash` | 1,000,000 | 37.5 MB | 1,000 | 20 |
+| `gemini-2.5-flash-lite` | 1,000,000 | 37.5 MB | 1,000 | 20 |
+| `claude-sonnet-4-5` | 200,000 | 22 MB | 100 | 5 |
+| `claude-opus-4-5` | 200,000 | 22 MB | 100 | 5 |
+| `claude-opus-4-6` | 200,000 | 22 MB | 100 | 5 |
+| `claude-haiku-4-5` | 200,000 | 22 MB | 100 | 5 |
+| `claude-sonnet-4-6` | 200,000 | 22 MB | 100 | 5 |
 
-## Document Models (Document Support — Preview)
+> **Note:** Only Gemini and Claude models support document inputs. Other models silently return `None` for document inputs.
 
-| Model | Max Document Size |
-|-------|------------------|
-| `gemini-3-pro` | 10 MB |
-| `gemini-2.5-flash` | 10 MB |
-| `gemini-2.5-flash-lite` | 10 MB |
-| `claude-sonnet-4-6` | 4.5 MB |
-| `claude-opus-4-6` | 4.5 MB |
-| `claude-sonnet-4-5` | 4.5 MB |
-| `claude-opus-4-5` | 4.5 MB |
+### Model list source
+
+This section intentionally uses only models that are currently enabled in `src/models.json`.
 
 ## Detecting Input Type
 
@@ -227,9 +227,9 @@ The function signature always matches the customer's table so they can call it d
 
 The model must support file inputs. Prefer these families (in order):
 
-**For images:** `claude-sonnet-4-6` > `claude-sonnet-4-5` > `openai-gpt-5.2` > `gemini-2.5-flash` > `gemini-2.5-flash-lite`
+**For images:** `claude-opus-4-5` > `claude-sonnet-4-6` > `claude-sonnet-4-5` > `openai-gpt-5.2` > `openai-gpt-4.1` > `gemini-3.1-pro` > `llama4-maverick` > `pixtral-large`
 
-**For documents (preview):** `gemini-2.5-flash` > `gemini-3-pro` > `claude-sonnet-4-5`
+**For documents:** `gemini-2.5-flash` > `gemini-3.1-pro` > `claude-sonnet-4-5`
 
 If the user's selected model does not support multimodal, warn and suggest a compatible alternative.
 
@@ -362,7 +362,7 @@ LANGUAGE SQL
 AS
 $$
     AI_COMPLETE(
-        model=>'gemini-3-pro',
+        model=>'gemini-3.1-pro',
         messages=>ARRAY_CONSTRUCT(
             OBJECT_CONSTRUCT('role', 'system', 'content', 'You are a document analyst.'),
             OBJECT_CONSTRUCT('role', 'user', 'content', PROMPT(

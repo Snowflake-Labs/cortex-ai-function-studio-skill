@@ -88,7 +88,7 @@ Store as `model`. Default: `claude-opus-4-6`
 Run the generation script directly. It renders the anonymous SPROC, appends the CALL, and executes everything in a single Snowpark session. **Always pass every flag** — use `none` for unused optional parameters:
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic \
     --database {database} \
     --schema {schema} \
     --connection {connection} \
@@ -206,7 +206,7 @@ Use this flow when the user already has input rows but no expected labels.
 Run the same script with `--source-table` and `--max-source-rows` to cap the preview:
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic \
     --database {database} \
     --schema {schema} \
     --connection {connection} \
@@ -224,7 +224,7 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic
 ### Full Run Call (all rows, overwrite table)
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py synthetic \
     --database {database} \
     --schema {schema} \
     --connection {connection} \

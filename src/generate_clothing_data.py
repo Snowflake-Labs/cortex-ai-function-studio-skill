@@ -20,9 +20,9 @@ Condition labels:
     5 → like_new
 
 Example usage:
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_clothing_data.py \\
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/generate_clothing_data.py \\
         --connection MY_CONNECTION --database TEMP --schema PUBLIC
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_clothing_data.py \\
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/generate_clothing_data.py \\
         --connection MY_CONNECTION --database TEMP --schema PUBLIC \\
         --per-class 50 --train-pct 60
 """

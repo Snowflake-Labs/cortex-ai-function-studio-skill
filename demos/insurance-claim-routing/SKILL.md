@@ -1,6 +1,6 @@
 ---
 name: insurance-claim-routing-demo
-description: "Interactive demo: Build an insurance claim routing AI function using pseudo-label generation, then evaluate and optimize cheaper models against a Claude Opus teacher baseline."
+description: "Interactive demo: Generate pseudo-labels from a strong teacher model, build a cheap student function, and evaluate accuracy. Showcases pseudo-labeling and teacher-student distillation."
 parent_skill: demos
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
@@ -12,7 +12,7 @@ Build an AI function that routes insurance claims using pseudo-labeled training 
 
 ## Overview
 
-Seed input-only data → pseudo-label with a strong teacher → build a cheap student function → evaluate → optimize. Evaluation and optimization run async by default. **Estimated time:** 10-20 minutes.
+Seed input-only data → pseudo-label with a strong teacher → build a cheap student function → evaluate. **Estimated time:** ~10 minutes.
 
 ## Workflow
 
@@ -20,18 +20,16 @@ Seed input-only data → pseudo-label with a strong teacher → build a cheap st
 
 Explain to user:
 ```
-Welcome to the Insurance Claim Routing Demo!
+Welcome to the Pseudo-Labeling & Teacher-Student Distillation Demo!
 
 At the end of this demo, you will witness the Cortex AI Function Studio's ability to:
-- Generate pseudo-labels using a strong teacher model
-- Produce structured JSON outputs with multiple fields (route, citation, confidence)
-- Use a custom composite evaluation metric with weighted field scoring
-- Optimize prompts across multiple models using GEPA with the custom metric
-- Compare cost vs. quality trade-offs across cheaper student models using a Pareto analysis
+- Generate pseudo-labels using a strong teacher model (no labeled data needed!)
+- Build a cheap student model that reproduces teacher-quality decisions
+- Evaluate how closely the student matches the teacher using the exact_match metric
 
 This demo starts with unlabeled claim intake records. We will use a strong
-teacher model to create routing labels, then measure how closely cheaper models
-can reproduce those decisions before and after optimization.
+teacher model to create routing labels, then build a cheaper student model
+and measure how closely it reproduces those decisions.
 
 Claim routes:
 - fast_track_auto
@@ -44,11 +42,11 @@ Claim routes:
 Objects created: all prefixed with DEMO_ for easy cleanup.
 ```
 
-**⚠️ STOP**: Ask user if they want to proceed before continuing.
-
 ### Step 2: Setup - Choose Location
 
-Ask user:
+If `{database}` and `{schema}` are already known from the prerequisite flow, accept them silently and skip the prompt.
+
+Otherwise, ask user:
 ```
 Where would you like to create the demo objects?
 
@@ -62,7 +60,7 @@ Store the database and schema for use throughout the demo.
 
 Explain to user:
 ```
-I'll load a pre-generated set of 500 realistic insurance claim intake records:
+I'll load 80 realistic insurance claim intake records from a pre-generated set:
 auto collisions, property damage, theft, injury, fraud, and documentation cases.
 
 Columns:
@@ -74,9 +72,15 @@ I'll create:
 - {database}.{schema}.DEMO_CLAIMS_UNLABELED
 ```
 
-**⚠️ STOP**: Wait for user to confirm before loading seed data.
+Run the data generation script:
+```bash
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_claims_data.py load \
+  --connection <CONNECTION_NAME> \
+  --database {database} \
+  --schema {schema}
+```
 
-**Load** `seed_claims_unlabeled.sql` and execute it, substituting `{database}` and `{schema}` with the user's chosen values. This creates and populates the table with 500 pre-generated claim summaries.
+**Note:** Replace `<SKILL_DIRECTORY>` with the absolute path to the cortex-ai-function-studio skill directory, and `<CONNECTION_NAME>` with the active Snowflake connection.
 
 Verify creation and confirm summaries are diverse:
 ```sql
@@ -100,10 +104,7 @@ Source table: {database}.{schema}.DEMO_CLAIMS_UNLABELED
 Input columns: CLAIM_SUMMARY, INCIDENT_CHANNEL, CUSTOMER_SEGMENT
 Output fields:
   - claim_route (string) — routing category
-  - citation (string) — excerpt from the claim summary justifying the route
-  - confidence (number) — confidence score 0.0-1.0
-Destination table: {database}.{schema}.DEMO_CLAIMS_LABELED
-Preview rows: 20
+Destination table: {database}.{schema}.DEMO_CLAIMS_DATA
 ```
 
 If the default teacher model is unavailable, **load** `references/model_selection.md` and choose the strongest Claude-family option.
@@ -113,76 +114,29 @@ If the default teacher model is unavailable, **load** `references/model_selectio
 Pass this context into that workflow:
 - `source_table`: `{database}.{schema}.DEMO_CLAIMS_UNLABELED`
 - `input_columns`: `['CLAIM_SUMMARY', 'INCIDENT_CHANNEL', 'CUSTOMER_SEGMENT']`
-- `output_table`: `{database}.{schema}.DEMO_CLAIMS_LABELED`
+- `output_table`: `{database}.{schema}.DEMO_CLAIMS_DATA`
 - `model`: `{teacher_model}`
-- `task_description`: `Classify each claim intake row into exactly one routing category: fast_track_auto, property_damage, injury_review, fraud_review, documentation_needed, or manual_specialist_review. Also provide a short citation (an excerpt from the claim summary that justifies your routing decision) and a confidence score between 0.0 and 1.0.`
-- `output_schema`: `{"properties": {"claim_route": {"type": "string", "description": "One of: fast_track_auto, property_damage, injury_review, fraud_review, documentation_needed, manual_specialist_review"}, "citation": {"type": "string", "description": "Short excerpt from the claim summary justifying the route"}, "confidence": {"type": "number", "description": "Confidence score between 0.0 and 1.0"}}}`
-- `preview_rows`: `20`
+- `task_description`: `Classify each claim intake row into exactly one routing category: fast_track_auto, property_damage, injury_review, fraud_review, documentation_needed, or manual_specialist_review.`
+- `output_schema`: `{"properties": {"claim_route": {"type": "string", "description": "One of: fast_track_auto, property_damage, injury_review, fraud_review, documentation_needed, manual_specialist_review"}}}`
+- `preview_rows`: `0`
 
 The label-synthesis workflow must:
-- preview labels first
-- show `EXPECTED` values for review
-- allow revise/regenerate if needed
-- run the full overwrite labeling pass only after explicit approval
+- skip the preview step and label all rows in one pass
 - continue with `EXPECTED` as the default label column
 
-**⚠️ STOP**: Wait for the label-synthesis preview and explicit user approval before the full labeling run.
-
-Show the label distribution and a sample of structured outputs:
+Show the label distribution after labeling completes:
 ```sql
 SELECT EXPECTED:claim_route::STRING AS CLAIM_ROUTE, COUNT(*) AS ROWS
-FROM {database}.{schema}.DEMO_CLAIMS_LABELED
+FROM {database}.{schema}.DEMO_CLAIMS_DATA
 GROUP BY 1
 ORDER BY ROWS DESC;
-
-SELECT
-    EXPECTED:claim_route::STRING AS ROUTE,
-    LEFT(EXPECTED:citation::STRING, 80) AS CITATION_PREVIEW,
-    EXPECTED:confidence::FLOAT AS CONFIDENCE
-FROM {database}.{schema}.DEMO_CLAIMS_LABELED
-LIMIT 5;
 ```
 
-Flatten and split the labeled data. We keep two label columns:
-- `EXPECTED_OUTPUT` — just the route string, used for exact_match evaluation in Step 6
-- `EXPECTED_JSON` — full JSON with all 3 fields, used for composite metric optimization in Step 7
-
+The pseudo-label workflow stores labels as a VARIANT column (`EXPECTED`). Since our output has a single field, convert it to a plain string column for evaluation:
 ```sql
-CREATE OR REPLACE TEMPORARY TABLE DEMO_CLAIMS_SPLIT_TEMP AS
-SELECT
-    CLAIM_SUMMARY,
-    INCIDENT_CHANNEL,
-    CUSTOMER_SEGMENT,
-    EXPECTED:claim_route::STRING AS EXPECTED_OUTPUT,
-    EXPECTED::STRING AS EXPECTED_JSON,
-    ROW_NUMBER() OVER (ORDER BY RANDOM(42)) AS _split_rn
-FROM {database}.{schema}.DEMO_CLAIMS_LABELED;
-
-SET split_point = (
-    SELECT FLOOR(COUNT(*) * 0.6)
-    FROM DEMO_CLAIMS_SPLIT_TEMP
-);
-
-CREATE OR REPLACE TABLE {database}.{schema}.DEMO_CLAIMS_TRAIN AS
-SELECT * EXCLUDE (_split_rn)
-FROM DEMO_CLAIMS_SPLIT_TEMP
-WHERE _split_rn <= $split_point;
-
-CREATE OR REPLACE TABLE {database}.{schema}.DEMO_CLAIMS_TEST AS
-SELECT * EXCLUDE (_split_rn)
-FROM DEMO_CLAIMS_SPLIT_TEMP
-WHERE _split_rn > $split_point;
-
-DROP TABLE IF EXISTS DEMO_CLAIMS_SPLIT_TEMP;
-```
-
-Verify the split:
-```sql
-SELECT 'TRAIN' AS SPLIT, COUNT(*) AS ROWS
-FROM {database}.{schema}.DEMO_CLAIMS_TRAIN
-UNION ALL
-SELECT 'TEST' AS SPLIT, COUNT(*) AS ROWS
-FROM {database}.{schema}.DEMO_CLAIMS_TEST;
+ALTER TABLE {database}.{schema}.DEMO_CLAIMS_DATA ADD COLUMN EXPECTED_OUTPUT VARCHAR;
+UPDATE {database}.{schema}.DEMO_CLAIMS_DATA SET EXPECTED_OUTPUT = EXPECTED:claim_route::STRING;
+ALTER TABLE {database}.{schema}.DEMO_CLAIMS_DATA DROP COLUMN EXPECTED;
 ```
 
 ### Step 5: Create the Student AI Function
@@ -197,16 +151,11 @@ Function name: DEMO_ROUTE_CLAIM
 Inputs: CLAIM_SUMMARY, INCIDENT_CHANNEL, CUSTOMER_SEGMENT
 Outputs:
   - claim_route (string) — routing category
-  - citation (string) — evidence excerpt justifying the route
-  - confidence (number) — confidence score 0.0-1.0
 System prompt:
 "You are an insurance claim routing system. Given a claim summary, incident
-channel, and customer segment:
-1. Classify the claim into exactly one route: fast_track_auto, property_damage,
-   injury_review, fraud_review, documentation_needed, or manual_specialist_review.
-2. Provide a short citation — an excerpt from the claim summary that justifies
-   your routing decision.
-3. Provide a confidence score between 0.0 and 1.0."
+channel, and customer segment, classify the claim into exactly one route:
+fast_track_auto, property_damage, injury_review, fraud_review,
+documentation_needed, or manual_specialist_review."
 
 User prompt template:
 "Claim summary: {CLAIM_SUMMARY}\nIncident channel: {INCIDENT_CHANNEL}\nCustomer segment: {CUSTOMER_SEGMENT}"
@@ -217,10 +166,10 @@ User prompt template:
 **Load** `create/SKILL.md` and follow it from **Step 7 onward**, passing:
 - `database`, `schema`
 - `function_name`: `DEMO_ROUTE_CLAIM`
-- `function_intention`: `Route insurance claims to the correct processing track with citation and confidence.`
+- `function_intention`: `Route insurance claims to the correct processing track.`
 - `model`: chosen student model
 - `inputs`: `[{"name": "CLAIM_SUMMARY", "sql_type": "VARCHAR"}, {"name": "INCIDENT_CHANNEL", "sql_type": "VARCHAR"}, {"name": "CUSTOMER_SEGMENT", "sql_type": "VARCHAR"}]`
-- `outputs`: `[{"name": "claim_route", "json_type": "string", "description": "One of: fast_track_auto, property_damage, injury_review, fraud_review, documentation_needed, manual_specialist_review"}, {"name": "citation", "json_type": "string", "description": "Short excerpt from the claim summary justifying the route"}, {"name": "confidence", "json_type": "number", "description": "Confidence score between 0.0 and 1.0"}]`
+- `outputs`: `[{"name": "claim_route", "json_type": "string", "description": "One of: fast_track_auto, property_damage, injury_review, fraud_review, documentation_needed, manual_specialist_review"}]`
 - `system_prompt`: confirmed prompt
 - `user_prompt_template`: `Claim summary: {CLAIM_SUMMARY}\nIncident channel: {INCIDENT_CHANNEL}\nCustomer segment: {CUSTOMER_SEGMENT}`
 
@@ -230,15 +179,13 @@ Return here after the smoke test succeeds.
 
 Present the evaluation configuration:
 ```
-Let's evaluate how well the student model routes claims on the held-out test set.
+Let's evaluate how well the student model routes claims.
 
-Since this is a classification task, the built-in exact_match metric works
-perfectly for a quick baseline. The function returns a VARIANT with 3 fields,
-so we use metric_options with output_field='claim_route' to extract just the
-route label for comparison against EXPECTED_OUTPUT.
+Since the function returns a single claim_route string, the built-in
+exact_match metric works perfectly — it compares the predicted route
+directly against the teacher-labeled EXPECTED_OUTPUT.
 
 Default metric: exact_match
-Output field: claim_route (extracted from VARIANT)
 Results table: DEMO_ROUTE_CLAIM_EVAL_RESULTS
 ```
 
@@ -247,11 +194,10 @@ Results table: DEMO_ROUTE_CLAIM_EVAL_RESULTS
 **Load** `evaluate/SKILL.md` and follow it from **Step 5 onward**, passing:
 - `function_name`: `{database}.{schema}.DEMO_ROUTE_CLAIM`
 - `function_model`: chosen student model
-- `test_table`: `{database}.{schema}.DEMO_CLAIMS_TEST`
+- `test_table`: `{database}.{schema}.DEMO_CLAIMS_DATA`
 - `input_columns`: `['CLAIM_SUMMARY', 'INCIDENT_CHANNEL', 'CUSTOMER_SEGMENT']`
 - `label_column`: `EXPECTED_OUTPUT`
 - `metric`: `exact_match`
-- `metric_options`: `OBJECT_CONSTRUCT('output_field', 'claim_route')`
 - `results_table`: `{database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS`
 
 **Async by default:** When the evaluate workflow reaches the execution mode selection, choose **async** (`EVALUATE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`EVALUATE_AI_FUNCTION`) instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
@@ -279,125 +225,9 @@ LIMIT 20;
 
 Discuss common failure patterns. Explain that labels are teacher-generated (pseudo-labels), not human ground truth.
 
-After reviewing results, continue to Step 6.5.
+After reviewing results, continue to Step 7.
 
-### Step 6.5: Create Custom Composite Metric
-
-Explain to user:
-```
-The exact_match metric only checks whether the route label matches exactly.
-But our function now returns structured output with three fields — claim_route,
-citation, and confidence. We can build a custom composite metric that scores
-all three, giving the optimizer richer feedback to improve the prompt.
-
-Custom metric: DEMO_CLAIM_ROUTING_METRIC
-Fields and weights:
-  - claim_route: exact match (weight 0.5)
-  - citation: substring check (weight 0.3)
-  - confidence: 1 - MSE (weight 0.2)
-```
-
-**⚠️ STOP**: Wait for user confirmation before creating the custom metric.
-
-Create the custom metric UDF directly in Snowflake. This follows the contract from `references/custom_metrics.md`:
-
-**Read** `demos/insurance-claim-routing/create_claim_routing_metric.sql`, substitute `{database}` and `{schema}` with the user's values, and execute the SQL.
-
-Verify the UDF was created:
-```sql
-DESCRIBE FUNCTION {database}.{schema}.DEMO_CLAIM_ROUTING_METRIC(VARCHAR, VARCHAR);
-```
-
-Quick smoke test:
-```sql
-SELECT {database}.{schema}.DEMO_CLAIM_ROUTING_METRIC(
-    '{"claim_route": "fraud_review", "citation": "suspicious damage pattern", "confidence": 0.9}',
-    '{"claim_route": "fraud_review", "citation": "suspicious damage pattern noted", "confidence": 0.85}'
-) AS result;
-```
-
-Expected: score close to 1.0 (exact route match, citation substring found, small confidence gap).
-
-Present the result to the user and confirm the metric is working before proceeding.
-
-After confirmation, continue to Step 7.
-
-### Step 7: Optimize the Student AI Function
-
-Present the optimization configuration:
-```
-Let's optimize the prompt to improve claim routing accuracy.
-
-The optimizer will evolve the system prompt through multiple generations,
-testing variations against the training data to find prompts that produce
-better results. This could take anywhere between 2 to 20 minutes depending
-on the budget selected.
-
-We'll use the custom composite metric (DEMO_CLAIM_ROUTING_METRIC) created in
-Step 6.5, which scores all three output fields — route accuracy (50%), citation
-quality (30%), and confidence calibration (20%). The label column is EXPECTED_JSON
-which contains the full structured output for comparison.
-
-Please confirm or modify any settings you'd like to change:
-
-Auto budget: medium (~5-10 minutes)
-Metric: claim_routing_metric (custom composite)
-Custom metric UDF: {database}.{schema}.DEMO_CLAIM_ROUTING_METRIC
-Label column: EXPECTED_JSON
-Tracking table: DEMO_ROUTE_CLAIM_OPT_TRACKING
-Models: ['llama3.1-8b', 'gemini-2.5-flash-lite', 'openai-o4-mini', 'qwen3-next-80b-a3b']
-
-Options:
-1. Yes - Run optimization with these settings
-2. Modify - Change settings before running
-3. No - Skip to cleanup
-```
-
-**⚠️ STOP**: Wait for user confirmation before starting optimization.
-
-If user chooses No, skip to Step 8.
-
-If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passing:
-- `function_name`: `{database}.{schema}.DEMO_ROUTE_CLAIM`
-- `training_table`: `{database}.{schema}.DEMO_CLAIMS_TRAIN`
-- `test_table`: `{database}.{schema}.DEMO_CLAIMS_TEST`
-- `input_columns`: `['CLAIM_SUMMARY', 'INCIDENT_CHANNEL', 'CUSTOMER_SEGMENT']`
-- `label_column`: `EXPECTED_JSON`
-- `metric`: `claim_routing_metric`
-- `custom_metric_udf`: `{database}.{schema}.DEMO_CLAIM_ROUTING_METRIC`
-- `models`: `['llama3.1-8b', 'gemini-2.5-flash-lite', 'openai-o4-mini', 'qwen3-next-80b-a3b']`
-- `reflection_model`: strongest available Claude or large Llama-family reflection model
-- `auto_budget`: `medium`
-- `tracking_table`: `{database}.{schema}.DEMO_ROUTE_CLAIM_OPT_TRACKING`
-
-**Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`OPTIMIZE_AI_FUNCTION`) with `timeout_seconds: 14400` instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
-
-**Skip Step 8 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
-
-After optimization completes, present the results and compare the before and after scores. Query the tracking table to show the optimization journey:
-```sql
-SELECT
-    ROW_NUMBER() OVER (PARTITION BY MODEL_NAME ORDER BY CREATED_AT) AS CANDIDATE_IDX,
-    MODEL_NAME,
-    METRIC_SCORE AS SCORE,
-    LEFT(PROMPT_TEXT, 100) AS PROMPT_PREVIEW
-FROM {database}.{schema}.DEMO_ROUTE_CLAIM_OPT_TRACKING
-WHERE METRIC_SCORE IS NOT NULL
-ORDER BY METRIC_SCORE DESC
-LIMIT 10;
-```
-
-**Cost savings emphasis:** Compare the best optimized model's score against the baseline from Step 6. Look up both models in `src/models.json` and use `get_model_cost(model, prompt_len)` from `src/filter_pareto.py` with the prompt character length. Compute `cost_ratio = teacher_cost / best_model_cost`.
-
-If the optimized model matches or beats baseline, highlight:
-```
-Massive cost savings: {best_model} is ~{cost_ratio}x cheaper than {teacher_model}
-while achieving {optimized_score}% accuracy (vs {baseline_score}% baseline).
-```
-
-Continue to Step 8.
-
-### Step 8: Cleanup
+### Step 7: Cleanup
 
 Ask user:
 ```
@@ -407,13 +237,9 @@ Would you like to clean up the demo objects?
 
 This will drop:
 - {database}.{schema}.DEMO_CLAIMS_UNLABELED
-- {database}.{schema}.DEMO_CLAIMS_LABELED
-- {database}.{schema}.DEMO_CLAIMS_TRAIN
-- {database}.{schema}.DEMO_CLAIMS_TEST
+- {database}.{schema}.DEMO_CLAIMS_DATA
 - {database}.{schema}.DEMO_ROUTE_CLAIM
-- {database}.{schema}.DEMO_CLAIM_ROUTING_METRIC
 - {database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS
-- {database}.{schema}.DEMO_ROUTE_CLAIM_OPT_TRACKING
 ```
 
 **⚠️ STOP**: Wait for user confirmation before cleanup.
@@ -421,20 +247,36 @@ This will drop:
 If yes, execute:
 ```sql
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_UNLABELED;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_LABELED;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_TRAIN;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_TEST;
+DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_DATA;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM(VARCHAR, VARCHAR, VARCHAR);
-DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_CLAIM_ROUTING_METRIC(VARCHAR, VARCHAR);
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM_OPT_TRACKING;
 ```
 
-### Step 9: Next Steps
+### Step 8: Next Steps
 
-Summarize the workflow: unlabeled data → teacher pseudo-labels → cheap student function → evaluation → custom composite metric → multi-model optimization → cost/quality Pareto analysis.
+Summarize the workflow: unlabeled data → teacher pseudo-labels → cheap student function → evaluation.
 
-If the optimized model beat baseline, reiterate cost savings: `{best_model}` achieves `{optimized_score}%` at ~`{cost_ratio}x` cheaper than `{teacher_model}`.
+Explain to user:
+```
+You completed the pseudo-labeling and teacher-student distillation workflow:
+
+1. Loaded unlabeled insurance claim intake records
+2. Used a strong teacher model (Claude Opus) to generate routing labels
+3. Built a cheaper student model to reproduce teacher routing decisions
+4. Evaluated the student against teacher labels using exact_match
+
+Key takeaways:
+
+  Pseudo-labeling: When you don't have labeled data, a strong teacher model
+  can generate high-quality training labels from your unlabeled data. This
+  is dramatically faster than manual annotation.
+
+  Teacher-student distillation: Once you have labels, you can train a cheap
+  student model that approaches teacher quality at a fraction of the cost.
+
+Want to build richer evaluation metrics? Try the "Custom Evaluation Metrics" demo.
+Want to optimize the student's prompt? Try the "Prompt Optimization" demo.
+```
 
 ## Key Cautions
 
@@ -446,11 +288,7 @@ If the optimized model beat baseline, reiterate cost savings: `{best_model}` ach
 
 - ✋ Step 1: After introduction
 - ✋ Step 2: After choosing database and schema
-- ✋ Step 3: Before generating input-only data
-- ✋ Step 4: Before pseudo-label preview
-- ✋ Step 4: Before full pseudo-labeling
+- ✋ Step 4: Before pseudo-labeling
 - ✋ Step 5: Before creating the student function
 - ✋ Step 6: Before evaluation
-- ✋ Step 6.5: Before creating custom metric
-- ✋ Step 7: Before optimization
-- ✋ Step 8: Before cleanup
+- ✋ Step 7: Before cleanup

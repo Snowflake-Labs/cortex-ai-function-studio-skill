@@ -67,7 +67,7 @@ class CustomMetric(Protocol):
 
         Returns:
             (score, feedback) where score is 0.0-1.0 and feedback explains
-            the score in a way that is useful for prompt optimization.
+            the score in a way that is useful for optimization.
         """
         ...
 
@@ -719,7 +719,7 @@ def llm_judge_batch(
         max_tokens: Maximum tokens for response.
         scoring_mode: ``"binary"`` (default) returns 1.0/0.0.
             ``"continuous"`` returns 0.0--1.0, giving GEPA richer
-            gradient for prompt optimization.  Both modes use
+            gradient for optimization.  Both modes use
             structured JSON output.
         file_paths: Optional list of stage-relative file paths,
             one per item.  When provided together with ``stage_name``,

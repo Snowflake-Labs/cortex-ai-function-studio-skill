@@ -32,7 +32,7 @@ Before starting the workflow, scan the user's message and conversation context f
 | `database` | Yes | (from prerequisites) | No | - |
 | `schema` | Yes | (from prerequisites) | No | - |
 | `function_name` | Yes | (generated) | No | - |
-| `model` | Yes | claude-sonnet-4-5 | No | - |
+| `model` | Yes | claude-sonnet-4-6 | No | - |
 | `udf_body_sql` | If research | (generated) | **Yes** | selected_approach, inputs, outputs, model |
 
 **Critical fields** (always confirm even if pre-provided): `selected_approach` + `udf_body_sql` (only if use research mode), `system_prompt` + `user_prompt_template` (direct mode), `inputs`, `outputs`
@@ -82,7 +82,7 @@ For example:
 
 #### Step 2: Clarifying Questions
 
-Based on the `task_description`, ask targeted clarifying questions. **Only ask questions whose answers are not already apparent from the user's message.** Batch related questions together — do not ask one at a time.
+Based on the `task_description`, ask targeted clarifying questions. **Only ask questions whose answers are not already apparent from the user's message.** Batch related questions together — do not ask one at a time. If the user's initial message already provides enough context, skip this step entirely.
 
 Questions to consider (ask only what's missing):
 - **Domain/context**: What industry or domain? (e.g., customer support, legal, medical, finance)
@@ -91,7 +91,7 @@ Questions to consider (ask only what's missing):
 - **Edge cases**: Any special handling needed? (nulls, empty inputs, multilingual content, ambiguous cases)
 - **Quality vs. speed tradeoffs**: Is accuracy or latency more important?
 
-**⚠️ STOP**: Wait for user answers before proceeding.
+If you need to ask, wait for user answers before proceeding. Do not gate this as a mandatory stop — only pause if questions were actually asked.
 
 #### Step 3: Define Inputs and Outputs
 
@@ -144,22 +144,19 @@ Output 1:
 
 #### Step 4: Select Creation Mode
 
-Based on the task description and clarifications, present the creation modes:
+**If any input has a multimodal type (`FILE` or `STAGE_FILE_PATH`)**, Agent Research mode is NOT available — always use Direct mode. Do not offer or mention the research option. Skip to Step 7.
+
+**Default to Direct mode** unless the user explicitly requests research, custom SQL, or pre/post-processing. Do not ask the user to choose a mode — infer it:
+
+- If the user said "research", "explore approaches", "I want pre-processing", or "custom SQL" → Agent Research mode. Continue to Step 5.
+- Otherwise → Direct mode. Skip to Create phase (Step 7).
+
+If you are unsure and the task seems complex enough to warrant research, you may briefly offer:
 ```
-Now that I understand your task, how would you like to build the function?
-
-1. **Direct** — I'll create a straightforward AI_COMPLETE function with a system prompt
-   and user prompt template. Best for simple tasks where the LLM output is used as-is.
-2. **Agent Research** (experimental) — I'll research state-of-the-art techniques and
-   propose implementation approaches with SQL pre- and post-processing strategies.
-   You'll pick the approach that fits best, or describe your own.
+This looks like a straightforward task — I'll create a Direct AI_COMPLETE function.
+If you'd prefer I research implementation approaches with SQL pre/post-processing, let me know.
 ```
-
-**⚠️ STOP**: Wait for customer to select a mode.
-
-**If Direct** → skip to Create phase (Step 7).
-
-**If Agent Research** → continue to Step 5.
+Then proceed with Direct mode without waiting for a response unless the user intervenes.
 
 #### Step 5: Research and Present Approaches
 
@@ -234,30 +231,45 @@ Use the target `database` and `schema` values that were already collected during
 
 **Direct mode:**
 
-	Generate the system prompt and user prompt template from collected information.
+  Generate the system prompt and user prompt template from collected information.
 
-	**If `system_prompt` not collected**, auto-generate from task description and clarifications:
-	```
-	You are an expert [domain] assistant. Your task is to [task_description].
+  **If `system_prompt` not collected**, auto-generate from task description and clarifications:
+  ```
+  You are an expert [domain] assistant. Your task is to [task_description].
 
-	Guidelines:
-	- [specific instruction based on clarifications]
-	- [edge case handling]
-	- Always respond in the specified JSON format
-	```
-	Show for confirmation: "I'll use this system prompt:\n\n{system_prompt}\n\nConfirm or edit?"
+  Guidelines:
+  - [specific instruction based on clarifications]
+  - [edge case handling]
+  - Always respond in the specified JSON format
+  ```
 
-	**If `user_prompt_template` not collected**, auto-generate from input parameter names:
-	- Example for inputs `[TEXT, LANGUAGE]`:
-	  ```
-	  Analyze the following text:
+  **If `user_prompt_template` not collected**, auto-generate from input parameter names:
+  - Example for inputs `[TEXT, LANGUAGE]`:
+    ```
+    Analyze the following text:
 
-	  Text: {TEXT}
-	  Language: {LANGUAGE}
-	  ```
-	Show for confirmation: "I'll use this user prompt template:\n\n{user_prompt_template}\n\nConfirm or edit?"
+    Text: {TEXT}
+    Language: {LANGUAGE}
+    ```
 
-	**⚠️ STOP**: Always confirm system prompt and user prompt template before proceeding (critical fields for direct mode).
+  **⚠️ STOP**: Present the system prompt and user prompt template together as a single review block:
+  ```
+  Here's what I'll create:
+
+  Function: {database}.{schema}.{function_name}({inputs}) → {return_type}
+  Model: {model}
+
+  System prompt:
+    "{system_prompt}"
+
+  User prompt template:
+    "{user_prompt_template}"
+
+  Outputs: {output_fields}
+
+  Confirm or edit?
+  ```
+  Wait for user to confirm or request edits before proceeding.
 
 **Agent Research mode:**
 
@@ -291,24 +303,31 @@ After confirmation, execute the DDL.
 
 **Direct mode** (AI_COMPLETE with structured output, matching the JSON config schema):
 
-	Build the JSON configuration from confirmed system prompt, user prompt template, inputs, and outputs:
-	```bash
-	uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
-	    --execute \
-	    --json '<JSON_CONFIG>' \
-	    --connection <CONNECTION_NAME> \
-	    --warehouse <WAREHOUSE_NAME>
-	```
+  Pass the confirmed configuration as individual CLI flags:
+  ```bash
+  PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
+      --execute \
+      --connection <CONNECTION_NAME> \
+      --database <DATABASE> \
+      --schema <SCHEMA> \
+      --function-name <FUNCTION_NAME> \
+      --function-intention '<FUNCTION_INTENTION>' \
+      --model <MODEL> \
+      --system-prompt '<SYSTEM_PROMPT>' \
+      --user-prompt-template '<USER_PROMPT_TEMPLATE>' \
+      --inputs '<INPUTS_JSON_ARRAY>' \
+      --outputs '<OUTPUTS_JSON_ARRAY>'
+  ```
+  If any input uses `sql_type: "STAGE_FILE_PATH"`, also pass `--stage-name <STAGE_NAME>`. Not needed for native `FILE` column inputs.
 
 **Agent Research mode** (arbitrary SQL UDF body):
 
 	Pass the confirmed DDL directly:
 	```bash
-	uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
+	PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
 	    --execute \
 	    --sql-body '<COMPLETE_CREATE_FUNCTION_DDL>' \
-	    --connection <CONNECTION_NAME> \
-	    --warehouse <WAREHOUSE_NAME>
+	    --connection <CONNECTION_NAME>
 	```
 
 Both modes handle object tagging and query tag logging automatically.
@@ -332,9 +351,8 @@ Your AI function is ready!
 
 What would you like to do?
 1. **Evaluate** (recommended) - Measure function performance against a labeled dataset
-2. **Generate Data** - Generate synthetic training/test data if you don't have labeled examples
-3. **Test** - Run a quick test with sample inputs via SQL
-4. **Done** - Exit for now
+2. **Test** - Run a quick test with sample inputs via SQL
+3. **Done** - Exit for now
 ```
 
 If evaluate → Load `evaluate/SKILL.md` with context:
@@ -372,13 +390,9 @@ If evaluate → Load `evaluate/SKILL.md` with context:
 ## Stopping Points
 
 Planning:
-- ✋ Step 2: After clarifying questions — wait for answers
 - ✋ Step 3: Confirm inputs/outputs
-- ✋ Step 4: After presenting creation modes — wait for selection
-- ✋ Step 5: (research) After presenting approaches — wait for selection or custom description
-- ✋ Step 6: (research) Confirm selected approach
+- ✋ Step 5: (research only) After presenting approaches — wait for selection or custom description
 
 Create:
-- ✋ Step 8: (direct) Confirm system prompt and user prompt template
+- ✋ Step 8: (direct) Confirm combined review (function name, model, system prompt, user prompt template, outputs)
 - ✋ Step 8: (research) Confirm complete DDL before execution
-- ✋ Step 10: Before presenting next steps

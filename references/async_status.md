@@ -69,39 +69,30 @@ ORDER BY SCORE;
 
 ### Optimization Results
 
-Once state is `SUCCEEDED`, query the tracking table:
+Once state is `SUCCEEDED`, query the experiment for results:
 
 ```sql
--- Get best results by model
-SELECT 
-    MODEL_NAME,
-    MAX(METRIC_SCORE) AS BEST_SCORE,
-    COUNT(*) AS CANDIDATES_EVALUATED
-FROM {tracking_table}
-WHERE RUN_ID = '{run_id}'
-GROUP BY MODEL_NAME
-ORDER BY BEST_SCORE DESC;
+-- List all runs and their status
+SHOW RUNS IN EXPERIMENT {experiment_name};
 
--- Get the best prompt
-SELECT 
-    MODEL_NAME,
-    METRIC_SCORE,
-    PROMPT_TEXT
-FROM {tracking_table}
-WHERE RUN_ID = '{run_id}'
-ORDER BY METRIC_SCORE DESC
-LIMIT 1;
+-- Get seed and best scores for a specific model
+-- Run names use the pattern: {MODEL}_SEED, {MODEL}_ITER_1, ..., {MODEL}_BEST
+-- where {MODEL} is the uppercased model name with non-alphanumeric chars replaced by _
+-- Examples: llama3.1-8b -> LLAMA3_1_8B, claude-haiku-4-5 -> CLAUDE_HAIKU_4_5
+SHOW RUN METRICS IN EXPERIMENT {experiment_name} RUN {MODEL}_SEED;
+SHOW RUN METRICS IN EXPERIMENT {experiment_name} RUN {MODEL}_BEST;
 
--- Full candidate history
-SELECT 
-    ROW_NUMBER() OVER (PARTITION BY MODEL_NAME ORDER BY CREATED_AT) AS ITERATION,
-    MODEL_NAME,
-    METRIC_SCORE,
-    LEFT(PROMPT_TEXT, 100) AS PROMPT_PREVIEW,
-    CREATED_AT
-FROM {tracking_table}
-WHERE RUN_ID = '{run_id}'
-ORDER BY MODEL_NAME, CREATED_AT;
+-- Get the optimized prompt/body and aggregate stats
+SHOW RUN PARAMETERS IN EXPERIMENT {experiment_name} RUN {MODEL}_BEST;
+```
+
+For detailed candidate history (diagnostic, optional):
+
+```sql
+-- List all iteration runs for a model
+SHOW RUNS IN EXPERIMENT {experiment_name};
+-- Then query individual iteration run metrics:
+SHOW RUN METRICS IN EXPERIMENT {experiment_name} RUN {MODEL}_ITER_1;
 ```
 
 ## Listing Recent Runs
@@ -178,7 +169,7 @@ ALTER TASK {database}.{schema}.{run_id} SUSPEND;
 DROP TASK IF EXISTS {database}.{schema}.{run_id};
 ```
 
-Any partial results already written to the tracking/results table will remain available.
+Any partial results already written to the experiment or results table will remain available.
 
 ## Cleanup
 
@@ -213,7 +204,7 @@ Which database and schema was this job created in?
 For example: MY_DATABASE.MY_SCHEMA
 ```
 
-Use the provided database and schema for all subsequent `TASK_HISTORY()`, results table, and tracking table queries. For example:
+Use the provided database and schema for all subsequent `TASK_HISTORY()`, results table, and experiment queries. For example:
 ```sql
 SELECT *
 FROM TABLE({database}.INFORMATION_SCHEMA.TASK_HISTORY(
@@ -226,9 +217,9 @@ FROM TABLE({database}.INFORMATION_SCHEMA.TASK_HISTORY(
 
 The run_id encodes the function name and timestamp:
 - `ai_func_eval_FUNC_NAME_1709234567890` → function is `FUNC_NAME`, results table is `FUNC_NAME_EVAL_RESULTS`
-- `ai_func_opt_FUNC_NAME_1709234567890` → function is `FUNC_NAME`, tracking table is `FUNC_NAME_OPT_TRACKING`
+- `ai_func_opt_FUNC_NAME_1709234567890` → function is `FUNC_NAME`, experiment name is `FUNC_NAME_OPT_EXP`
 
-To recover the function name: strip the `ai_func_eval_` or `ai_func_opt_` prefix and the trailing `_<13-digit-timestamp>` suffix. Use the database and schema provided by the user (from the mandatory step above) to fully qualify all table references.
+To recover the function name: strip the `ai_func_eval_` or `ai_func_opt_` prefix and the trailing `_<13-digit-timestamp>` suffix. Use the database and schema provided by the user (from the mandatory step above) to fully qualify all references.
 
 ### If state is EXECUTING
 
@@ -279,7 +270,7 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
 4. Present the `evaluate/SKILL.md` Step 6 next-steps menu:
    ```
    What would you like to do?
-   1. Optimize (recommended) - Improve the function through prompt tuning and model selection
+   1. Optimize (recommended) - Improve the function through function body optimization and model selection
    2. Done - Exit for now
    ```
 
@@ -287,13 +278,16 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
 
 ### If state is SUCCEEDED — Optimization (run_id starts with `ai_func_opt_`)
 
-1. Query the tracking table using the inferred name and run_id:
+1. Query the experiment for results:
    ```sql
-   SELECT MODEL_NAME, MAX(METRIC_SCORE) AS BEST_SCORE, COUNT(*) AS CANDIDATES_EVALUATED
-   FROM {database}.{schema}.{tracking_table}
-   WHERE RUN_ID = '{run_id}'
-   GROUP BY MODEL_NAME
-   ORDER BY BEST_SCORE DESC;
+   -- List all runs
+   SHOW RUNS IN EXPERIMENT {database}.{schema}.{experiment_name};
+
+   -- Get best scores per model (query each MODEL_BEST run)
+   SHOW RUN METRICS IN EXPERIMENT {database}.{schema}.{experiment_name} RUN {MODEL}_BEST;
+
+   -- Get the optimized prompt and aggregate stats
+   SHOW RUN PARAMETERS IN EXPERIMENT {database}.{schema}.{experiment_name} RUN {MODEL}_BEST;
    ```
 
 2. Present results per `optimize/SKILL.md` Step 6 format: seed vs best scores, improvement, candidate count, and prompts.

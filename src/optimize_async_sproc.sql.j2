@@ -5,10 +5,14 @@
 -- =============================================================================
 -- Async Optimization SPROC for AI Functions
 -- Creates and executes a Snowflake Task to run optimization in the background
+--
+-- NOTE: Async control params (WAREHOUSE_NAME, RUN_ID, TIMEOUT_MINUTES) are
+-- ordered differently here than in EVALUATE_AI_FUNCTION_ASYNC. Use named
+-- parameter syntax when calling to avoid positional errors.
 -- =============================================================================
 --
 -- Use src/create_sproc.py to generate this SPROC:
---   uv run python src/create_sproc.py optimize_async DATABASE SCHEMA STAGE_NAME
+--   PYTHONPATH=<SKILL_DIR>/src uv run python src/create_sproc.py optimize_async DATABASE SCHEMA STAGE_NAME
 --
 -- =============================================================================
 
@@ -22,16 +26,16 @@ CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION_ASY
     REFLECTION_MODEL VARCHAR,
     TEST_TABLE VARCHAR DEFAULT NULL,
     AUTO_BUDGET VARCHAR DEFAULT 'light',
-    TRACKING_TABLE VARCHAR DEFAULT NULL,
     RESULTS_TABLE VARCHAR DEFAULT NULL,
     VALIDATION_FRACTION FLOAT DEFAULT 0.5,
     TEMPERATURE FLOAT DEFAULT 0.7,
     MAX_TOKENS INTEGER DEFAULT 8192,
     METRIC_OPTIONS VARIANT DEFAULT NULL,
     CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
-    ENABLE_DETAILED_TRACKING BOOLEAN DEFAULT FALSE,
     RUN_ID VARCHAR DEFAULT NULL,
     AGGREGATION_METRIC VARCHAR DEFAULT NULL,
+    OPTIMIZE_MODE VARCHAR DEFAULT 'body',
+    EXPERIMENT_NAME VARCHAR DEFAULT NULL,
     WAREHOUSE_NAME VARCHAR DEFAULT NULL,
     TIMEOUT_MINUTES INTEGER DEFAULT 240
 )
@@ -73,7 +77,7 @@ BEGIN
     -- Snowflake Tasks run under the owner role, which requires a direct USAGE grant.
     -- Session-level warehouse access (via role hierarchy) is NOT sufficient for tasks.
     SELECT CURRENT_ROLE() INTO current_role_name;
-    EXECUTE IMMEDIATE 'SHOW GRANTS TO ROLE ' || current_role_name;
+    EXECUTE IMMEDIATE 'SHOW GRANTS TO ROLE "' || REPLACE(current_role_name, '"', '""') || '"';
     SELECT COUNT(*) INTO wh_grant_count
         FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
         WHERE "granted_on" = 'WAREHOUSE'
@@ -107,29 +111,30 @@ BEGIN
     END IF;
     
     -- Build the SPROC call (RUN_ID = task_name for tracking)
+    -- Escape single quotes in user-provided strings to prevent SQL injection
     sproc_call := 'CALL {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION(' ||
-        '''' || FUNCTION_NAME || ''', ' ||
-        '''' || TRAINING_TABLE || ''', ' ||
-        '''' || LABEL_COLUMN || ''', ' ||
+        '''' || REPLACE(FUNCTION_NAME, '''', '''''') || ''', ' ||
+        '''' || REPLACE(TRAINING_TABLE, '''', '''''') || ''', ' ||
+        '''' || REPLACE(LABEL_COLUMN, '''', '''''') || ''', ' ||
         input_cols_str || ', ' ||
-        '''' || METRIC_NAME || ''', ' ||
+        '''' || REPLACE(METRIC_NAME, '''', '''''') || ''', ' ||
         models_str || ', ' ||
-        '''' || REFLECTION_MODEL || ''', ' ||
-        COALESCE('''' || TEST_TABLE || '''', 'NULL') || ', ' ||
-        '''' || AUTO_BUDGET || ''', ' ||
-        COALESCE('''' || TRACKING_TABLE || '''', 'NULL') || ', ' ||
-        COALESCE('''' || RESULTS_TABLE || '''', 'NULL') || ', ' ||
+        '''' || REPLACE(REFLECTION_MODEL, '''', '''''') || ''', ' ||
+        COALESCE('''' || REPLACE(TEST_TABLE, '''', '''''') || '''', 'NULL') || ', ' ||
+        '''' || REPLACE(AUTO_BUDGET, '''', '''''') || ''', ' ||
+        COALESCE('''' || REPLACE(RESULTS_TABLE, '''', '''''') || '''', 'NULL') || ', ' ||
         TO_VARCHAR(VALIDATION_FRACTION) || ', ' ||
         TO_VARCHAR(TEMPERATURE) || ', ' ||
         TO_VARCHAR(MAX_TOKENS) || ', ' ||
         metric_opts_str || ', ' ||
-        COALESCE('''' || CUSTOM_METRIC_UDF || '''', 'NULL') || ', ' ||
-        TO_VARCHAR(ENABLE_DETAILED_TRACKING) || ', ' ||
-        '''' || task_name || ''', ' ||
-        COALESCE('''' || AGGREGATION_METRIC || '''', 'NULL') || ')';
+        COALESCE('''' || REPLACE(CUSTOM_METRIC_UDF, '''', '''''') || '''', 'NULL') || ', ' ||
+        '''' || REPLACE(task_name, '''', '''''') || ''', ' ||
+        COALESCE('''' || REPLACE(AGGREGATION_METRIC, '''', '''''') || '''', 'NULL') || ', ' ||
+        '''' || REPLACE(OPTIMIZE_MODE, '''', '''''') || ''', ' ||
+        COALESCE('''' || REPLACE(EXPERIMENT_NAME, '''', '''''') || '''', 'NULL') || ')';
     
     -- Create the task (no schedule — single execution only via EXECUTE TASK)
-    create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}.' || task_name ||
+    create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}."' || REPLACE(task_name, '"', '""') || '"' ||
         ' WAREHOUSE = ' || wh_to_use ||
         ' USER_TASK_TIMEOUT_MS = ' || TO_VARCHAR(TIMEOUT_MINUTES * 60 * 1000) ||
         ' AS ' || sproc_call;
@@ -137,7 +142,7 @@ BEGIN
     EXECUTE IMMEDIATE create_task_sql;
     
     -- Execute the task immediately (works on suspended tasks, no RESUME needed)
-    EXECUTE IMMEDIATE 'EXECUTE TASK {{ database }}.{{ schema }}.' || task_name;
+    EXECUTE IMMEDIATE 'EXECUTE TASK {{ database }}.{{ schema }}."' || REPLACE(task_name, '"', '""') || '"';
     
     RETURN task_name;
 END;

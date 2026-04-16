@@ -10,11 +10,11 @@ This ensures users only see meaningful trade-offs between cost and quality.
 Cost formula: cost = input_price × prompt_chars + output_price × avg_output_chars.
 
 Example usage:
-    uv run python filter_pareto.py --json '[{"model": "llama3.1-8b", "score": 0.82}, ...]' \
+    PYTHONPATH=<SKILL_DIR>/src uv run python filter_pareto.py --json '[{"model": "llama3.1-8b", "score": 0.82}, ...]' \
         --prompt-chars 200 --avg-output-chars 10
 
     # Via stdin
-    echo '[...]' | uv run python filter_pareto.py --prompt-chars 200 --avg-output-chars 10
+    echo '[...]' | PYTHONPATH=<SKILL_DIR>/src uv run python filter_pareto.py --prompt-chars 200 --avg-output-chars 10
 """
 
 from __future__ import annotations
@@ -71,6 +71,9 @@ def filter_pareto_optimal(results: list[dict], prompt_chars: int, avg_output_cha
 
     if prompt_chars <= 0:
         raise ValueError("Prompt length must be greater than 0")
+
+    if avg_output_chars < 0:
+        raise ValueError("Average output length must be non-negative")
 
     # Calculate relative cost for each result
     for r in results:

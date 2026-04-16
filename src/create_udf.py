@@ -6,62 +6,29 @@
 
 Supports two modes:
 
-1. **JSON config mode** (--json / --config): Generates a standard AI_COMPLETE UDF
-   from a structured JSON specification with system prompt and user prompt template.
-   Supports both text-only and multimodal (image/document) inputs. Both paths use
-   response_format for structured JSON output when outputs are specified.
+1. **Flagged mode** (--database, --schema, etc.): Generates a standard AI_COMPLETE
+   UDF from individual CLI flags specifying system prompt, user prompt template,
+   inputs and outputs. Supports both text-only and multimodal (image/document)
+   inputs. Uses response_format for structured JSON output when outputs are
+   specified.
 
 2. **Raw SQL mode** (--sql-body): Executes an agent-authored CREATE FUNCTION DDL
    directly. Supports arbitrary SQL UDF bodies (not limited to a single AI_COMPLETE
    call). The script handles execution, object tagging, and query tag logging.
 
 Example usage:
-    # JSON config mode — standard AI_COMPLETE UDF
-    uv run python create_udf.py --json '{"database": "MY_DB", ...}'
-    uv run python create_udf.py --json '{"database": "MY_DB", ...}' --execute --connection my_conn
+    # Flagged mode — standard AI_COMPLETE UDF
+    PYTHONPATH=<SKILL_DIR>/src uv run python create_udf.py \\
+        --database MY_DB --schema MY_SCHEMA --function-name MY_FUNC \\
+        --model claude-sonnet-4-5 --system-prompt 'Classify sentiment' \\
+        --user-prompt-template '{TEXT}' \\
+        --inputs '[{"name":"TEXT","sql_type":"VARCHAR"}]' \\
+        --outputs '[{"name":"label","json_type":"string","description":"sentiment"}]' \\
+        --execute --connection my_conn
 
     # Raw SQL mode — arbitrary UDF body
-    uv run python create_udf.py --sql-body 'CREATE OR REPLACE FUNCTION ...' --execute --connection my_conn
-
-Expected JSON structure (for --json / --config mode):
-
-Text-only (default):
-{
-    "database": "MY_DB",
-    "schema": "MY_SCHEMA",
-    "function_name": "MY_FUNCTION",
-    "function_intention": "One-line description of what the function should do",
-    "model": "claude-sonnet-4-5",
-    "inputs": [
-        {"name": "INPUT_COL", "sql_type": "VARCHAR"}
-    ],
-    "outputs": [
-        {"name": "output_field", "json_type": "string", "description": "desc"}
-    ],
-    "system_prompt": "system prompt",
-    "user_prompt_template": "user prompt"
-}
-
-Multimodal (images/documents from a Snowflake stage):
-{
-    "database": "MY_DB",
-    "schema": "MY_SCHEMA",
-    "function_name": "MY_FUNCTION",
-    "function_intention": "One-line description of what the function should do",
-    "model": "claude-sonnet-4-5",
-    "stage_name": "@MY_DB.MY_SCHEMA.AI_FUNCTIONS",
-    "inputs": [
-        {"name": "FILE_PATH", "sql_type": "STAGE_FILE_PATH"},
-        {"name": "QUESTION", "sql_type": "VARCHAR"}
-    ],
-    "outputs": [
-        {"name": "answer", "json_type": "string", "description": "desc"}
-    ],
-    "system_prompt": "system prompt",
-    "user_prompt_template": "Analyze this file: {FILE_PATH}\\nQuestion: {QUESTION}"
-}
-
-The stage_name field is required when any input uses sql_type STAGE_FILE_PATH.
+    PYTHONPATH=<SKILL_DIR>/src uv run python create_udf.py \\
+        --sql-body 'CREATE FUNCTION ...' --execute --connection my_conn
 """
 
 from __future__ import annotations
@@ -77,6 +44,7 @@ from typing import Any
 
 from custom_ai_function_utils import (
     COCO_SESSION_TAG_PREFIX,
+    apply_file_prompt_prefix_workaround,
     customai_query_tag_logging,
     create_session_from_connection,
 )
@@ -242,12 +210,17 @@ def build_json_schema(outputs: list[OutputField]) -> dict[str, Any]:
     }
 
 
+COMMENT_PREFIX = "[CORTEX AI FUNC STUDIO] "
+
+
 def _normalize_comment(text: str, *, max_len: int = 1000) -> str:
     cleaned = " ".join(str(text).split())
     if not cleaned:
         return ""
-    if len(cleaned) > max_len:
-        cleaned = cleaned[: max_len - 3].rstrip() + "..."
+    prefix_len = len(COMMENT_PREFIX)
+    effective_max = max_len - prefix_len
+    if len(cleaned) > effective_max:
+        cleaned = cleaned[: effective_max - 3].rstrip() + "..."
     return cleaned
 
 
@@ -327,6 +300,38 @@ def _resolve_output_schema(
     return return_type, result_suffix, response_format_expr
 
 
+def _resolve_multimodal_prompt_template_and_args(
+    spec: UDFSpec,
+) -> tuple[str, list[str]]:
+    """Resolve the PROMPT template and argument list for multimodal UDFs."""
+    has_template_placeholders = bool(
+        re.findall(r"\{(\w+)\}", spec.user_prompt_template)
+    )
+    if has_template_placeholders:
+        return _build_multimodal_prompt_args(
+            spec.user_prompt_template,
+            spec.inputs,
+            spec.stage_name,
+        )
+
+    prompt_args = []
+    for inp in spec.inputs:
+        if inp.is_file_path:
+            prompt_args.append(
+                f"TO_FILE('{escape_sql_string(spec.stage_name)}', {inp.name})"
+            )
+        else:
+            prompt_args.append(_sql_to_varchar(inp.name, inp.sql_type))
+
+    input_refs = " ".join(f"{{{i}}}" for i in range(len(prompt_args)))
+    return f"{input_refs} {spec.user_prompt_template}", prompt_args
+
+
+def _prompt_arg_is_to_file_expression(prompt_arg: str | None) -> bool:
+    """True when the SQL expression passed to PROMPT() starts with TO_FILE(...)."""
+    return bool(prompt_arg and prompt_arg.lstrip().upper().startswith("TO_FILE("))
+
+
 def _build_create_function_ddl(
     fqn: str,
     input_params: str,
@@ -339,7 +344,7 @@ def _build_create_function_ddl(
         CREATE OR REPLACE FUNCTION {fqn}({input_params})
         RETURNS {return_type}
         LANGUAGE SQL
-        COMMENT = '{escaped_comment}'
+        COMMENT = '{COMMENT_PREFIX}{escaped_comment}'
         AS
         $$
             {body_expr}
@@ -366,30 +371,9 @@ def generate_multimodal_sql(spec: UDFSpec) -> str:
     return_type, result_suffix, response_format_expr = _resolve_output_schema(
         spec.outputs
     )
-
-    has_template_placeholders = bool(
-        re.findall(r"\{(\w+)\}", spec.user_prompt_template)
+    translated_template, prompt_args = _resolve_multimodal_prompt_template_and_args(
+        spec
     )
-
-    if has_template_placeholders:
-        # User template has {PLACEHOLDER}s — translate each to positional {N}
-        # and build matching PROMPT() args (TO_FILE for files, column ref for text)
-        translated_template, prompt_args = _build_multimodal_prompt_args(
-            spec.user_prompt_template, spec.inputs, spec.stage_name
-        )
-    else:
-        # No placeholders — auto-generate "{0} {1} ... {N} <template>" so all
-        # inputs are passed to PROMPT() before the user's free-text instruction
-        prompt_args = []
-        for inp in spec.inputs:
-            if inp.is_file_path:
-                prompt_args.append(
-                    f"TO_FILE('{escape_sql_string(spec.stage_name)}', {inp.name})"
-                )
-            else:
-                prompt_args.append(_sql_to_varchar(inp.name, inp.sql_type))
-        input_refs = " ".join(f"{{{i}}}" for i in range(len(prompt_args)))
-        translated_template = f"{input_refs} {spec.user_prompt_template}"
 
     args_str = ",\n                        ".join(prompt_args)
     response_format_line = (
@@ -398,6 +382,12 @@ def generate_multimodal_sql(spec: UDFSpec) -> str:
         else ""
     )
 
+    prompt_template = apply_file_prompt_prefix_workaround(
+        translated_template,
+        first_prompt_arg_is_file=_prompt_arg_is_to_file_expression(
+            prompt_args[0] if prompt_args else None
+        ),
+    )
     ai_complete_call = dedent(f"""\
         AI_COMPLETE(
             model=>'{escape_sql_string(spec.model)}',
@@ -409,7 +399,7 @@ def generate_multimodal_sql(spec: UDFSpec) -> str:
                 OBJECT_CONSTRUCT(
                     'role', 'user',
                     'content', PROMPT(
-                        '{escape_sql_string(translated_template)}',
+                        '{escape_sql_string(prompt_template)}',
                         {args_str}
                     )
                 )
@@ -517,7 +507,9 @@ def parse_config(config: dict[str, Any]) -> UDFSpec:
         # a file-path input.  Normalise to VARCHAR (the actual SQL param type)
         # and set is_file_path automatically.  The legacy is_file_path boolean
         # is still honoured for backward compatibility.
-        is_file_path = raw_sql_type == "STAGE_FILE_PATH" or inp.get("is_file_path", False)
+        is_file_path = raw_sql_type == "STAGE_FILE_PATH" or inp.get(
+            "is_file_path", False
+        )
         sql_type = "VARCHAR" if raw_sql_type == "STAGE_FILE_PATH" else raw_sql_type
         inputs.append(
             InputParam(
@@ -756,26 +748,18 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=dedent("""\
             Examples:
-                # JSON config — generate and print DDL
-                uv run python create_udf.py --json '{"database": "DB", ...}'
-
-                # JSON config — generate and execute
-                uv run python create_udf.py --json '{"database": "DB", ...}' --execute --connection my_conn
+                # Flagged mode — generate and execute
+                PYTHONPATH=<SKILL_DIR>/src uv run python create_udf.py \\
+                    --database DB --schema SCH --function-name MY_FUNC \\
+                    --system-prompt 'Classify sentiment' --user-prompt-template '{TEXT}' \\
+                    --inputs '[{"name":"TEXT","sql_type":"VARCHAR"}]' \\
+                    --outputs '[{"name":"label","json_type":"string","description":"sentiment"}]' \\
+                    --execute --connection my_conn
 
                 # Raw SQL — execute agent-authored DDL directly
-                uv run python create_udf.py --sql-body 'CREATE OR REPLACE FUNCTION ...' --execute --connection my_conn
+                PYTHONPATH=<SKILL_DIR>/src uv run python create_udf.py \\
+                    --sql-body 'CREATE FUNCTION ...' --execute --connection my_conn
             """),
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        help="Path to JSON config file, or '-' to read from stdin",
-    )
-    parser.add_argument(
-        "--json",
-        type=str,
-        dest="json_str",
-        help="Inline JSON configuration string",
     )
     parser.add_argument(
         "--sql-body",
@@ -797,6 +781,59 @@ def main() -> None:
         help="Warehouse for session context (defaults to connection's current warehouse)",
     )
 
+    # --- Flagged arguments ---
+    flag_group = parser.add_argument_group(
+        "flagged config",
+        "Individual arguments for specifying UDF configuration. "
+        "Provide --database to activate this mode.",
+    )
+    flag_group.add_argument("--database", type=str, help="Target Snowflake database")
+    flag_group.add_argument("--schema", type=str, help="Target Snowflake schema")
+    flag_group.add_argument(
+        "--function-name", type=str, dest="function_name", help="Name for the UDF"
+    )
+    flag_group.add_argument(
+        "--function-intention",
+        type=str,
+        dest="function_intention",
+        default="",
+        help="One-line description of the function's purpose",
+    )
+    flag_group.add_argument(
+        "--model",
+        type=str,
+        dest="flag_model",
+        default="claude-sonnet-4-5",
+        help="Cortex model name (default: claude-sonnet-4-5)",
+    )
+    flag_group.add_argument(
+        "--system-prompt", type=str, dest="system_prompt", help="System prompt text"
+    )
+    flag_group.add_argument(
+        "--user-prompt-template",
+        type=str,
+        dest="user_prompt_template",
+        help="User prompt template with {PLACEHOLDER} syntax",
+    )
+    flag_group.add_argument(
+        "--inputs",
+        type=str,
+        dest="inputs_json",
+        help='JSON array of input specs, e.g. \'[{"name":"TEXT","sql_type":"VARCHAR"}]\'',
+    )
+    flag_group.add_argument(
+        "--outputs",
+        type=str,
+        dest="outputs_json",
+        help='JSON array of output specs, e.g. \'[{"name":"label","json_type":"string","description":"..."}]\'',
+    )
+    flag_group.add_argument(
+        "--stage-name",
+        type=str,
+        dest="stage_name",
+        help="Snowflake stage name (required for multimodal/file inputs)",
+    )
+
     args = parser.parse_args()
 
     if args.sql_body:
@@ -815,28 +852,58 @@ def main() -> None:
 
     config = None
 
-    if args.json_str:
+    if args.database is not None:
+        # Build config dict from individual flags
+        missing = []
+        for field_name, attr in [
+            ("--schema", "schema"),
+            ("--function-name", "function_name"),
+            ("--system-prompt", "system_prompt"),
+            ("--user-prompt-template", "user_prompt_template"),
+            ("--inputs", "inputs_json"),
+            ("--outputs", "outputs_json"),
+        ]:
+            if getattr(args, attr) is None:
+                missing.append(field_name)
+        if missing:
+            print(
+                f"Error: flagged mode requires: {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         try:
-            config = json.loads(args.json_str)
+            inputs = json.loads(args.inputs_json)
         except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in --json argument: {e}", file=sys.stderr)
+            print(f"Error: Invalid JSON in --inputs: {e}", file=sys.stderr)
             sys.exit(1)
-    elif args.config:
+
         try:
-            if args.config == "-":
-                config = json.load(sys.stdin)
-            else:
-                with open(args.config) as f:
-                    config = json.load(f)
+            outputs = json.loads(args.outputs_json)
         except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in config file: {e}", file=sys.stderr)
+            print(f"Error: Invalid JSON in --outputs: {e}", file=sys.stderr)
             sys.exit(1)
-        except FileNotFoundError:
-            print(f"Error: Config file not found: {args.config}", file=sys.stderr)
-            sys.exit(1)
+
+        config = {
+            "database": args.database,
+            "schema": args.schema,
+            "function_name": args.function_name,
+            "function_intention": args.function_intention,
+            "model": args.flag_model,
+            "system_prompt": args.system_prompt,
+            "user_prompt_template": args.user_prompt_template,
+            "inputs": inputs,
+            "outputs": outputs,
+        }
+        if args.stage_name:
+            config["stage_name"] = args.stage_name
+
     else:
         parser.print_help()
-        print("\nError: --config, --json, or --sql-body is required", file=sys.stderr)
+        print(
+            "\nError: --database (flagged mode) or --sql-body is required",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     try:

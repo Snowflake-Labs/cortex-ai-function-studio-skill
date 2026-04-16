@@ -17,9 +17,21 @@ Display to the user:
 ```
 The Cortex AI Function Studio guides you through the full lifecycle of custom AI functions. The intended workflow is **create → evaluate → optimize**.
 During creation, you choose how to build: **Direct** (simple AI_COMPLETE call) or **Agent Research** (I research and propose approaches 
-with SQL pre/post-processing — you can also specify your own strategy). After building, evaluate against labeled data, then optimize with automated prompt tuning and model selection.
+with SQL pre/post-processing — you can also specify your own strategy). After building, evaluate against labeled data, then optimize with automated function body optimization and model selection.
 If you're new to custom AI functions, you can start with a **demo** to see a worked example end-to-end.
 ```
+
+## Agent Execution Rules
+
+**After a `⚠️ STOP` point is cleared by the user, execute all subsequent tool calls (uv scripts, SQL) WITHOUT re-asking for confirmation until the next `⚠️ STOP` point.** The skill-level confirmation IS the authorization to proceed.
+
+Do NOT:
+- Ask "shall I proceed?" immediately before running a uv script the user just approved
+- Ask "OK to run this SQL?" after the user confirmed the evaluation/optimization settings
+- Re-confirm tool calls that are direct consequences of an already-approved action
+- Ask the user to choose between sync and async execution — default to sync
+
+These rules apply to all sub-skills (create, evaluate, optimize, demos).
 
 ## Workflow
 
@@ -67,22 +79,20 @@ What would you like to do?
 
 - **Create**: Two modes — Direct (simple AI_COMPLETE) or Agent Research (research + propose SQL UDF structures, with option to specify your own)
 - **Evaluate**: Measure with pre-built or custom metrics via SQL
-- **Optimize**: Improve functions using prompt optimization and perform cost/quality model comparison. Pass ALL models in a single call — the optimizer runs them concurrently. Do NOT make separate calls per model.
+- **Optimize**: Improve functions using function body optimization (modifies prompts, model references, and SQL pre/post-processing) and perform cost/quality model comparison. Pass ALL models in a single call — the optimizer runs them concurrently. Do NOT make separate calls per model.
 - **Demo**: Interactive walkthroughs with example use cases
 - **Data Preparation**: Prepare train/test data (`references/data_preparation.md`)
 - **Synthetic Data**: Generate data for evaluation and optimization (`synthetic-data/SKILL.md`)
 - **Pseudo Labels**: Label input-only tables using strong-model inference and reuse for evaluate/optimize (`synthetic-data/SKILL.md`)
-- **Version Management**: Track and manage function versions (`references/version_management.md`)
 
 ## Data Suggestions
 
-| Workflow | Quick Start | Production |
-|----------|-------------|------------|
-| Evaluate | ~50 rows | 200+ rows |
-| Optimize | ~50 rows | 300+ rows |
+| Workflow | Recommended Rows |
+|----------|------------------|
+| Evaluate | 20–50 rows       |
+| Optimize | 20–50 rows       |
 
-> **Quick Start** sizes are enough to try the tool and iterate fast.
-> **Production** sizes give better statistical signal for optimization and more reliable evaluation scores.
+> These sizes are enough for fast iteration. Larger datasets (200+ rows) improve statistical signal but are not required to get started.
 
 ## Stopping Points
 
@@ -96,5 +106,5 @@ Each sub-skill has its own stopping points documented within.
 Depends on workflow selected:
 - **Create**: AI function DDL created in Snowflake
 - **Evaluate**: Performance score and detailed results table
-- **Optimize**: Optimized prompt with improved performance
+- **Optimize**: Optimized function with improved performance
 - **Demo**: Completed walkthrough with demo objects (cleanable)

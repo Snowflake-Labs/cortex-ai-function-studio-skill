@@ -9,43 +9,43 @@ This document covers all prerequisites needed for the Cortex AI Function Studio.
 
 Load from main SKILL.md Step 0 (always). Also load when: "setup", "install", "prerequisites", "requirements", "getting started".
 
+## Environment Detection
+
+Detect whether the session is running inside **Snowsight** (the Snowflake web UI) or a **CLI** environment. Store the result as state variable `environment` (`snowsight` | `cli`) — subsequent workflows branch on this value.
+
+**Detection heuristic:** Run **`bash ls /workspace/`** to check if a Workspace context is active. If it succeeds (returns a directory listing), the session is running inside Snowsight with Workspaces — set `environment = snowsight`. If it fails (e.g., "No such file or directory") or is unavailable, set `environment = cli`. Do **not** ask the user which environment they are in — detect it automatically. **⚠️ There is no `list_files` tool — always use `bash ls` for file listing.**
+
+**If `environment == snowsight`:** Load `references/snowsight_copilot.md` and complete the Snowsight-specific setup before proceeding to the remaining prerequisites below.
+
+**If `environment == cli`:** Skip Snowsight setup and proceed directly.
+
 ## Required
 
-### Snowflake Connection with AI_COMPLETE Access
+### Silent Prerequisite Checks
 
-You need an active Snowflake connection with access to AI_COMPLETE.
+**IMPORTANT — Quiet on success**: Run all prerequisite checks (connection, AI_COMPLETE, uv) in a **single parallel batch**. Do NOT narrate what you are checking beforehand — just run the checks. If everything passes, do NOT display individual results. Only mention prerequisites if something **fails**. The user should see zero prerequisite output on the happy path.
 
-**Verify connection:**
-```bash
-cortex connections list
-```
+Run these two checks **in parallel** (single tool-call batch):
 
-**Test AI_COMPLETE access:**
+1. **Snowflake connection + AI_COMPLETE + session defaults** (single SQL):
 ```sql
-SELECT AI_COMPLETE('llama3.1-8b','Hello, world!');
+SELECT AI_COMPLETE('llama3.1-8b','ping') AS ai_test, CURRENT_DATABASE() AS db, CURRENT_SCHEMA() AS sch, CURRENT_ROLE() AS role;
 ```
 
-### uv (Required)
-
-Most workflows use Python scripts managed with [uv](https://docs.astral.sh/uv/).
-
-**⚠️ HARD GATE**: Check if installed — do not proceed without `uv`:
+2. **uv installed**:
 ```bash
 uv --version
 ```
 
-**If `uv` is not installed**, inform the user and install:
-```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
+**If any check fails**, stop and report only the failure:
+- Connection/AI_COMPLETE fails → tell user to verify their Snowflake connection
+- `uv` not found → install it:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+  Then restart terminal and retry. **⚠️ STOP**: Do NOT proceed until `uv --version` succeeds.
 
-# Or with Homebrew
-brew install uv
-```
-
-After installation, restart the terminal or run `source ~/.bashrc` (or equivalent).
-
-**⚠️ STOP**: Do NOT proceed to any workflow until `uv --version` succeeds. The create, evaluate, optimize, and demo workflows all depend on `uv`-managed scripts.
+**If all checks pass**, proceed silently to the target database/schema step.
 
 ### Target Database and Schema
 
@@ -53,12 +53,7 @@ All workflows require a target database and schema where AI function objects wil
 
 **If `database` and `schema` are already known** (from the user's initial message or conversation context), accept silently.
 
-**If not known**, first query the current session defaults:
-```sql
-SELECT CURRENT_DATABASE(), CURRENT_SCHEMA();
-```
-
-Then ask, offering the session defaults as an option (if they are set):
+**If not known**, use the session defaults from the prerequisite check above (the `db` and `sch` columns). If they are set, ask offering them as an option:
 ```
 Which database and schema should the AI function be created in?
 
@@ -78,15 +73,11 @@ Store as `{database}` and `{schema}` — these are reused by create, evaluate, a
 
 ## Snowflake Privileges
 
-The skill creates several Snowflake objects. Run the checks below to verify the current role has the necessary grants.
+The skill creates several Snowflake objects. Run the privilege checks below **silently** — same pattern as prerequisite checks. Only surface results to the user if something is **missing**.
 
 ### Privilege Check
 
-Run these three queries in parallel to check all required privileges at once:
-
-```sql
-SELECT CURRENT_ROLE() AS CURRENT_ROLE;
-```
+Run these two queries **in parallel** (single tool-call batch):
 
 ```sql
 SHOW GRANTS ON DATABASE {database};
@@ -96,7 +87,7 @@ SHOW GRANTS ON DATABASE {database};
 SHOW GRANTS ON SCHEMA {database}.{schema};
 ```
 
-From the results, check whether the current role (or a role it inherits) has the following grants. If the role has **ALL** or **OWNERSHIP** on the database and schema, all checks pass — skip to the summary.
+The current role is already known from the prerequisite check above. Check whether the role (or a role it inherits) has the following grants. If the role has **ALL** or **OWNERSHIP** on the database and schema, all checks pass — proceed silently.
 
 **Required privileges:**
 
@@ -111,37 +102,17 @@ From the results, check whether the current role (or a role it inherits) has the
 
 **Optional privileges (async execution):**
 
-These are only needed for running evaluations or optimizations in the background via Snowflake Tasks. Missing async privileges are **not blockers** — the user can still use synchronous execution.
+These are only needed if the user explicitly requests async execution. Do not check these by default — only verify if the user asks for async.
 
-| Privilege | Check In | Needed For |
-|-----------|----------|------------|
-| CREATE TASK | `GRANTS ON SCHEMA` | Creating background tasks |
-| EXECUTE TASK | Account-level grant | Running background tasks |
-| USAGE on warehouse (direct grant) | `GRANTS ON WAREHOUSE` | Tasks require explicit warehouse USAGE — role hierarchy is not sufficient |
-
-To check EXECUTE TASK, run:
-```sql
-SHOW GRANTS ON ACCOUNT;
-```
-Filter for `"privilege" = 'EXECUTE TASK'` granted to the current role.
-
-To check warehouse USAGE (only if async is needed), run:
-```sql
-SHOW GRANTS ON WAREHOUSE {warehouse};
-```
-
-**Note:** Warehouse USAGE for tasks is also validated at runtime by the async SPROCs. This pre-check gives early visibility.
+| Privilege | Needed For |
+|-----------|------------|
+| CREATE TASK | Creating background tasks |
+| EXECUTE TASK (account-level) | Running background tasks |
+| USAGE on warehouse (direct grant) | Tasks require explicit warehouse USAGE |
 
 ### Reporting Results
 
-**If all required privileges pass**, display a brief summary and proceed:
-```
-Privileges verified for {role} on {database}.{schema}. Ready to proceed.
-```
-
-Append one of:
-- `Async execution available.` — if all three optional privileges pass
-- `Async execution unavailable (sync only). Missing: {list}` — if any optional are missing
+**If all required privileges pass**: Proceed silently. Do NOT display a summary message — just move on to the next workflow step.
 
 **If any required privilege is missing:**
 

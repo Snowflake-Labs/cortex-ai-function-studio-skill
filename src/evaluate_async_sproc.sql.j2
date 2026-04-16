@@ -5,10 +5,14 @@
 -- =============================================================================
 -- Async Evaluation SPROC for AI Functions
 -- Creates and executes a Snowflake Task to run evaluation in the background
+--
+-- NOTE: Async control params (WAREHOUSE_NAME, RUN_ID, TIMEOUT_MINUTES) are
+-- ordered differently here than in OPTIMIZE_AI_FUNCTION_ASYNC. Use named
+-- parameter syntax when calling to avoid positional errors.
 -- =============================================================================
 --
 -- Use src/create_sproc.py to generate this SPROC with correct stage paths:
---   uv run python src/create_sproc.py evaluate_async DATABASE SCHEMA STAGE_NAME
+--   PYTHONPATH=<SKILL_DIR>/src uv run python src/create_sproc.py evaluate_async DATABASE SCHEMA STAGE_NAME
 --
 -- =============================================================================
 
@@ -65,7 +69,7 @@ BEGIN
     -- Snowflake Tasks run under the owner role, which requires a direct USAGE grant.
     -- Session-level warehouse access (via role hierarchy) is NOT sufficient for tasks.
     SELECT CURRENT_ROLE() INTO current_role_name;
-    EXECUTE IMMEDIATE 'SHOW GRANTS TO ROLE ' || current_role_name;
+    EXECUTE IMMEDIATE 'SHOW GRANTS TO ROLE "' || REPLACE(current_role_name, '"', '""') || '"';
     SELECT COUNT(*) INTO wh_grant_count
         FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
         WHERE "granted_on" = 'WAREHOUSE'
@@ -94,22 +98,23 @@ BEGIN
     END IF;
     
     -- Build the SPROC call
+    -- Escape single quotes in user-provided strings to prevent SQL injection
     sproc_call := 'CALL {{ database }}.{{ schema }}.EVALUATE_AI_FUNCTION(' ||
-        '''' || FUNCTION_NAME || ''', ' ||
-        '''' || TEST_TABLE || ''', ' ||
+        '''' || REPLACE(FUNCTION_NAME, '''', '''''') || ''', ' ||
+        '''' || REPLACE(TEST_TABLE, '''', '''''') || ''', ' ||
         input_cols_str || ', ' ||
-        '''' || LABEL_COLUMN || ''', ' ||
-        '''' || METRIC_NAME || ''', ' ||
-        '''' || MODEL_NAME || ''', ' ||
+        '''' || REPLACE(LABEL_COLUMN, '''', '''''') || ''', ' ||
+        '''' || REPLACE(METRIC_NAME, '''', '''''') || ''', ' ||
+        '''' || REPLACE(MODEL_NAME, '''', '''''') || ''', ' ||
         COALESCE(TO_VARCHAR(SAMPLE_SIZE), 'NULL') || ', ' ||
-        COALESCE('''' || RESULTS_TABLE || '''', 'NULL') || ', ' ||
+        COALESCE('''' || REPLACE(RESULTS_TABLE, '''', '''''') || '''', 'NULL') || ', ' ||
         metric_opts_str || ', ' ||
         TO_VARCHAR(MAX_LENGTH) || ', ' ||
-        COALESCE('''' || CUSTOM_METRIC_UDF || '''', 'NULL') || ', ' ||
-        '''' || task_name || ''')';
+        COALESCE('''' || REPLACE(CUSTOM_METRIC_UDF, '''', '''''') || '''', 'NULL') || ', ' ||
+        '''' || REPLACE(task_name, '''', '''''') || ''')';
     
     -- Create the task (no schedule — single execution only via EXECUTE TASK)
-    create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}.' || task_name ||
+    create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}."' || REPLACE(task_name, '"', '""') || '"' ||
         ' WAREHOUSE = ' || wh_to_use ||
         ' USER_TASK_TIMEOUT_MS = ' || TO_VARCHAR(TIMEOUT_MINUTES * 60 * 1000) ||
         ' AS ' || sproc_call;
@@ -117,7 +122,7 @@ BEGIN
     EXECUTE IMMEDIATE create_task_sql;
     
     -- Execute the task immediately (works on suspended tasks, no RESUME needed)
-    EXECUTE IMMEDIATE 'EXECUTE TASK {{ database }}.{{ schema }}.' || task_name;
+    EXECUTE IMMEDIATE 'EXECUTE TASK {{ database }}.{{ schema }}."' || REPLACE(task_name, '"', '""') || '"';
     
     RETURN task_name;
 END;

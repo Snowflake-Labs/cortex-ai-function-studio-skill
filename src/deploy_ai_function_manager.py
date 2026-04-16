@@ -57,7 +57,9 @@ STAGE_MODULES = [
     "src/custom_ai_function_utils.py",
     "src/metrics_core.py",
     "src/snow_gepa_adapter.py",
+    "src/snow_gepa_experiment.py",
     "src/snow_gepa_optimize.py",
+    "src/snow_gepa_optimize_anything.py",
     "src/snow_synthetic_data.py",
 ]
 
