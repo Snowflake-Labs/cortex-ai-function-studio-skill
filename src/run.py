@@ -12,15 +12,15 @@ executing the combined SQL via Snowpark.  Evaluate and optimize also support
 asynchronous execution via Snowflake Tasks.
 
 Usage:
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/src/run.py evaluate \
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/run.py evaluate \
         --database DB --schema SCHEMA --stage AI_FUNCTIONS \
         --connection MY_CONN --function-name DB.SCHEMA.MY_FUNC ...
 
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/src/run.py optimize \
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/run.py optimize \
         --database DB --schema SCHEMA --stage AI_FUNCTIONS \
         --connection MY_CONN --function-name DB.SCHEMA.MY_FUNC ...
 
-    uv run --project <SKILL_DIR> python <SKILL_DIR>/src/run.py synthetic \
+    PYTHONPATH=<SKILL_DIR>/src uv run --project <SKILL_DIR> python <SKILL_DIR>/src/run.py synthetic \
         --database DB --schema SCHEMA --stage AI_FUNCTIONS \
         --connection MY_CONN --task-description "Classify tickets" ...
 """
@@ -284,16 +284,16 @@ def _opt_build_call(args: argparse.Namespace) -> str:
         _sql_varchar(args.reflection_model),
         _sql_varchar(args.test_table),
         _sql_varchar(args.auto_budget),
-        _sql_varchar(args.tracking_table),
         _sql_varchar(args.results_table),
         _sql_float(args.validation_fraction),
         _sql_float(args.temperature),
         _sql_int(args.max_tokens),
         _sql_variant_json(args.metric_options),
         _sql_varchar(args.custom_metric_udf),
-        _sql_bool(args.enable_detailed_tracking),
         _sql_varchar(args.run_id),
         _sql_varchar(args.aggregation_metric),
+        _sql_varchar(getattr(args, "optimize_mode", "body")),
+        _sql_varchar(args.experiment_name),
     ]
     joined = ",\n    ".join(params)
     return f"CALL OPTIMIZE_AI_FUNCTION(\n    {joined}\n)"
@@ -337,16 +337,16 @@ def _add_optimize_args(sub: argparse.ArgumentParser) -> None:
     )
     opt.add_argument("--auto-budget", required=True, help="light, medium, or heavy")
     opt.add_argument(
-        "--tracking-table",
+        "--experiment-name",
         type=nullable_str,
         required=True,
-        help="Table to save candidate history, or 'none'",
+        help="Snowflake Experiment name to persist results, or 'none'",
     )
     opt.add_argument(
         "--results-table",
         type=nullable_str,
         required=True,
-        help="Table to save final results, or 'none'",
+        help="Table to save per-row test-set eval results, or 'none'",
     )
     opt.add_argument("--validation-fraction", type=float, required=True)
     opt.add_argument("--temperature", type=float, required=True)
@@ -364,12 +364,6 @@ def _add_optimize_args(sub: argparse.ArgumentParser) -> None:
         help="Fully qualified UDF name, or 'none'",
     )
     opt.add_argument(
-        "--enable-detailed-tracking",
-        type=bool_str,
-        required=True,
-        help="'true' to enable verbose logging, or 'false'",
-    )
-    opt.add_argument(
         "--run-id",
         type=nullable_str,
         required=True,
@@ -380,6 +374,14 @@ def _add_optimize_args(sub: argparse.ArgumentParser) -> None:
         type=nullable_str,
         required=True,
         help="'accuracy' or 'f1-score', or 'none' to disable",
+    )
+    opt.add_argument(
+        "--optimize-mode",
+        type=str,
+        default="body",
+        choices=["prompt", "body"],
+        help="'body' (default) optimizes the entire SQL function body. "
+        "'prompt' optimizes only the system prompt.",
     )
 
     async_grp = sub.add_argument_group("async execution")
@@ -421,8 +423,8 @@ def _run_optimize(args: argparse.Namespace, exec_fn) -> dict:
         "result": raw,
         "function": args.function_name,
     }
-    if args.tracking_table:
-        result["tracking_table"] = args.tracking_table
+    if args.experiment_name:
+        result["experiment_name"] = args.experiment_name
     if args.run_id:
         result["run_id"] = args.run_id
     return result
@@ -555,9 +557,13 @@ def parse_args() -> argparse.Namespace:
         infra = sub.add_argument_group("infrastructure")
         infra.add_argument("--database", required=True)
         infra.add_argument("--schema", required=True)
-        infra.add_argument("--stage", default="", help="Bare stage name (only needed without --inline)")
         infra.add_argument(
-            "--inline", action="store_true", default=True,
+            "--stage", default="", help="Bare stage name (only needed without --inline)"
+        )
+        infra.add_argument(
+            "--inline",
+            action="store_true",
+            default=True,
             help="Embed Python source in SPROC body (default: True)",
         )
         infra.add_argument(
@@ -591,6 +597,13 @@ def main() -> None:
         session.sql(f"USE SCHEMA {args.database}.{args.schema}").collect()
 
         def _exec(sql: str) -> list:
+            """Execute SQL, automatically tagging with the Cortex session ID.
+
+            When CORTEX_SESSION_ID is set in the environment, wraps execution
+            in customai_query_tag_logging to inject the session ID into the
+            QUERY_TAG (key: __CUSTOM_AI_FUNCTION_COCO_SESSION_ID_), restoring
+            the original tag afterward.
+            """
             if coco_session_id:
                 with customai_query_tag_logging(
                     session,

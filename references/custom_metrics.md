@@ -265,7 +265,7 @@ All metrics must:
 1. Have a handler function named `evaluate`
 2. Accept `(expected: str, predicted: str)` parameters
 3. Return a dict with `score` (float 0.0-1.0) and `feedback` (string)
-4. Feedback explains the score in a way that helps prompt optimization
+4. Feedback explains the score in a way that helps optimization
 5. **Use `_parse_json()` instead of `json.loads()` for any JSON parsing** (see Robust JSON Parsing section above)
 
 Write the file to `/tmp/{metric_name}.py` for local testing first.
@@ -402,7 +402,7 @@ Write a test script at `/tmp/test_{metric_name}.py` that:
 
 Run with:
 ```bash
-uv run --project <SKILL_DIRECTORY> python /tmp/test_{metric_name}.py
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python /tmp/test_{metric_name}.py
 ```
 
 Present results as a table with columns: `#`, `Description`, `Score`, `Target`, `Status`, `Feedback`.
@@ -442,7 +442,30 @@ Quick smoke test in SQL:
 SELECT {database}.{schema}.{metric_name}('expected text', 'predicted text') AS result;
 ```
 
-### Step 6: Use It
+### Step 6: Clean Up Local Temp Files
+
+After the UDF is successfully created and verified in Snowflake, remove the temporary files that were created on the user's behalf during development. Only remove files that this workflow created — do not delete any other files in `/tmp/`.
+
+Delete these two files:
+- `/tmp/{metric_name}.py` — the metric code written in Step 2
+- `/tmp/test_{metric_name}.py` — the test script written in Step 4
+
+```bash
+rm /tmp/{metric_name}.py /tmp/test_{metric_name}.py
+```
+
+Confirm to the user:
+```
+Cleaned up temporary files:
+- /tmp/{metric_name}.py
+- /tmp/test_{metric_name}.py
+
+The metric logic now lives in Snowflake as a UDF — these local files are no longer needed.
+```
+
+If either file doesn't exist (e.g., already removed), that's fine — skip it silently.
+
+### Step 7: Use It
 
 The metric is now available by its fully qualified UDF name. To use it in evaluation or optimization:
 
@@ -472,3 +495,4 @@ If Optimize -> Load `optimize/SKILL.md` with metric pre-selected.
 - Step 3: Review and approve test cases
 - Step 4: All tests must pass and results approved
 - Step 5: Review DDL before executing
+- Step 6: Clean up temp files after UDF creation

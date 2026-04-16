@@ -9,13 +9,14 @@ dependencies = [
     "numpy>=1.24.0",
     "snowflake-connector-python>=3.0.0",
     "snowflake-snowpark-python>=1.0.0",
-    "gepa>=0.0.19",
+    "gepa==0.1.1",
     "jinja2>=3.0.0",
     "pyyaml>=6.0",
 ]
 
 [dependency-groups]
 test = [
+    "pillow>=12.2.0",
     "pytest>=8.0.0",
 ]
 

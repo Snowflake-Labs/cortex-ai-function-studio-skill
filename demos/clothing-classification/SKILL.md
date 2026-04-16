@@ -1,6 +1,6 @@
 ---
 name: clothing-classification-demo
-description: "Interactive demo: Build a multimodal clothing condition classifier using expert-labeled garment images, then evaluate and optimize across models via GEPA prompt optimization."
+description: "Interactive demo: Build a multimodal clothing condition classifier using expert-labeled garment images, then evaluate and optimize across models via GEPA optimization."
 parent_skill: demos
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
@@ -8,7 +8,7 @@ parent_skill: demos
 
 # Clothing Condition Classification Demo
 
-Build a multimodal AI function that classifies second-hand garment condition from images, then optimize across models via GEPA prompt optimization.
+Build a multimodal AI function that classifies second-hand garment condition from images, then optimize across models via GEPA optimization.
 
 ## Overview
 
@@ -25,7 +25,7 @@ Welcome to the Clothing Condition Classification Demo!
 At the end of this demo, you will witness the Cortex AI Function Studio's ability to:
 - Classify garment condition from images using multimodal AI_COMPLETE
 - Evaluate classification accuracy across 5 condition grades
-- Optimize prompts using GEPA to improve smaller, cheaper models
+- Optimize functions using GEPA to improve smaller, cheaper models
 - Compare cost vs. quality trade-offs across models using Pareto analysis
 
 This demo uses expert-labeled data from the Fashion Second-Hand dataset
@@ -43,8 +43,6 @@ Snowflake stage and classifies them by visual inspection alone.
 
 Objects created: all prefixed with DEMO_ for easy cleanup.
 ```
-
-**⚠️ STOP**: Ask user if they want to proceed before continuing.
 
 ### Step 2: Setup - Choose Location
 
@@ -89,7 +87,7 @@ Do you consent to downloading this dataset? (yes/no)
 No problem! Here's what you would typically see if you ran this demo to completion:
 
 Baseline accuracy (generic prompt, exact_match): ~15%
-After GEPA optimization (medium budget, 3 vision models):
+After GEPA optimization (light budget, 3 vision models):
 
 | Model                  | Best Optimized | Improvement |
 |------------------------|----------------|-------------|
@@ -100,7 +98,7 @@ After GEPA optimization (medium budget, 3 vision models):
 Key insight: GEPA evolves the generic 7-word prompt into a detailed grading
 rubric with visual cue definitions (pilling, stains, holes, fabric integrity),
 calibration notes, and tie-breaking rules — closing a 35-point quality gap
-through prompt optimization alone.
+through GEPA optimization alone.
 
 Condition grading is inherently subjective (even experts disagree on adjacent
 grades), so 50% exact-match on a 5-class task represents meaningful improvement.
@@ -111,14 +109,14 @@ Ready to try a different demo? Just say "demo" to see available options.
 
 **If yes**, proceed:
 ```
-How many images per class? [default: 100, total = 5 × this value]
+How many images per class? [default: 30, total = 5 × this value]
 ```
 
 **⚠️ STOP**: Wait for user to specify per-class count (or confirm default) before proceeding.
 
 Run the data generation script:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_clothing_data.py \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_clothing_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
   --schema {schema} \
@@ -203,7 +201,7 @@ Results table: DEMO_CLASSIFY_CLOTHING_EVAL_RESULTS
 - `metric`: `exact_match`
 - `results_table`: `{database}.{schema}.DEMO_CLASSIFY_CLOTHING_EVAL_RESULTS`
 
-**Async by default:** When the evaluate workflow reaches the execution mode selection, choose **async** (`EVALUATE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), fall back to sync execution. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session. **Load** `references/async_status.md` for polling patterns.
+**Sync by default:** Use sync execution with `timeout_seconds: 14400`. Only fall back to async if the sync execution times out or the user explicitly requests it.
 
 **Skip Step 6 (next steps)** in the evaluate workflow — return here after results are presented.
 
@@ -225,7 +223,7 @@ ORDER BY SCORE
 LIMIT 10;
 ```
 
-Discuss common failure patterns: adjacent classes are easily confused (e.g., `good` vs `fair`), condition grading is inherently subjective from a single image, and a generic prompt doesn't tell the model what visual cues distinguish each grade. This is exactly what GEPA can improve.
+Discuss common failure patterns: adjacent classes are easily confused (e.g., `good` vs `fair`), condition grading is inherently subjective from a single image, and a generic function body doesn't tell the model what visual cues distinguish each grade. This is exactly what GEPA can improve.
 
 After reviewing results, continue to Step 6.
 
@@ -245,10 +243,10 @@ generations:
 
 Please confirm or modify any settings:
 
-Auto budget: medium (~10-20 minutes)
+Auto budget: demo (~5 minutes)
 Metric: exact_match
 Label column: EXPECTED_OUTPUT
-Tracking table: DEMO_CLASSIFY_CLOTHING_OPT_TRACKING
+Experiment: DEMO_CLASSIFY_CLOTHING_OPT_EXP
 Models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'claude-haiku-4-5']
 
 Options:
@@ -270,12 +268,12 @@ If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passi
 - `metric`: `exact_match`
 - `models`: `['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'claude-haiku-4-5']`
 - `reflection_model`: `claude-opus-4-6` (or strongest available Claude-family model)
-- `auto_budget`: `medium`
-- `tracking_table`: `{database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_TRACKING`
+- `auto_budget`: `demo`
+- `experiment_name`: `{database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_EXP`
 
-**Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error, fall back to sync with `timeout_seconds: 14400`. After kicking off the async job, poll `TASK_HISTORY()` for completion. **Load** `references/async_status.md` for polling patterns.
+**Sync by default:** Use sync execution with `timeout_seconds: 14400`. Only fall back to async if the user explicitly requests it or if the sync execution times out.
 
-**Skip Step 8 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
+**Skip Step 8 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized function.
 
 ### Step 7: Summarize GEPA Results
 
@@ -284,14 +282,14 @@ After optimization completes, present results and compare before/after.
 **7.1. Show the optimization journey:**
 
 ```sql
-SELECT
-    ROW_NUMBER() OVER (PARTITION BY MODEL_NAME ORDER BY CREATED_AT) AS CANDIDATE_IDX,
-    MODEL_NAME,
-    METRIC_SCORE AS SCORE,
-    LEFT(PROMPT_TEXT, 120) AS PROMPT_PREVIEW
-FROM {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_TRACKING
-WHERE METRIC_SCORE IS NOT NULL
-ORDER BY MODEL_NAME, CREATED_AT;
+-- List all runs (SEED, ITER_1..N, BEST per model)
+SHOW RUNS IN EXPERIMENT {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_EXP;
+
+-- View metrics for each run to see how scores evolved
+-- Run names follow the pattern: {MODEL}_SEED, {MODEL}_ITER_1, ..., {MODEL}_BEST
+-- where {MODEL} is the uppercased model name with non-alphanumeric chars replaced by _
+-- e.g. gemini-2.5-flash-lite -> GEMINI_2_5_FLASH_LITE
+SHOW RUN METRICS IN EXPERIMENT {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_EXP;
 ```
 
 Highlight how prompts evolve — early candidates use generic language ("classify this garment"), later candidates include specific visual cues (pilling, stains, holes, fabric integrity, color fading) that GEPA learned from misclassification feedback.
@@ -299,11 +297,9 @@ Highlight how prompts evolve — early candidates use generic language ("classif
 **7.2. Compare baseline vs. optimized:**
 
 ```sql
-SELECT MODEL_NAME, MAX(METRIC_SCORE) AS BEST_SCORE
-FROM {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_TRACKING
-WHERE METRIC_SCORE IS NOT NULL
-GROUP BY MODEL_NAME
-ORDER BY BEST_SCORE DESC;
+-- Compare seed vs best for each model
+SHOW RUN METRICS IN EXPERIMENT {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_EXP;
+-- Look for {MODEL}_SEED and {MODEL}_BEST rows and compare valset_score
 ```
 
 **7.3. Pareto analysis for cost/quality:**
@@ -311,7 +307,7 @@ ORDER BY BEST_SCORE DESC;
 Note: for multimodal functions, actual cost is dominated by image token count, not text chars. The Pareto filter gives a relative cost ordering which is still directionally useful.
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
     --json '[{"model": "model1", "score": 0.85}, ...]' \
     --prompt-chars {prompt_chars} --avg-output-chars 5 \
     --seed-score {baseline_score} --format table
@@ -322,7 +318,7 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py
 ```
 Key result: {best_model} achieves {optimized_score}% classification accuracy
 at ~{cost_ratio}x cheaper than {strong_reference}. GEPA closed the quality gap
-through prompt optimization alone.
+through GEPA optimization alone.
 
 What GEPA learned:
 - Reflected on misclassifications across {total_candidates} prompt variations
@@ -346,7 +342,7 @@ This will drop:
 - {database}.{schema}.DEMO_CLOTHING_TEST
 - {database}.{schema}.DEMO_CLASSIFY_CLOTHING (function)
 - {database}.{schema}.DEMO_CLASSIFY_CLOTHING_EVAL_RESULTS
-- {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_TRACKING
+- {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_EXP
 ```
 
 **⚠️ STOP**: Wait for user confirmation before cleanup.
@@ -358,7 +354,7 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLOTHING_TRAIN;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLOTHING_TEST;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_CLASSIFY_CLOTHING(VARCHAR);
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLASSIFY_CLOTHING_EVAL_RESULTS;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_TRACKING;
+DROP EXPERIMENT IF EXISTS {database}.{schema}.DEMO_CLASSIFY_CLOTHING_OPT_EXP;
 ```
 
 ### Step 9: Next Steps
@@ -372,7 +368,7 @@ Thanks for trying the Clothing Condition Classification demo!
 Here's what you learned:
 - **Created** a multimodal AI function that classifies garments from images
 - **Evaluated** classification accuracy using exact_match
-- **Optimized** the prompt using GEPA to improve accuracy across cheaper models
+- **Optimized** the function using GEPA to improve accuracy across cheaper models
 
 Key takeaways about multimodal GEPA optimization:
 
@@ -385,8 +381,8 @@ Key takeaways about multimodal GEPA optimization:
   GEPA's reflection discovers the discriminative cues automatically.
 
   Cost savings: The Pareto frontier shows which vision models offer the best
-  quality-per-dollar for this task. Smaller models with optimized prompts
-  often match larger models with generic prompts.
+  quality-per-dollar for this task. Smaller models with optimized functions
+  often match larger models with generic implementations.
 
 Ready to build your own multimodal AI function? Just say "create an AI function"
 and mention that you want to process images.

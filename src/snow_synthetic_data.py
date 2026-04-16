@@ -432,7 +432,7 @@ def _resolve_output_spec(
     if isinstance(output_schema, str):
         try:
             schema_obj = RobustAIComplete.parse_ai_complete_payload(
-                output_schema, allow_text_recovery=False
+                output_schema
             )
         except json.JSONDecodeError as exc:
             raise ValueError(f"OUTPUT_SCHEMA is not valid JSON: {exc}") from exc
@@ -1028,7 +1028,7 @@ def _pseudo_label_batch(
     output_cols: list[str],
     output_properties: dict[str, dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Pseudo-label one batch of input rows."""
+    """Pseudo-label one batch of input rows via a single multi-row AI_COMPLETE call."""
     if not inputs_batch:
         return []
 
@@ -1046,37 +1046,44 @@ def _pseudo_label_batch(
         "required": output_cols,
     }
     normalizer = ExampleNormalizer(input_cols=[], output_cols=output_cols)
+
+    # Build all prompts upfront
+    prompts = [
+        _build_pseudo_label_prompt(task_description, inputs, response_schema)
+        for inputs in inputs_batch
+    ]
+
+    # Single multi-row AI_COMPLETE call — Snowflake parallelizes server-side
+    raw_responses = RobustAIComplete.call_ai_complete(
+        session,
+        model=model,
+        user_prompts=prompts,
+        temperature=0.0,
+        max_tokens=8192,
+        response_schema=response_schema,
+    )
+
+    if raw_responses is None or len(raw_responses) != len(inputs_batch):
+        raise RuntimeError(
+            f"AI_COMPLETE returned {len(raw_responses) if raw_responses else 0} "
+            f"responses, expected {len(inputs_batch)}"
+        )
+
     outputs: list[dict[str, object]] = []
-
-    for idx_val, inputs in enumerate(inputs_batch):
-        prompt = _build_pseudo_label_prompt(task_description, inputs, response_schema)
-        fallback_prompt = (
-            f"{prompt}\n\n"
-            "Return ONLY a valid JSON object. "
-            "Do not include markdown, code fences, or extra text."
-        )
-        parsed = RobustAIComplete.run_ai_complete_with_json_fallback(
-            session=session,
-            model=model,
-            primary_prompt=prompt,
-            fallback_prompt=fallback_prompt,
-            response_schema=response_schema,
-            temperature=0.0,
-            max_tokens=8192,
-        )
-
+    for idx_val, parsed in enumerate(raw_responses):
         if parsed is None:
             raise ValueError(f"Model returned empty response for row index {idx_val}")
         if isinstance(parsed, dict) and isinstance(parsed.get("outputs"), dict):
             parsed = parsed["outputs"]
         if not isinstance(parsed, dict):
             raise ValueError(
-                f"Expected JSON object output for row index {idx_val}, got {type(parsed).__name__}"
+                f"Expected JSON object output for row index {idx_val}, "
+                f"got {type(parsed).__name__}"
             )
 
-        normalized = normalizer.normalize_examples([{"inputs": {}, "outputs": parsed}])[
-            0
-        ]["outputs"]
+        normalized = normalizer.normalize_examples(
+            [{"inputs": {}, "outputs": parsed}]
+        )[0]["outputs"]
         outputs.append(normalized)
 
     return outputs

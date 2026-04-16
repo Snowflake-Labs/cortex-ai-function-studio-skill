@@ -259,7 +259,7 @@ class SnowflakeAdapter(
         model: str,
         original_ddl: str,
         temp_function_name: str,
-        tracking_callback: Callable[[dict[str, str], float], None] | None = None,
+        tracking_callback: Callable[[dict[str, str], float, int], None] | None = None,
         detailed_tracking_callback: Callable[[dict], None] | None = None,
         file_type_params: list[str] | None = None,
         stage_name: str | None = None,

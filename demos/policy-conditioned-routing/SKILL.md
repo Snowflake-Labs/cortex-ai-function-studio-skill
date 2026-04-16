@@ -1,6 +1,6 @@
 ---
 name: policy-conditioned-routing-demo
-description: "Interactive demo: Build a policy-conditioned support ticket routing AI function using hand-curated gold-labeled data, then evaluate and optimize cheaper models via prompt optimization."
+description: "Interactive demo: Build a policy-conditioned support ticket routing AI function using hand-curated gold-labeled data, then evaluate and optimize cheaper models via GEPA optimization."
 parent_skill: demos
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
@@ -8,7 +8,7 @@ parent_skill: demos
 
 # Policy-Conditioned Support Ticket Routing Demo
 
-Build an AI function that routes support tickets using company-specific policy context, then optimize cheaper models via prompt optimization to match or beat a strong baseline.
+Build an AI function that routes support tickets using company-specific policy context, then optimize cheaper models via GEPA optimization to match or beat a strong baseline.
 
 ## Overview
 
@@ -16,7 +16,7 @@ This demo walks you through:
 1. Loading a labeled dataset with company routing policies
 2. Creating a policy-aware routing AI function
 3. Evaluating baseline accuracy across multiple models
-4. Optimizing cheap models via prompt optimization to close the accuracy gap
+4. Optimizing cheap models via GEPA optimization to close the accuracy gap
 5. Comparing before/after results
 
 Correct routing requires interpreting company-specific policy language written in internal vocabulary — models must generalize policy semantics rather than rely on keyword matching.
@@ -48,8 +48,6 @@ policy — a model that ignores policy context will score poorly.
 
 Objects created: all prefixed with DEMO_ for easy cleanup.
 ```
-
-**⚠️ STOP**: Ask user if they want to proceed before continuing.
 
 ### Step 2: Setup - Choose Location
 
@@ -118,7 +116,6 @@ Default model: gemini-2.5-flash-lite
 Inputs:
   SUBJECT, BODY, CUSTOMER_TIER, COMPANY_NAME,
   POLICY_PROFILE, POLICY_TEXT, ENTITLEMENT_TEXT
-  MODEL_NAME (overridable), SYSTEM_PROMPT (overridable)
 
 Output: route (string)
 ```
@@ -181,23 +178,43 @@ Default comparison models:
 
 If one of these models is unavailable, remove it from the list or **load** `references/model_selection.md` to choose substitutes.
 
-Create the results table and run each model:
+Create the results table:
 ```sql
 CREATE OR REPLACE TABLE {database}.{schema}.DEMO_ROUTE_TICKET_BASELINE_RESULTS (
     MODEL_NAME VARCHAR, ROW_COUNT NUMBER, CORRECT NUMBER, ACCURACY NUMBER(10, 4)
 );
 ```
 
-For **each model**, run:
+**Create a per-model UDF for each model**, then run evaluation. The model and system prompt are baked into each function body — we create a separate function per model using `create_udf.py`, reusing the same configuration from Step 4 but with a different `model` and `function_name`.
+
+**Do not confirm with the user before creating each UDF** — the user already confirmed the model list above.
+
+For each model, derive a function suffix from the model name (replace `-` and `.` with `_`, uppercase). For example, `claude-sonnet-4-5` → `DEMO_ROUTE_TICKET__CLAUDE_SONNET_4_5`.
+
+For **each model**, create the function:
+```bash
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
+    --execute --connection <CONNECTION_NAME> \
+    --database {database} \
+    --schema {schema} \
+    --function-name "DEMO_ROUTE_TICKET__{model_suffix}" \
+    --function-intention 'Route policy-aware support tickets using company context.' \
+    --model {model_name} \
+    --system-prompt '<same system_prompt from Step 4>' \
+    --user-prompt-template 'Subject: {SUBJECT}\nBody: {BODY}\nCustomer tier: {CUSTOMER_TIER}\nCompany name: {COMPANY_NAME}\nPolicy profile: {POLICY_PROFILE}\nCompany policy: {POLICY_TEXT}\nEntitlement notes: {ENTITLEMENT_TEXT}' \
+    --inputs '[{"name": "SUBJECT", "sql_type": "VARCHAR"}, {"name": "BODY", "sql_type": "VARCHAR"}, {"name": "CUSTOMER_TIER", "sql_type": "VARCHAR"}, {"name": "COMPANY_NAME", "sql_type": "VARCHAR"}, {"name": "POLICY_PROFILE", "sql_type": "VARCHAR"}, {"name": "POLICY_TEXT", "sql_type": "VARCHAR"}, {"name": "ENTITLEMENT_TEXT", "sql_type": "VARCHAR"}]' \
+    --outputs '[{"name": "route", "json_type": "string", "description": "Support ticket route"}]'
+```
+
+After all UDFs are created, run eval queries **in parallel** — one per model:
 ```sql
 INSERT INTO {database}.{schema}.DEMO_ROUTE_TICKET_BASELINE_RESULTS
 WITH preds AS (
     SELECT
         EXPECTED_OUTPUT,
-        {database}.{schema}.DEMO_ROUTE_TICKET(
+        {database}.{schema}.DEMO_ROUTE_TICKET__{model_suffix}(
             SUBJECT, BODY, CUSTOMER_TIER, COMPANY_NAME,
-            POLICY_PROFILE, POLICY_TEXT, ENTITLEMENT_TEXT,
-            '{model_name}', NULL
+            POLICY_PROFILE, POLICY_TEXT, ENTITLEMENT_TEXT
         ) AS PREDICTED
     FROM {database}.{schema}.DEMO_TICKETS_EVAL
 )
@@ -205,6 +222,11 @@ SELECT
     '{model_name}', COUNT(*), COUNT_IF(PREDICTED = EXPECTED_OUTPUT),
     ROUND(COUNT_IF(PREDICTED = EXPECTED_OUTPUT) / COUNT(*), 4)
 FROM preds;
+```
+
+After all results are collected, **drop the per-model UDFs**:
+```sql
+DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET__{model_suffix}(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
 ```
 
 Show the baseline leaderboard:
@@ -216,12 +238,12 @@ ORDER BY ACCURACY DESC;
 
 Highlight that cheap models typically score well below the strong reference on this hard benchmark because the policy vocabulary is unfamiliar.
 
-### Step 7: Optimize Prompts
+### Step 7: Optimize Functions
 
 Present the optimization configuration:
 ```
-Now we'll optimize the cheap models using prompt optimization.
-The optimizer evolves the system prompt through multiple generations,
+Now we'll optimize the cheap models using GEPA optimization.
+The optimizer evolves the function body through multiple generations,
 testing variations against the 96-row training set.
 
 Default cheap models:
@@ -231,8 +253,8 @@ Default cheap models:
 - gemini-2.5-flash-lite
 - claude-haiku-4-5
 
-Auto budget: heavy (~20-30 minutes)
-Tracking table: DEMO_ROUTE_TICKET_OPT_TRACKING
+Auto budget: demo (~5 minutes)
+Experiment: DEMO_ROUTE_TICKET_OPT_EXP
 ```
 
 **⚠️ STOP**: Wait for user confirmation or modifications before starting optimization.
@@ -246,19 +268,19 @@ Tracking table: DEMO_ROUTE_TICKET_OPT_TRACKING
 - `metric`: `exact_match`
 - `models`: the confirmed cheap-model list
 - `reflection_model`: `claude-sonnet-4-5`
-- `auto_budget`: `heavy`
-- `tracking_table`: `{database}.{schema}.DEMO_ROUTE_TICKET_OPT_TRACKING`
+- `auto_budget`: `demo`
+- `experiment_name`: `{database}.{schema}.DEMO_ROUTE_TICKET_OPT_EXP`
 
 Return here after optimization results are presented.
 
 ### Step 8: Summarize Results
 
-**8.1.** Join baseline results from `DEMO_ROUTE_TICKET_BASELINE_RESULTS` with the best optimized score per model from `DEMO_ROUTE_TICKET_OPT_TRACKING`. Show each model's baseline accuracy, optimized accuracy, gain, and whether it meets or exceeds the strong reference (`claude-sonnet-4-5`) baseline. The strong reference itself was not optimized — include it as the reference row.
+**8.1.** Join baseline results from `DEMO_ROUTE_TICKET_BASELINE_RESULTS` with the best optimized score per model from `DEMO_ROUTE_TICKET_OPT_EXP`. Show each model's baseline accuracy, optimized accuracy, gain, and whether it meets or exceeds the strong reference (`claude-sonnet-4-5`) baseline. The strong reference itself was not optimized — include it as the reference row.
 
 **8.2.** Calculate relative cost using the Pareto filter script (`src/filter_pareto.py`). Include all models: optimized cheap models at their best optimized score and `claude-sonnet-4-5` at its baseline score. Use the system prompt character length for `--prompt-chars` and average expected output length from the eval table for `--avg-output-chars`. Use the strong reference baseline as `--seed-score`. Present the Pareto-optimal table to the user.
 
 **8.3.** Summarize key findings:
-- Which model gained the most accuracy from prompt optimization.
+- Which model gained the most accuracy from GEPA optimization.
 - If any optimized cheap model beats or matches the strong reference, call it out along with its relative cost — better quality at lower cost.
 - If `claude-sonnet-4-5` is dominated on the Pareto frontier (a cheaper model has equal or higher score), note that the strong model is no longer the best option at any price point.
 - If no cheap model beats the strong reference, note the remaining gap and suggest heavier optimization budgets or different models.
@@ -278,7 +300,7 @@ This will drop:
 - {database}.{schema}.DEMO_TICKETS_EVAL
 - {database}.{schema}.DEMO_ROUTE_TICKET
 - {database}.{schema}.DEMO_ROUTE_TICKET_BASELINE_RESULTS
-- {database}.{schema}.DEMO_ROUTE_TICKET_OPT_TRACKING
+- {database}.{schema}.DEMO_ROUTE_TICKET_OPT_EXP
 ```
 
 **⚠️ STOP**: Wait for user confirmation before cleanup.
@@ -289,9 +311,9 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_COMPANY_ROUTING_POLICY_V6;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_TICKETS_HARD_GOLD_V6_SMALL;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_TICKETS_POLICY_TRAIN_V6_LARGE;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_TICKETS_EVAL;
-DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
+DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET_BASELINE_RESULTS;
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET_OPT_TRACKING;
+DROP EXPERIMENT IF EXISTS {database}.{schema}.DEMO_ROUTE_TICKET_OPT_EXP;
 ```
 
 ### Step 10: Next Steps
@@ -304,12 +326,12 @@ You completed a policy-conditioned routing workflow:
 2. Built a policy-aware routing function
 3. Measured baselines — cheap models scored well below the strong
    reference because the policy vocabulary is intentionally unfamiliar
-4. Optimized cheap models via prompt optimization
+4. Optimized cheap models via GEPA optimization
 5. Compared cost and quality side-by-side
 
 Key takeaways:
 
-  Accuracy: Prompt optimization recovered large accuracy gains on
+  Accuracy: GEPA optimization recovered large accuracy gains on
   cheap models. On hard tasks where baselines are low, the room for
   improvement is biggest.
 
@@ -318,7 +340,7 @@ Key takeaways:
   the strong reference, switching to it saves cost with no quality
   penalty.
 
-  When to use prompt optimization: Whenever baseline accuracy on
+  When to use GEPA optimization: Whenever baseline accuracy on
   your task is disappointing, especially with cheaper models.
   Optimization can close the gap without changing models or data.
 ```

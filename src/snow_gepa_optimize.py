@@ -8,13 +8,15 @@ This module provides the main optimize() function that runs GEPA prompt
 optimization using Snowflake AI functions via UDF invocation.
 """
 
+import contextlib
 import logging
 import random
 import re
+import tempfile
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Literal, TypedDict
+from typing import Callable, Literal
 
 import gepa as gepa_pkg
 from gepa import NoImprovementStopper
@@ -49,6 +51,11 @@ from custom_ai_function_utils import (
     with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc,
     with_custom_ai_function_query_tag,
 )
+from snow_gepa_experiment import (
+    create_gepa_experiment,
+    save_failed_run_to_experiment,
+    save_optimization_to_experiment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +64,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_REFLECTION_MINIBATCH_SIZE = 10
-DEFAULT_AUTO_BUDGET: Literal["light", "medium", "heavy"] = "light"
+DEFAULT_AUTO_BUDGET: Literal["demo", "light", "medium", "heavy"] = "demo"
 DEFAULT_VALIDATION_FRACTION = 0.5
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 8192
@@ -67,6 +74,7 @@ DEFAULT_REFLECTION_CALL_WEIGHT = 1
 DEFAULT_SPLIT_SEED = 42
 
 AUTO_BUDGET_SETTINGS: dict[str, dict[str, int]] = {
+    "demo": {"n": 2},
     "light": {"n": 6},
     "medium": {"n": 12},
     "heavy": {"n": 18},
@@ -152,7 +160,7 @@ class MaxTotalBudgetStopper:
     @classmethod
     def resolve_budget(
         cls,
-        auto: Literal["light", "medium", "heavy"],
+        auto: Literal["demo", "light", "medium", "heavy"],
         num_components: int,
         valset_size: int,
         reflection_minibatch_size: int = DEFAULT_REFLECTION_MINIBATCH_SIZE,
@@ -178,10 +186,12 @@ class MaxTotalBudgetStopper:
             )
 
         num_candidates = cls.AUTO_BUDGET_SETTINGS[auto]["n"]
-        N = int(max(
-            2 * (num_components * 2) * math.log2(num_candidates),
-            1.5 * num_candidates,
-        ))
+        N = int(
+            max(
+                2 * (num_components * 2) * math.log2(num_candidates),
+                1.5 * num_candidates,
+            )
+        )
 
         V = valset_size
         M = reflection_minibatch_size
@@ -226,8 +236,7 @@ class MaxTotalBudgetStopper:
         # Task prompt: instruction + one user input
         if trainset:
             avg_input_len = sum(
-                sum(len(str(v)) for v in item["inputs"].values())
-                for item in trainset
+                sum(len(str(v)) for v in item["inputs"].values()) for item in trainset
             ) / len(trainset)
             avg_answer_len = sum(
                 len(str(item.get("answer", ""))) for item in trainset
@@ -261,26 +270,23 @@ class MaxTotalBudgetStopper:
         sample = trainset[:reflection_minibatch_size]
         dataset_with_feedback = [
             {
-                "Inputs": "\n".join(
-                    f"{k}: {v}" for k, v in item["inputs"].items()
-                ),
+                "Inputs": "\n".join(f"{k}: {v}" for k, v in item["inputs"].items()),
                 "Generated Outputs": item.get("answer", ""),
                 "Feedback": "Needs improvement.",
             }
             for item in sample
         ]
-        reflection_prompt = InstructionProposalSignature.prompt_renderer({
-            "current_instruction_doc": instruction,
-            "dataset_with_feedback": dataset_with_feedback,
-            "prompt_template": None,
-        })
+        reflection_prompt = InstructionProposalSignature.prompt_renderer(
+            {
+                "current_instruction_doc": instruction,
+                "dataset_with_feedback": dataset_with_feedback,
+                "prompt_template": None,
+            }
+        )
         reflection_prompt_len = (
             len(reflection_prompt)
             if isinstance(reflection_prompt, str)
-            else sum(
-                len(str(part.get("content", "")))
-                for part in reflection_prompt
-            )
+            else sum(len(str(part.get("content", ""))) for part in reflection_prompt)
         )
 
         return max(1, round(reflection_prompt_len / metric_prompt_len))
@@ -295,18 +301,6 @@ class MaxTotalBudgetStopper:
             + self.reflection_lm.call_count * self.reflection_call_weight
         )
         return total >= self.max_budget
-
-
-class TrackingDetail(TypedDict):
-    """Per-row evaluation detail for detailed tracking."""
-
-    row_idx: int
-    prompt_text: str
-    input_text: str
-    expected: str
-    predicted: str
-    metric_score: float
-    metric_feedback: str
 
 
 def optimize(
@@ -335,12 +329,11 @@ def optimize(
     no_improvement_patience: int | None = None,
     seed: int = 0,
     log_dir: str | None = None,
-    tracking_callback: Callable[[dict[str, str], float, int], None] | None = None,
-    detailed_tracking_callback: Callable[[dict], None] | None = None,
+    cache_evaluation: bool = True,
     file_type_params: list[str] | None = None,
     stage_name: str | None = None,
 ) -> GEPAResult:
-    """Optimizes prompts using the GEPA algorithm with Snowflake AI function invocation.
+    """Optimizes AI functions using the GEPA algorithm with Snowflake AI function invocation.
 
     The stopping condition uses a combined budget that accounts for both
     metric evaluation calls and reflection LLM calls, so that optimization
@@ -380,9 +373,6 @@ def optimize(
             many iterations. Set to None to disable. Default None.
         seed: Random seed for reproducibility. Default 0.
         log_dir: Directory for saving logs (optional).
-        tracking_callback: Optional callback function called after each candidate
-            evaluation with (candidate_dict, average_score).
-        detailed_tracking_callback: Optional callback for per-row evaluation details.
 
     Returns:
         GEPAResult containing:
@@ -401,8 +391,6 @@ def optimize(
         model=model,
         original_ddl=original_ddl,
         temp_function_name=temp_function_name,
-        tracking_callback=tracking_callback,
-        detailed_tracking_callback=detailed_tracking_callback,
         file_type_params=file_type_params,
         stage_name=stage_name,
     )
@@ -421,6 +409,10 @@ def optimize(
             )
         )
 
+    # When run_dir is set, let GEPA create its own file-based logger inside
+    # the directory; passing our logger would skip GEPA's run_dir setup.
+    gepa_logger = None if log_dir else PythonLoggingAdapter(logger)
+
     return gepa_pkg.optimize(
         seed_candidate=seed_candidate,
         trainset=trainset,
@@ -435,9 +427,10 @@ def optimize(
         max_merge_invocations=max_merge_invocations,
         max_metric_calls=None,
         stop_callbacks=stop_callbacks,
-        logger=PythonLoggingAdapter(logger),
+        logger=gepa_logger,
         seed=seed,
         run_dir=log_dir,
+        cache_evaluation=cache_evaluation,
     )
 
 
@@ -467,441 +460,6 @@ def split_dataset(
         trainset = valset[: max(1, len(valset) // 3)]
 
     return valset, trainset
-
-
-def create_tracking_table(session: Session, tracking_table: str) -> None:
-    """Create the tracking table if it doesn't exist.
-
-    Uses CREATE TABLE IF NOT EXISTS to preserve history across optimization runs.
-    Each run is identified by RUN_ID.
-    """
-    session.sql(f"""
-        CREATE TABLE IF NOT EXISTS {tracking_table} (
-            RUN_ID VARCHAR,
-            FUNCTION_NAME VARCHAR,
-            MODEL_NAME VARCHAR,
-            CANDIDATE_INDEX INTEGER,
-            PROMPT_TEXT VARCHAR(16777216),
-            EVAL_TYPE VARCHAR,
-            METRIC_SCORE FLOAT,
-            NUM_EXAMPLES INTEGER,
-            IS_FULL_EVAL BOOLEAN,
-            CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-        )
-    """).collect()
-
-
-def _log_tracking_error(
-    session: Session,
-    table_name: str,
-    run_id: str,
-    model: str,
-    error_msg: str,
-    prompt_snippet: str,
-) -> None:
-    """Log tracking errors to {table_name}_ERRORS for debugging.
-
-    Creates the errors table if it doesn't exist, then inserts the error record.
-    This function is intentionally fault-tolerant - if error logging itself fails,
-    it silently continues to avoid cascading failures.
-    """
-    errors_table = f"{table_name}_ERRORS"
-    try:
-        session.sql(f"""
-            CREATE TABLE IF NOT EXISTS {errors_table} (
-                RUN_ID VARCHAR,
-                MODEL_NAME VARCHAR,
-                ERROR_MESSAGE VARCHAR(16777216),
-                PROMPT_SNIPPET VARCHAR(500),
-                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-            )
-        """).collect()
-        session.sql(
-            f"""
-            INSERT INTO {errors_table} 
-            (RUN_ID, MODEL_NAME, ERROR_MESSAGE, PROMPT_SNIPPET)
-            VALUES (?, ?, ?, ?)
-        """,
-            params=[run_id, model, str(error_msg)[:500], prompt_snippet[:200]],
-        ).collect()
-    except Exception:
-        pass  # Don't fail if error logging itself fails
-
-
-class IncrementalTracker:
-    """Tracks candidates incrementally during optimization.
-
-    This class saves each candidate to the tracking table immediately after evaluation.
-    """
-
-    def __init__(
-        self,
-        session: Session,
-        table_name: str,
-        model: str,
-        run_id: str,
-        function_name: str,
-        valset_size: int,
-    ) -> None:
-        self.session = session
-        self.table_name = table_name
-        self.model = model
-        self.run_id = run_id
-        self.function_name = function_name
-        self.valset_size = valset_size
-        self.seen_prompts: set[str] = set()
-        self.candidate_index = 0
-
-    def track_candidate(
-        self, candidate: dict[str, str], score: float, num_examples: int
-    ) -> None:
-        """Save a single candidate to the tracking table immediately.
-
-        Args:
-            candidate: The candidate dict (e.g., {"instruction": "..."})
-            score: The evaluation score for this candidate
-            num_examples: Number of examples used in the evaluation
-        """
-        prompt = candidate.get("instruction", "")
-
-        # Skip duplicates (same prompt might be evaluated multiple times)
-        prompt_hash = hash(prompt)
-        if prompt_hash in self.seen_prompts:
-            return
-        self.seen_prompts.add(prompt_hash)
-
-        self.candidate_index += 1
-
-        # Mark as full eval if num_examples matches the validation set size
-        is_full_eval = num_examples == self.valset_size
-
-        self.session.sql(
-            f"""
-            INSERT INTO {self.table_name} 
-            (RUN_ID, FUNCTION_NAME, MODEL_NAME, CANDIDATE_INDEX, 
-             PROMPT_TEXT, EVAL_TYPE, METRIC_SCORE, NUM_EXAMPLES, IS_FULL_EVAL)
-            VALUES (?, ?, ?, ?, ?, 'incremental', ?, ?, ?)
-        """,
-            params=[
-                self.run_id,
-                self.function_name,
-                self.model,
-                self.candidate_index,
-                prompt,
-                score,
-                num_examples,
-                is_full_eval,
-            ],
-        ).collect()
-
-
-def create_detailed_tracking_table(session: Session, table_name: str) -> None:
-    """Create table for per-row evaluation details.
-
-    This table stores detailed information about each evaluation for debugging
-    GEPA optimization runs. Each row represents one input/output pair evaluated.
-    """
-    session.sql(f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            RUN_ID VARCHAR,
-            FUNCTION_NAME VARCHAR,
-            MODEL_NAME VARCHAR,
-            CANDIDATE_IDX INTEGER,
-            PROMPT_TEXT VARCHAR(16777216),
-            ROW_IDX INTEGER,
-            INPUT_TEXT VARCHAR(16777216),
-            EXPECTED VARCHAR(16777216),
-            PREDICTED VARCHAR(16777216),
-            METRIC_SCORE FLOAT,
-            METRIC_FEEDBACK VARCHAR(16777216),
-            SPLIT VARCHAR,
-            EVAL_TYPE VARCHAR,
-            CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-        )
-    """).collect()
-
-
-class DetailedTracker:
-    """Tracks per-row evaluation details during optimization.
-
-    This class saves detailed information about each evaluation row, including
-    input, expected output, predicted output, and metric feedback. Useful for
-    debugging why prompts are scoring poorly.
-
-    Uses batched inserts - accumulates rows in memory and flushes when the
-    prompt changes (i.e., per candidate) to minimize INSERT overhead.
-    """
-
-    def __init__(
-        self,
-        session: Session,
-        table_name: str,
-        model: str,
-        run_id: str,
-        function_name: str,
-        split: str = "valset",
-    ) -> None:
-        self.session = session
-        self.table_name = table_name
-        self.model = model
-        self.run_id = run_id
-        self.function_name = function_name
-        self.split = split
-        self.candidate_idx = 0
-        self.current_prompt_hash: int | None = None
-        self.pending_rows: list[TrackingDetail] = []  # Batch accumulator
-
-    def track_detail(self, detail: TrackingDetail) -> None:
-        """Save a single row's evaluation detail.
-
-        Rows are batched in memory and flushed when the prompt changes.
-
-        Args:
-            detail: Dict with keys: row_idx, prompt_text, input_text, expected,
-                    predicted, metric_score, metric_feedback
-        """
-        prompt_text = detail.get("prompt_text", "")
-        prompt_hash = hash(prompt_text)
-
-        # Flush pending rows when prompt changes (new candidate)
-        if prompt_hash != self.current_prompt_hash:
-            self._flush_batch()
-            self.current_prompt_hash = prompt_hash
-            self.candidate_idx += 1
-
-        # Add to batch
-        self.pending_rows.append(
-            {
-                "prompt_text": prompt_text,
-                "row_idx": detail.get("row_idx", 0),
-                "input_text": detail.get("input_text", ""),
-                "expected": detail.get("expected", ""),
-                "predicted": detail.get("predicted", ""),
-                "metric_score": detail.get("metric_score", 0),
-                "metric_feedback": detail.get("metric_feedback", ""),
-            }
-        )
-
-    def _flush_batch(self) -> None:
-        """Flush all pending rows to the database in a single INSERT."""
-        if not self.pending_rows:
-            return
-
-        # Build parameterized batch INSERT with bind variables.
-        value_qmarks = []
-        bind_params: list[object] = []
-        for row in self.pending_rows:
-            prompt_text = (
-                str(row["prompt_text"]) if row["prompt_text"] is not None else ""
-            )
-            input_text = str(row["input_text"]) if row["input_text"] is not None else ""
-            expected = str(row["expected"]) if row["expected"] is not None else ""
-            predicted = str(row["predicted"]) if row["predicted"] is not None else ""
-            feedback = (
-                str(row["metric_feedback"])
-                if row["metric_feedback"] is not None
-                else ""
-            )
-
-            value_qmarks.append("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'incremental')")
-            bind_params.extend(
-                [
-                    self.run_id,
-                    self.function_name,
-                    self.model,
-                    self.candidate_idx,
-                    prompt_text,
-                    row["row_idx"],
-                    input_text,
-                    expected,
-                    predicted,
-                    row["metric_score"],
-                    feedback,
-                    self.split,
-                ]
-            )
-
-        values_clause = ", ".join(value_qmarks)
-
-        self.session.sql(
-            f"""
-            INSERT INTO {self.table_name}
-            (RUN_ID, FUNCTION_NAME, MODEL_NAME,
-             CANDIDATE_IDX, PROMPT_TEXT, ROW_IDX,
-             INPUT_TEXT, EXPECTED, PREDICTED, METRIC_SCORE, METRIC_FEEDBACK,
-             SPLIT, EVAL_TYPE)
-            VALUES {values_clause}
-        """,
-            params=bind_params,
-        ).collect()
-        self.pending_rows = []
-
-    def flush(self) -> None:
-        """Public method to flush any remaining rows at end of optimization."""
-        self._flush_batch()
-
-
-def save_tracking(
-    session: Session,
-    table_name: str,
-    result: GEPAResult,
-    model: str,
-    run_id: str,
-    function_name: str,
-    valset_size: int | None = None,
-) -> None:
-    """Save final optimization results to a tracking table.
-
-    Inserts final summary rows for each candidate with eval_type='final'.
-    Called at the end of optimization.
-    """
-    # Insert final summary rows with eval_type='final'
-    for idx, candidate in enumerate(result.candidates):
-        prompt = candidate.get("instruction", "")
-        score = (
-            result.val_aggregate_scores[idx]
-            if idx < len(result.val_aggregate_scores)
-            else None
-        )
-
-        # Use parameterized query — bind variables keep data out of the SQL parser.
-        score_val = score if score is not None else None
-        num_examples_val = valset_size if valset_size is not None else None
-
-        try:
-            session.sql(
-                f"""
-                INSERT INTO {table_name} 
-                (RUN_ID, FUNCTION_NAME, MODEL_NAME, CANDIDATE_INDEX, 
-                 PROMPT_TEXT, EVAL_TYPE, METRIC_SCORE, NUM_EXAMPLES, IS_FULL_EVAL)
-                VALUES (?, ?, ?, ?, ?, 'final', ?, ?, TRUE)
-            """,
-                params=[
-                    run_id,
-                    function_name,
-                    model,
-                    idx,
-                    prompt,
-                    score_val,
-                    num_examples_val,
-                ],
-            ).collect()
-        except Exception:
-            pass  # Don't fail if tracking insert fails
-
-
-def create_opt_results_table(session: Session, results_table: str) -> None:
-    """Create the optimization results table if it doesn't exist.
-
-    Stores per-model summary results (seed and optimized) for each optimization run.
-    Modeled after the eval results table pattern.
-    """
-    session.sql(f"""
-        CREATE TABLE IF NOT EXISTS {results_table} (
-            RUN_ID VARCHAR,
-            FUNCTION_NAME VARCHAR,
-            MODEL_NAME VARCHAR,
-            EVAL_TYPE VARCHAR,
-            PROMPT_TEXT VARCHAR(16777216),
-            TEST_SCORE FLOAT,
-            VAL_SCORE FLOAT,
-            NUM_TEST_EXAMPLES INTEGER,
-            NUM_VAL_EXAMPLES INTEGER,
-            TOTAL_CANDIDATES INTEGER,
-            TOTAL_METRIC_CALLS INTEGER,
-            TOTAL_REFLECTION_CALLS INTEGER,
-            ELAPSED_SECONDS FLOAT,
-            REFLECTION_MODEL VARCHAR,
-            CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-        )
-    """).collect()
-
-
-def save_opt_results(
-    session: Session,
-    results_table: str,
-    run_id: str,
-    function_name: str,
-    model_results: list[dict],
-    seed_prompt: str,
-    valset_size: int,
-) -> None:
-    """Save optimization results to the results table.
-
-    Writes two rows per model: one for the seed prompt and one for the best
-    optimized prompt, with both validation and test scores.
-    """
-    for model_output in model_results:
-        if model_output.get("status") != "completed":
-            continue
-
-        model = model_output["model"]
-        reflection_model = model_output.get("reflection_model", "")
-        elapsed = model_output.get("elapsed_seconds", 0)
-        total_candidates = model_output.get("total_candidates", 0)
-        total_metric_calls = model_output.get("total_metric_calls", 0)
-        total_reflection_calls = model_output.get("total_reflection_calls", 0)
-        num_test = model_output.get("num_test_examples")
-
-        # Seed row
-        try:
-            session.sql(
-                f"""
-                INSERT INTO {results_table}
-                (RUN_ID, FUNCTION_NAME, MODEL_NAME, EVAL_TYPE, PROMPT_TEXT,
-                 TEST_SCORE, VAL_SCORE, NUM_TEST_EXAMPLES, NUM_VAL_EXAMPLES,
-                 TOTAL_CANDIDATES, TOTAL_METRIC_CALLS, TOTAL_REFLECTION_CALLS,
-                 ELAPSED_SECONDS, REFLECTION_MODEL)
-                VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                params=[
-                    run_id,
-                    function_name,
-                    model,
-                    seed_prompt,
-                    model_output.get("seed_test_score"),
-                    model_output.get("seed_val_score"),
-                    num_test,
-                    valset_size,
-                    total_candidates,
-                    total_metric_calls,
-                    total_reflection_calls,
-                    elapsed,
-                    reflection_model,
-                ],
-            ).collect()
-        except Exception:
-            pass
-
-        # Optimized row
-        try:
-            session.sql(
-                f"""
-                INSERT INTO {results_table}
-                (RUN_ID, FUNCTION_NAME, MODEL_NAME, EVAL_TYPE, PROMPT_TEXT,
-                 TEST_SCORE, VAL_SCORE, NUM_TEST_EXAMPLES, NUM_VAL_EXAMPLES,
-                 TOTAL_CANDIDATES, TOTAL_METRIC_CALLS, TOTAL_REFLECTION_CALLS,
-                 ELAPSED_SECONDS, REFLECTION_MODEL)
-                VALUES (?, ?, ?, 'optimized', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                params=[
-                    run_id,
-                    function_name,
-                    model,
-                    model_output.get("best_prompt", ""),
-                    model_output.get("best_test_score"),
-                    model_output.get("best_val_score"),
-                    num_test,
-                    valset_size,
-                    total_candidates,
-                    total_metric_calls,
-                    total_reflection_calls,
-                    elapsed,
-                    reflection_model,
-                ],
-            ).collect()
-        except Exception:
-            pass
 
 
 def _extract_balanced_paren_content(text: str) -> str:
@@ -988,7 +546,6 @@ def get_function_ddl(
     return ddl
 
 
-
 def extract_prompt_from_ddl_string(ddl: str, function_name: str = "") -> str:
     """Extract the system prompt from a raw DDL string.
 
@@ -1009,7 +566,6 @@ def extract_prompt_from_ddl_string(ddl: str, function_name: str = "") -> str:
         )
 
     return match.group(1).replace("''", "'")
-
 
 
 def extract_model_from_ddl_string(ddl: str, function_name: str = "") -> str:
@@ -1033,11 +589,6 @@ def extract_model_from_ddl_string(ddl: str, function_name: str = "") -> str:
     return match.group(1)
 
 
-
-
-
-
-
 def _run_single_model_optimization(
     model: str,
     session: Session,
@@ -1052,246 +603,214 @@ def _run_single_model_optimization(
     max_tokens: int,
     function_name: str,
     input_columns: list,
-    tracking_table: str,
+    results_table: str,
     test_table: str,
     label_column: str,
     expected_columns: list[str] | None,
     seed_prompt: str,
     run_id: str,
-    enable_detailed_tracking: bool = False,
     aggregation_metric: str | None = None,
     original_ddl: str = "",
     file_type_params: list[str] | None = None,
     stage_name: str | None = None,
+    experiment_name: str | None = None,
 ) -> dict:
-    """Run optimization for a single model. Designed to be called in parallel.
-
-    Args:
-        model: Model name to optimize with
-        session: Snowpark session (thread-safe for reads)
-        seed_candidate: Initial candidate
-        trainset: Training examples
-        valset: Validation examples
-        evaluator: Evaluation function
-        resolved_budget: Pre-calculated budget
-        reflection_call_weight: Weight of one reflection call vs one metric call
-        reflection_model: Reflection model name
-        temperature: LLM temperature
-        max_tokens: Max tokens
-        function_name: Fully qualified name of the function being optimized
-        input_columns: Input column names
-        tracking_table: Table for tracking results
-        test_table: Optional test table for final evaluation
-        label_column: Label column name
-        expected_columns: Optional expected output columns for object-level eval
-        seed_prompt: Original seed prompt
-        run_id: Unique identifier for this optimization run
-        enable_detailed_tracking: If True, log per-row evaluation details to
-            {tracking_table}_DETAILS for debugging. Off by default for performance.
-
-    Returns:
-        Dict with model results
-    """
+    """Run optimization for a single model. Designed to be called in parallel."""
     model_start_time = time.time()
 
-    # Set up incremental tracking for this model
-    tracking_callback = None
-    detailed_tracking_callback = None
-    detailed_tracker = None
-    if tracking_table:
-        tracker = IncrementalTracker(
-            session,
-            tracking_table,
-            model,
-            run_id,
-            function_name,
-            valset_size=len(valset),
-        )
-        tracking_callback = tracker.track_candidate
-
-        # Set up detailed tracking table (appends _DETAILS to tracking table name)
-        # Only enabled when explicitly requested for debugging
-        if enable_detailed_tracking:
-            detailed_table = f"{tracking_table}_DETAILS"
-            create_detailed_tracking_table(session, detailed_table)
-            detailed_tracker = DetailedTracker(
-                session, detailed_table, model, run_id, function_name
-            )
-            detailed_tracking_callback = detailed_tracker.track_detail
-
-    temp_fn = build_temp_function_name(function_name, "__OPT_TEMP")
-
-    reflection_lm = SnowflakeLLM(
-        session=session,
-        model=reflection_model or model,
-        temperature=temperature,
-        max_tokens=max_tokens,
+    log_dir_ctx = (
+        tempfile.TemporaryDirectory(prefix="gepa_prompt_")
+        if experiment_name
+        else contextlib.nullcontext(None)
     )
 
-    try:
-        result = optimize(
-            seed_candidate=seed_candidate,
-            trainset=trainset,
-            evaluator=evaluator,
+    with log_dir_ctx as gepa_log_dir:
+        temp_fn = build_temp_function_name(function_name, "__OPT_TEMP")
+
+        reflection_lm = SnowflakeLLM(
             session=session,
-            valset=valset,
-            function_name=function_name,
-            input_columns=input_columns,
-            model=model,
-            reflection_model=reflection_model or model,
-            reflection_lm=reflection_lm,
-            max_metric_calls=resolved_budget,
-            reflection_call_weight=reflection_call_weight,
-            original_ddl=original_ddl,
-            temp_function_name=temp_fn,
-            no_improvement_patience=None,
-            tracking_callback=tracking_callback,
-            detailed_tracking_callback=detailed_tracking_callback,
-            file_type_params=file_type_params,
-            stage_name=stage_name,
+            model=reflection_model or model,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
 
-        if tracking_table:
-            # Final save for this model
-            save_tracking(
-                session,
-                tracking_table,
-                result,
-                model,
-                run_id,
-                function_name,
-                valset_size=len(valset),
-            )
-            # Flush any remaining detailed tracking rows
-            if detailed_tracker is not None:
-                detailed_tracker.flush()
-
-        model_elapsed = round(time.time() - model_start_time, 2)
-
-        best_val_score = (
-            result.val_aggregate_scores[result.best_idx]
-            if result.val_aggregate_scores
-            else None
-        )
-        seed_val_score = (
-            result.val_aggregate_scores[0] if result.val_aggregate_scores else None
-        )
-
-        best_prompt_raw = result.best_candidate.get("instruction", "")
-
-        total_reflection_calls = reflection_lm.call_count
-        model_output = {
-            "model": model,
-            "status": "completed",
-            "elapsed_seconds": model_elapsed,
-            "best_prompt": best_prompt_raw,
-            "best_val_score": best_val_score,
-            "seed_val_score": seed_val_score,
-            "total_candidates": len(result.candidates),
-            "total_metric_calls": result.total_metric_calls,
-            "total_reflection_calls": total_reflection_calls,
-            "all_val_scores": result.val_aggregate_scores,
-            "reflection_model": reflection_model or model,
-        }
-
-        subscores = getattr(result, "val_aggregate_subscores", None) or []
-        if (
-            subscores
-            and result.best_idx < len(subscores)
-            and subscores[result.best_idx]
-        ):
-            model_output["best_val_subscores"] = subscores[result.best_idx]
-
-        # Test set evaluation using temp functions.
-        # Uses binary scoring so results match standalone EVALUATE_AI_FUNCTION.
-        if test_table and original_ddl:
-            eval_metric_options = (
-                dict(evaluator.kwargs) if hasattr(evaluator, "kwargs") else {}
-            )
-            if evaluator.metric_name == "llm_judge":
-                eval_metric_options["scoring_mode"] = "binary"
-            if expected_columns:
-                eval_metric_options["expected_columns"] = expected_columns
-
-            test_temp_fn = build_temp_function_name(function_name, "__OPT_TEST")
-
-            # Evaluate seed: create temp function with seed model+prompt
-            seedInst = TempAIFunction(
+        try:
+            result = optimize(
+                seed_candidate=seed_candidate,
+                trainset=trainset,
+                evaluator=evaluator,
                 session=session,
-                original_ddl=original_ddl,
-                temp_function_name=test_temp_fn,
-                candidate_model=model,
-                candidate_prompt=seed_prompt,
-            )
-            seed_test_score = evaluate(
-                session=session,
-                function_name=test_temp_fn,
-                test_table=test_table,
+                valset=valset,
+                function_name=function_name,
                 input_columns=input_columns,
-                label_column=label_column,
-                metric_name=evaluator.metric_name,
-                custom_metric_udf=evaluator.custom_metric_udf,
-                metric_options=eval_metric_options,
-                model_name=model,
-                executor=seedInst.call_rows,
-            )
-
-            # Evaluate best: create temp function with best model+prompt
-            bestInst = TempAIFunction(
-                session=session,
+                model=model,
+                reflection_model=reflection_model or model,
+                reflection_lm=reflection_lm,
+                max_metric_calls=resolved_budget,
+                reflection_call_weight=reflection_call_weight,
                 original_ddl=original_ddl,
-                temp_function_name=test_temp_fn,
-                candidate_model=model,
-                candidate_prompt=result.best_candidate["instruction"],
-            )
-            best_test_score = evaluate(
-                session=session,
-                function_name=test_temp_fn,
-                test_table=test_table,
-                input_columns=input_columns,
-                label_column=label_column,
-                metric_name=evaluator.metric_name,
-                custom_metric_udf=evaluator.custom_metric_udf,
-                metric_options=eval_metric_options,
-                model_name=model,
-                executor=bestInst.call_rows,
+                temp_function_name=temp_fn,
+                no_improvement_patience=None,
+                file_type_params=file_type_params,
+                stage_name=stage_name,
+                log_dir=gepa_log_dir,
             )
 
-            model_output["seed_test_score"] = seed_test_score
-            model_output["best_test_score"] = best_test_score
-            test_count = session.sql(
-                f"SELECT COUNT(*) FROM {test_table}"
-            ).collect()[0][0]
-            model_output["num_test_examples"] = test_count
+            model_elapsed = round(time.time() - model_start_time, 2)
 
-        return model_output
-
-    except (ValueError, json.JSONDecodeError):
-        # Parsing/validation errors - re-raise to fail fast for debugging
-        raise
-
-    except Exception as e:
-        model_elapsed = round(time.time() - model_start_time, 2)
-        error_msg = str(e)
-        print(f"[OPTIMIZATION_ERROR] {model}: {error_msg}")
-
-        # Log the error to tracking errors table
-        if tracking_table:
-            _log_tracking_error(
-                session,
-                tracking_table,
-                run_id,
-                model,
-                error_msg,
-                seed_prompt[:200] if seed_prompt else "N/A",
+            best_val_score = (
+                result.val_aggregate_scores[result.best_idx]
+                if result.val_aggregate_scores
+                else None
+            )
+            seed_val_score = (
+                result.val_aggregate_scores[0] if result.val_aggregate_scores else None
             )
 
-        return {
-            "model": model,
-            "status": "failed",
-            "error": error_msg,
-            "elapsed_seconds": model_elapsed,
-        }
+            best_prompt_raw = result.best_candidate.get("instruction", "")
+
+            model_output = {
+                "model": model,
+                "status": "completed",
+                "elapsed_seconds": model_elapsed,
+                "best_prompt": best_prompt_raw,
+                "best_val_score": best_val_score,
+                "seed_val_score": seed_val_score,
+                "total_candidates": len(result.candidates),
+                "total_metric_calls": result.total_metric_calls,
+                "total_reflection_calls": reflection_lm.call_count,
+                "reflection_model": reflection_model or model,
+            }
+
+            # Test set evaluation using temp functions.
+            # Uses binary scoring so results match standalone EVALUATE_AI_FUNCTION.
+            if test_table and original_ddl:
+                eval_metric_options = (
+                    dict(evaluator.kwargs) if hasattr(evaluator, "kwargs") else {}
+                )
+                if evaluator.metric_name == "llm_judge":
+                    eval_metric_options["scoring_mode"] = "binary"
+                if expected_columns:
+                    eval_metric_options["expected_columns"] = expected_columns
+
+                test_temp_fn = build_temp_function_name(function_name, "__OPT_TEST")
+
+                seedInst = TempAIFunction(
+                    session=session,
+                    original_ddl=original_ddl,
+                    temp_function_name=test_temp_fn,
+                    candidate_model=model,
+                    candidate_prompt=seed_prompt,
+                )
+                seed_test_score = evaluate(
+                    session=session,
+                    function_name=test_temp_fn,
+                    test_table=test_table,
+                    input_columns=input_columns,
+                    label_column=label_column,
+                    metric_name=evaluator.metric_name,
+                    custom_metric_udf=evaluator.custom_metric_udf,
+                    metric_options=eval_metric_options,
+                    model_name=model,
+                    executor=seedInst.call_rows,
+                    results_table=results_table,
+                    run_id=run_id,
+                )
+
+                bestInst = TempAIFunction(
+                    session=session,
+                    original_ddl=original_ddl,
+                    temp_function_name=test_temp_fn,
+                    candidate_model=model,
+                    candidate_prompt=result.best_candidate["instruction"],
+                )
+                best_test_score = evaluate(
+                    session=session,
+                    function_name=test_temp_fn,
+                    test_table=test_table,
+                    input_columns=input_columns,
+                    label_column=label_column,
+                    metric_name=evaluator.metric_name,
+                    custom_metric_udf=evaluator.custom_metric_udf,
+                    metric_options=eval_metric_options,
+                    model_name=model,
+                    executor=bestInst.call_rows,
+                    results_table=results_table,
+                    run_id=run_id,
+                )
+
+                model_output["seed_test_score"] = seed_test_score
+                model_output["best_test_score"] = best_test_score
+                test_count = session.sql(
+                    f"SELECT COUNT(*) FROM {test_table}"
+                ).collect()[0][0]
+                model_output["num_test_examples"] = test_count
+
+            # Unified scores: prefer test scores when available, else validation.
+            if "seed_test_score" in model_output:
+                model_output["seed_score"] = model_output["seed_test_score"]
+                model_output["best_score"] = model_output["best_test_score"]
+                model_output["score_source"] = "test"
+            else:
+                model_output["seed_score"] = seed_val_score
+                model_output["best_score"] = best_val_score
+                model_output["score_source"] = "validation"
+
+            if experiment_name:
+                candidates_text = [
+                    c.get("instruction", "") if isinstance(c, dict) else str(c)
+                    for c in result.candidates
+                ]
+                num_summary_examples = model_output.get("num_test_examples", len(valset))
+                save_optimization_to_experiment(
+                    session, experiment_name,
+                    function_name=function_name,
+                    model=model,
+                    seed_prompt=seed_prompt,
+                    best_prompt=best_prompt_raw,
+                    candidates=candidates_text,
+                    val_scores=result.val_aggregate_scores,
+                    best_idx=result.best_idx,
+                    seed_val_score=seed_val_score,
+                    best_val_score=best_val_score,
+                    seed_test_score=model_output.get("seed_test_score"),
+                    best_test_score=model_output.get("best_test_score"),
+                    score_source=model_output["score_source"],
+                    num_examples=num_summary_examples,
+                    reflection_model=reflection_model or model,
+                    total_candidates=len(result.candidates),
+                    total_metric_calls=result.total_metric_calls,
+                    total_reflection_calls=reflection_lm.call_count,
+                    elapsed_seconds=model_elapsed,
+                    run_dir=gepa_log_dir,
+                )
+
+            return model_output
+
+        except (ValueError, json.JSONDecodeError):
+            raise
+
+        except Exception as e:
+            model_elapsed = round(time.time() - model_start_time, 2)
+            error_msg = str(e)
+            print(f"[OPTIMIZATION_ERROR] {model}: {error_msg}")
+
+            if experiment_name:
+                save_failed_run_to_experiment(
+                    session, experiment_name,
+                    function_name=function_name,
+                    model=model,
+                    error_message=error_msg,
+                    prompt_snippet=seed_prompt[:200] if seed_prompt else "N/A",
+                    elapsed_seconds=model_elapsed,
+                )
+
+            return {
+                "model": model,
+                "status": "failed",
+                "error": error_msg,
+                "elapsed_seconds": model_elapsed,
+            }
 
 
 @with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc()
@@ -1306,19 +825,19 @@ def run_optimization(
     models: list,
     reflection_model: str,
     test_table: str = None,
-    auto_budget: Literal["light", "medium", "heavy"] = DEFAULT_AUTO_BUDGET,
-    tracking_table: str = None,
+    auto_budget: Literal["demo", "light", "medium", "heavy"] = DEFAULT_AUTO_BUDGET,
     results_table: str = None,
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     metric_options: dict = None,
     custom_metric_udf: str = None,
-    enable_detailed_tracking: bool = False,
     run_id: str = None,
     aggregation_metric: str | None = None,
+    optimize_mode: str = "body",
+    experiment_name: str | None = None,
 ) -> dict:
-    """Run GEPA optimization on a prompt. SPROC handler function.
+    """Run GEPA optimization on an AI function. SPROC handler function.
 
     The training_table data is split into:
     - valset (validation_fraction, default 2/3): Used for scoring candidates
@@ -1338,7 +857,9 @@ def run_optimization(
         reflection_model: Model for reflection (required)
         test_table: Optional held-out test table for final evaluation only
         auto_budget: Budget preset - "light", "medium", or "heavy"
-        tracking_table: Optional table to save optimization history
+        results_table: Optional table to save per-row test-set evaluation results.
+            Only used when test_table is also provided. Writes seed and best
+            eval details using the same schema as EVALUATE_AI_FUNCTION.
         validation_fraction: Fraction of training data for validation (default 0.667 = 2/3)
         temperature: LLM sampling temperature. Default 0.0.
         max_tokens: Maximum tokens in LLM response. Default 8192.
@@ -1348,17 +869,45 @@ def run_optimization(
             (e.g., ``DB.SCHEMA.MY_METRIC``). The UDF must accept
             ``(EXPECTED VARCHAR, PREDICTED VARCHAR)`` and return VARIANT
             with ``score`` and ``feedback`` keys.
-        enable_detailed_tracking: If True, log per-row evaluation details to
-            {tracking_table}_DETAILS for debugging. Off by default for performance.
         run_id: Unique identifier for this optimization run. Auto-generated if not provided.
         aggregation_metric: Optional batch-level classification metric to use for
-            selecting the best prompt. Supported: "accuracy", "f1-score". When provided,
-            the final best prompt is chosen by the highest value of this metric
-            across all candidates.
+            selecting the best candidate. Supported: "accuracy", "f1-score". When
+            provided, the final best candidate is chosen by the highest value of
+            this metric across all candidates.
+        optimize_mode: Optimization strategy. ``"body"`` (default) optimises
+            the entire SQL function body using ``optimize_anything``.
+            ``"prompt"`` optimises only the system prompt.
+        experiment_name: If provided, optimization results are persisted to a
+            Snowflake Experiment object.
 
     Returns:
-        Dict with optimization results including best_prompt and scores for each model
+        Dict with optimization results including best candidate and scores for each model
     """
+    if optimize_mode == "body":
+        from snow_gepa_optimize_anything import run_body_optimization
+
+        return run_body_optimization(
+            session=session,
+            function_name=function_name,
+            training_table=training_table,
+            label_column=label_column,
+            input_columns=input_columns,
+            metric_name=metric_name,
+            models=models,
+            reflection_model=reflection_model,
+            test_table=test_table,
+            auto_budget=auto_budget,
+            results_table=results_table,
+            validation_fraction=validation_fraction,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            metric_options=metric_options,
+            custom_metric_udf=custom_metric_udf,
+            run_id=run_id,
+            aggregation_metric=aggregation_metric,
+            experiment_name=experiment_name,
+        )
+
     start_time = time.time()
 
     if not run_id:
@@ -1377,7 +926,9 @@ def run_optimization(
     try:
         original_ddl = get_function_ddl(session, function_name, unescape=False)
         seed_prompt = extract_prompt_from_ddl_string(original_ddl, function_name)
-        seed_model = extract_model_from_ddl_string(original_ddl, function_name)
+        extract_model_from_ddl_string(
+            original_ddl, function_name
+        )  # validate model exists
     except ValueError as e:
         return {"error": str(e), "status": "failed"}
 
@@ -1510,9 +1061,8 @@ def run_optimization(
 
     seed_candidate = {"instruction": seed_prompt}
 
-    # Create tracking table once at the start (clears previous data)
-    if tracking_table:
-        create_tracking_table(session, tracking_table)
+    if experiment_name:
+        create_gepa_experiment(session, experiment_name)
 
     # Calculate budget once upfront - same budget for ALL models
     # This ensures consistent budget across all models regardless of run order
@@ -1533,6 +1083,7 @@ def run_optimization(
     # This significantly speeds up multi-model optimization
     model_results = []
     overall_best_score = -1
+    overall_best_score_source = "validation"
     overall_best_model = None
     overall_best_prompt = seed_prompt
 
@@ -1559,41 +1110,39 @@ def run_optimization(
                 max_tokens=max_tokens,
                 function_name=function_name,
                 input_columns=input_columns,
-                tracking_table=tracking_table,
+                results_table=results_table,
                 test_table=test_table,
                 label_column=label_column,
                 expected_columns=dataset_expected_columns,
                 seed_prompt=seed_prompt,
                 run_id=run_id,
-                enable_detailed_tracking=enable_detailed_tracking,
                 aggregation_metric=aggregation_metric,
                 original_ddl=original_ddl,
                 file_type_params=file_type_params,
                 stage_name=file_stage_name,
+                experiment_name=experiment_name,
             ): model
             for model in models
         }
 
-        # Collect results as they complete
         for future in as_completed(future_to_model):
             model = future_to_model[future]
             try:
                 model_output = future.result()
                 model_results.append(model_output)
 
-                # Track overall best
+                # Track overall best using unified score
                 if model_output.get("status") == "completed":
-                    best_val_score = model_output.get("best_val_score")
-                    if (
-                        best_val_score is not None
-                        and best_val_score > overall_best_score
-                    ):
-                        overall_best_score = best_val_score
+                    best_score = model_output.get("best_score")
+                    if best_score is not None and best_score > overall_best_score:
+                        overall_best_score = best_score
                         overall_best_model = model_output["model"]
                         overall_best_prompt = model_output["best_prompt"]
+                        overall_best_score_source = model_output.get(
+                            "score_source", "validation"
+                        )
 
             except Exception as e:
-                # This catches exceptions from future.result() itself
                 model_results.append(
                     {
                         "model": model,
@@ -1602,23 +1151,13 @@ def run_optimization(
                         "elapsed_seconds": 0,
                     }
                 )
-
-    # Persist optimization results if a results table was requested
-    if results_table:
-        try:
-            create_opt_results_table(session, results_table)
-            save_opt_results(
-                session=session,
-                results_table=results_table,
-                run_id=run_id,
-                function_name=function_name,
-                model_results=model_results,
-                seed_prompt=seed_prompt,
-                valset_size=len(valset),
-            )
-        except Exception:
-            # Results persistence failure should not break optimization
-            pass
+                if experiment_name:
+                    save_failed_run_to_experiment(
+                        session, experiment_name,
+                        function_name=function_name,
+                        model=model,
+                        error_message=f"Future execution error: {e}",
+                    )
 
     elapsed_seconds = round(time.time() - start_time, 2)
 
@@ -1629,19 +1168,12 @@ def run_optimization(
         "function_name": function_name,
         "seed_prompt": seed_prompt,
         "metric": metric_name,
-        "training_table": training_table,
-        "trainset_size": len(trainset),
-        "valset_size": len(valset),
-        "validation_fraction": validation_fraction,
-        "auto_budget": auto_budget,
-        "resolved_budget": resolved_budget,  # Same budget applied to all models
         "models": models,
         "model_results": model_results,
         "overall_best_model": overall_best_model,
         "overall_best_prompt": overall_best_prompt,
-        "overall_best_val_score": overall_best_score
-        if overall_best_score >= 0
-        else None,
+        "overall_best_score": overall_best_score if overall_best_score >= 0 else None,
+        "overall_best_score_source": overall_best_score_source,
     }
 
     if aggregation_metric:
@@ -1649,9 +1181,6 @@ def run_optimization(
 
     if dataset_expected_columns:
         output["expected_columns"] = dataset_expected_columns
-
-    if test_table:
-        output["test_table"] = test_table
 
     # Clean up async task if this was called from one (run_id matches task name)
     if run_id and run_id.startswith("ai_func_opt_"):
@@ -1664,4 +1193,3 @@ def run_optimization(
             pass  # Cleanup failure should not break optimization
 
     return output
-

@@ -102,6 +102,10 @@ def main(
     train: int = 300,
     test: int = 200,
     seed: int = 42,
+    language: str | None = None,
+    max_length: int | None = None,
+    train_table: str = "DEMO_TOXICITY_TRAIN",
+    test_table: str = "DEMO_TOXICITY_TEST",
 ) -> None:
     """Load dataset, sample balanced data, and create Snowflake tables.
 
@@ -116,12 +120,31 @@ def main(
         train: Number of training rows.
         test: Number of test rows.
         seed: Random seed for reproducibility.
+        language: Optional ISO language code filter (e.g., "en"). Case-insensitive.
+        max_length: Optional max character length filter for text samples.
+        train_table: Name for the training table.
+        test_table: Name for the test table.
     """
     logger.info("Loading FredZhang7/toxi-text-3M dataset...")
     dataset = datasets.load_dataset("FredZhang7/toxi-text-3M")
     df = dataset["train"].to_pandas()
 
     logger.info(f"Full dataset size: {len(df)} rows")
+
+    # Optional language filter
+    if language:
+        df = df[df["lang"].str.lower() == language.lower()]
+        logger.info(f"Filtered to language '{language}': {len(df)} rows")
+        if len(df) == 0:
+            raise ValueError(
+                f"No rows found for language '{language}'. "
+                f"Check the ISO code (e.g., 'en', 'fr', 'de', 'ar')."
+            )
+
+    # Optional max length filter
+    if max_length:
+        df = df[df["text"].str.len() <= max_length]
+        logger.info(f"Filtered to max length {max_length}: {len(df)} rows")
 
     # Map integer labels to string labels
     df["label"] = df["is_toxic"].apply(is_toxic_to_label)
@@ -180,19 +203,21 @@ def main(
     )
 
     try:
-        create_table(conn, database, schema, "DEMO_TOXICITY_TRAIN")
-        insert_data(conn, database, schema, "DEMO_TOXICITY_TRAIN", train_upload)
+        create_table(conn, database, schema, train_table)
+        insert_data(conn, database, schema, train_table, train_upload)
 
-        create_table(conn, database, schema, "DEMO_TOXICITY_TEST")
-        insert_data(conn, database, schema, "DEMO_TOXICITY_TEST", test_upload)
+        if test_rows > 0:
+            create_table(conn, database, schema, test_table)
+            insert_data(conn, database, schema, test_table, test_upload)
 
         logger.info("Done!")
         logger.info(
-            f"  Training table: {database}.{schema}.DEMO_TOXICITY_TRAIN ({len(train_upload)} rows)"
+            f"  Training table: {database}.{schema}.{train_table} ({len(train_upload)} rows)"
         )
-        logger.info(
-            f"  Test table: {database}.{schema}.DEMO_TOXICITY_TEST ({len(test_upload)} rows)"
-        )
+        if test_rows > 0:
+            logger.info(
+                f"  Test table: {database}.{schema}.{test_table} ({len(test_upload)} rows)"
+            )
     finally:
         conn.close()
 
@@ -237,6 +262,30 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Optional ISO language code filter, e.g. 'en', 'fr', 'de' (case-insensitive)",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=None,
+        help="Optional max character length filter for text samples",
+    )
+    parser.add_argument(
+        "--train-table",
+        type=str,
+        default="DEMO_TOXICITY_TRAIN",
+        help="Name for the training table (default: DEMO_TOXICITY_TRAIN)",
+    )
+    parser.add_argument(
+        "--test-table",
+        type=str,
+        default="DEMO_TOXICITY_TEST",
+        help="Name for the test table (default: DEMO_TOXICITY_TEST)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -250,4 +299,8 @@ if __name__ == "__main__":
         train=args.train,
         test=args.test,
         seed=args.seed,
+        language=args.language,
+        max_length=args.max_length,
+        train_table=args.train_table,
+        test_table=args.test_table,
     )

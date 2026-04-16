@@ -22,10 +22,10 @@ Load from main skill when user intent matches EVALUATE: "evaluate", "test", "mea
 | `input_columns` | Yes | - | **Yes** | test_table |
 | `label_column` | Yes | - | **Yes** | test_table |
 | `sample_size` | No | all | No | - |
-| `metric` | Yes | - | **Yes** | - |
+| `metric_name` | Yes | - | **Yes** | - |
 | `results_table` | No | (generated) | No | function_name |
 
-**Critical fields** (always confirm even if pre-provided): `input_columns`, `label_column`, `metric`
+**Critical fields** (always confirm even if pre-provided): `input_columns`, `label_column`, `metric_name`
 
 **Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `sample_size`, `results_table`
 
@@ -139,8 +139,6 @@ Note: The metric is selected at runtime when calling the SPROC, not at creation 
 
 ### Step 4: Run Evaluation
 
-**MANDATORY**: Wrap the SPROC `CALL ...` in the query tag wrapper from `references/query_tag.md` (set/restore `QUERY_TAG`). The agent MUST inject its local `CORTEX_SESSION_ID` into the wrapper and record it under the canonical key `__CUSTOM_AI_FUNCTION_CORTEX_SESSION_ID` (merge into JSON tags when possible; otherwise append to string tags). **You MUST reproduce the full wrapper SQL from `references/query_tag.md` verbatim** — including `CURRENT_QUERY_TAG()`, `TRY_PARSE_JSON`, `OBJECT_INSERT`, and both `ALTER SESSION SET QUERY_TAG` statements (set and restore). Do NOT simplify or abbreviate the wrapper. The agent MUST also inline the actual `CORTEX_SESSION_ID` value as a string literal — do NOT leave ANY placeholder such as `<CORTEX_SESSION_ID>`, `${CORTEX_SESSION_ID}`, `YOUR_SESSION_ID_HERE`, `YOUR_ACTUAL_SESSION_ID_HERE`, or similar. Look up the real session ID and substitute it directly into the SQL.
-
 **Load** `references/metrics.md` and present the metric selection prompt.
 
 **If user chooses "Create custom metric" (option 6):**
@@ -156,38 +154,24 @@ After custom metric creation completes, return to this step with the new metric 
 
 **Otherwise**, execute with the selected metric:
 
-#### Execution Mode Selection
+#### Execution Mode
 
-For large test datasets or complex metrics (especially `llm_judge`), evaluations can take several minutes. Ask the user:
+**Default to sync execution.** Use `timeout_seconds: 14400` (4 hours) to prevent the query from timing out. Async execution is available for large datasets (500+ rows) or complex metrics — only use it if the user explicitly requests it.
 
-```
-How would you like to run the evaluation?
+**Sync execution** (default): Runs directly and returns results via an anonymous stored procedure (no persistent objects). Python metrics code is inlined into the SPROC body.
 
-1. **Sync** (default)
-2. **Async** (recommended for large datasets) - Run in background, track with run_id
-```
-
-**If user selects Async**, ask about timeout:
-```
-The default async timeout is 4 hours (240 minutes).
-Would you like to use a different timeout?
-```
-If user provides a custom value, store as `timeout_minutes`. Otherwise use the default (240).
-
-**Sync execution** (default): Runs directly and returns results via an anonymous stored procedure (no persistent objects). Python metrics code is inlined into the SPROC body. Use `timeout_seconds: 14400` (4 hours) to prevent the query from timing out before completion.
-
-**Async execution**: Uses a Snowflake Task to run the evaluation in the background. The Task body contains the anonymous SPROC with inlined Python, so no named procedures are created and no stage upload is required.
+**Async execution** (only when explicitly requested): Uses a Snowflake Task to run the evaluation in the background. The Task body contains the anonymous SPROC with inlined Python, so no named procedures are created and no stage upload is required. If the user requests async, ask about timeout (default: 240 minutes).
 
 #### Running the Evaluation Script
 
 Run the evaluation script. It generates a `CALL EVALUATE_AI_FUNCTION(...)` stored procedure (anonymous SPROC) and executes it in a single Snowpark session. When showing SQL to users, always reference this `EVALUATE_AI_FUNCTION` SPROC name — do NOT invent manual SQL or alternative evaluation approaches. **Always pass every flag** — use `none` for unused optional parameters. For sync execution, use `timeout_seconds: 14400` (4 hours) to prevent the query from timing out.
 
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py evaluate \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/run.py evaluate \
     --database {database} \
     --schema {schema} \
     --connection <CONNECTION_NAME> \
-    --function-name {function_name} \
+    --function-name {database}.{schema}.{function_name} \
     --test-table {test_table} \
     --input-columns {input_col1} {input_col2} \
     --label-column {label_column} \
@@ -325,10 +309,10 @@ Present to user:
 ```
 Evaluation complete!
 
-**Recommended next step:** Optimize your function to improve its performance. The optimizer will automatically tune your system prompt and help you find the best model for your cost/quality tradeoffs.
+**Recommended next step:** Optimize your function to improve its performance. The optimizer will automatically tune the entire function body -- prompts, model references, and SQL pre/post-processing -- and help you find the best model for your cost/quality tradeoffs.
 
 What would you like to do?
-1. **Optimize** (recommended) - Improve the function through prompt tuning and model selection
+1. **Optimize** (recommended) - Improve the function through function body optimization and model selection
 2. **Done** - Exit for now
 ```
 
@@ -343,7 +327,6 @@ Critical confirmations (always stop, even if pre-provided):
 - ✋ Step 2: Confirm column mapping (input_columns, label_column)
 
 Optional confirmations:
-- ✋ Step 4: Before running evaluation
 - ✋ Step 5: After presenting results
 
 ## Output

@@ -22,6 +22,8 @@ optimize:
     - custom_ai_function_utils.py
     - metrics_core.py
     - snow_gepa_adapter.py
+    - snow_gepa_experiment.py
+    - snow_gepa_optimize_anything.py
     - snow_gepa_optimize.py
   handler: run_optimization
 

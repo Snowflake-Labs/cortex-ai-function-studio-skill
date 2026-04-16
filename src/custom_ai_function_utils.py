@@ -365,10 +365,8 @@ class RobustAIComplete:
         return None
 
     @classmethod
-    def _parse_json(
-        cls, value: object, *, allow_text_recovery: bool = False
-    ) -> object | None:
-        """Parse JSON from value; optionally recover from wrapped/non-JSON text."""
+    def _parse_json(cls, value: object) -> object | None:
+        """Parse JSON from a string value."""
         if not isinstance(value, str):
             return value
 
@@ -376,37 +374,14 @@ class RobustAIComplete:
         if not text:
             return None
 
-        # Soft text-recovery is intentionally disabled for now.
-        allow_text_recovery = False
-        if not allow_text_recovery:
-            return json.loads(text)
-
-        # Unwrap common Markdown code fences like ```...``` or ```json...```.
-        fenced_match = cls.JSON_CODE_BLOCK_RE.search(text)
-        if fenced_match:
-            text = fenced_match.group(1).strip()
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        for open_ch, close_ch in (("{", "}"), ("[", "]")):
-            candidate = cls._extract_balanced_substring(text, open_ch, close_ch)
-            if candidate is None:
-                continue
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-        return None
+        return json.loads(text)
 
     @classmethod
     def parse_ai_complete_payload(
-        cls, raw_response: object, *, allow_text_recovery: bool = False
+        cls, raw_response: object
     ) -> object | None:
         """Parse AI_COMPLETE response payload into JSON-like Python objects."""
-        parsed = cls._parse_json(raw_response, allow_text_recovery=allow_text_recovery)
+        parsed = cls._parse_json(raw_response)
         if parsed is None:
             return None
 
@@ -417,7 +392,7 @@ class RobustAIComplete:
                 raise RuntimeError(str(error_text))
             parsed = parsed.get("value")
 
-        return cls._parse_json(parsed, allow_text_recovery=allow_text_recovery)
+        return cls._parse_json(parsed)
 
     @classmethod
     def is_json_mode_validation_error(cls, message: str) -> bool:
@@ -429,6 +404,98 @@ class RobustAIComplete:
     def _is_return_details_not_allowed_error(cls, exc: Exception) -> bool:
         lowered = str(exc).lower()
         return all(marker in lowered for marker in cls.RETURN_DETAILS_BLOCK_MARKERS)
+
+    @staticmethod
+    def _normalize_user_prompts(user_prompts: list[str] | str) -> list[str]:
+        """Normalize user prompts to a list for downstream batching logic."""
+        return [user_prompts] if isinstance(user_prompts, str) else user_prompts
+
+    @staticmethod
+    def _validate_multimodal_inputs(
+        user_prompts: list[str],
+        file_paths: list[str] | None,
+        stage_name: str | list[str] | None,
+    ) -> tuple[bool, bool]:
+        """Validate multimodal batching inputs.
+
+        Returns ``(multimodal, per_row_stages)`` where:
+        - ``multimodal`` means file paths and stages were provided together
+        - ``per_row_stages`` means stage_name is a list aligned with prompts
+        """
+        has_file_paths = file_paths is not None
+        has_stage_name = stage_name is not None
+        if has_file_paths != has_stage_name:
+            raise ValueError("file_paths and stage_name must be provided together")
+
+        per_row_stages = isinstance(stage_name, list)
+        multimodal = has_file_paths and has_stage_name
+        if not multimodal:
+            return False, per_row_stages
+
+        if len(file_paths) != len(user_prompts):
+            raise ValueError(
+                f"file_paths length ({len(file_paths)}) must match "
+                f"user_prompts length ({len(user_prompts)})"
+            )
+        if per_row_stages and len(stage_name) != len(user_prompts):
+            raise ValueError(
+                f"stage_name length ({len(stage_name)}) must match "
+                f"user_prompts length ({len(user_prompts)})"
+            )
+        return True, per_row_stages
+
+    @staticmethod
+    def _build_ai_complete_content_expr(
+        *,
+        multimodal: bool,
+        per_row_stages: bool,
+        stage_name: str | list[str] | None,
+    ):
+        """Build the user-message content expression passed into AI_COMPLETE."""
+        if not multimodal:
+            return col("PROMPT_EXPR_COL")
+
+        stage_expr = col("STAGE_COL") if per_row_stages else lit(stage_name)
+        return call_function(
+            "PROMPT",
+            lit(
+                apply_file_prompt_prefix_workaround(
+                    "{0} {1}",
+                    first_prompt_arg_is_file=True,
+                )
+            ),
+            call_function("TO_FILE", stage_expr, col("FILE_PATH_COL")),
+            col("PROMPT_EXPR_COL"),
+        )
+
+    @staticmethod
+    def _build_prompt_dataframe_inputs(
+        user_prompts: list[str],
+        *,
+        multimodal: bool,
+        per_row_stages: bool,
+        file_paths: list[str] | None,
+        stage_name: str | list[str] | None,
+    ) -> tuple[list[list[object]], list[str]]:
+        """Build rows/schema for the intermediate Snowpark DataFrame."""
+        if not multimodal:
+            return [[i, p] for i, p in enumerate(user_prompts)], [
+                "IDX",
+                "PROMPT_EXPR_COL",
+            ]
+
+        if per_row_stages:
+            return [
+                [i, prompt, file_path, row_stage]
+                for i, (prompt, file_path, row_stage) in enumerate(
+                    zip(user_prompts, file_paths, stage_name)
+                )
+            ], ["IDX", "PROMPT_EXPR_COL", "FILE_PATH_COL", "STAGE_COL"]
+
+        return [
+            [i, prompt, file_path]
+            for i, (prompt, file_path) in enumerate(zip(user_prompts, file_paths))
+        ], ["IDX", "PROMPT_EXPR_COL", "FILE_PATH_COL"]
 
     @classmethod
     def _execute_ai_complete(
@@ -458,8 +525,8 @@ class RobustAIComplete:
             )
 
         When ``file_paths`` and ``stage_name`` are provided, each prompt
-        is wrapped in ``PROMPT('{0} {1}', text, TO_FILE(stage, path))``
-        so the model receives the file alongside the text.  Pass a
+        is wrapped with the temporary file-prefix workaround via
+        ``PROMPT('file: {0} {1}', TO_FILE(stage, path), text)``. Pass a
         ``str`` for a single stage or ``list[str]`` for per-row stages.
         """
 
@@ -468,19 +535,17 @@ class RobustAIComplete:
                 response_schema
             )
 
-        per_row_stages = isinstance(stage_name, list)
-        multimodal = bool(file_paths and stage_name)
-
-        if multimodal:
-            stage_expr = col("STAGE_COL") if per_row_stages else lit(stage_name)
-            content_expr = call_function(
-                "PROMPT",
-                lit("{0} {1}"),
-                col("PROMPT_EXPR_COL"),
-                call_function("TO_FILE", stage_expr, col("FILE_PATH_COL")),
-            )
-        else:
-            content_expr = col("PROMPT_EXPR_COL")
+        user_prompts = cls._normalize_user_prompts(user_prompts)
+        multimodal, per_row_stages = cls._validate_multimodal_inputs(
+            user_prompts,
+            file_paths,
+            stage_name,
+        )
+        content_expr = cls._build_ai_complete_content_expr(
+            multimodal=multimodal,
+            per_row_stages=per_row_stages,
+            stage_name=stage_name,
+        )
 
         message_exprs = []
         if system_prompt is not None and system_prompt.strip():
@@ -523,28 +588,13 @@ class RobustAIComplete:
             lit(include_error_details),  # return_error_details
         ]
 
-        # Build DataFrame with prompts (and optional image paths)
-        if isinstance(user_prompts, str):
-            user_prompts = [user_prompts]
-
-        if multimodal:
-            if per_row_stages:
-                prompts_for_df = [
-                    [i, p, fp, sn]
-                    for i, (p, fp, sn) in enumerate(
-                        zip(user_prompts, file_paths, stage_name)
-                    )
-                ]
-                schema = ["IDX", "PROMPT_EXPR_COL", "FILE_PATH_COL", "STAGE_COL"]
-            else:
-                prompts_for_df = [
-                    [i, p, fp]
-                    for i, (p, fp) in enumerate(zip(user_prompts, file_paths))
-                ]
-                schema = ["IDX", "PROMPT_EXPR_COL", "FILE_PATH_COL"]
-        else:
-            prompts_for_df = [[i, p] for i, p in enumerate(user_prompts)]
-            schema = ["IDX", "PROMPT_EXPR_COL"]
+        prompts_for_df, schema = cls._build_prompt_dataframe_inputs(
+            user_prompts,
+            multimodal=multimodal,
+            per_row_stages=per_row_stages,
+            file_paths=file_paths,
+            stage_name=stage_name,
+        )
 
         df = session.create_dataframe(prompts_for_df, schema=schema)
 
@@ -611,7 +661,6 @@ class RobustAIComplete:
         response_schema: dict[str, Any],
         temperature: float,
         max_tokens: int,
-        allow_text_recovery: bool = False,
     ) -> object:
         """Run AI_COMPLETE with strict schema first, then prompt-only fallback."""
         strict_result: object | None = None
@@ -645,7 +694,7 @@ class RobustAIComplete:
             response_schema=None,
         )
         return (
-            cls._parse_json(fallback_result[0], allow_text_recovery=allow_text_recovery)
+            cls._parse_json(fallback_result[0])
             if fallback_result
             else None
         )
@@ -705,8 +754,31 @@ def normalize_ddl_to_dollar_quoting(raw_ddl: str) -> str:
     return f"{prefix}$$\n{body}\n$${suffix}"
 
 
+def build_temp_ddl_from_body(
+    original_ddl: str,
+    candidate_body: str,
+    temp_function_name: str,
+) -> str:
+    """Build a TEMPORARY function DDL by replacing the entire body.
+
+    Unlike ``TempAIFunction._build_ddl`` which patches only the model and
+    system prompt, this replaces **everything** between the ``$$``
+    delimiters with *candidate_body*.  The function signature and RETURNS
+    clause are preserved from the original DDL.
+    """
+    ddl = normalize_ddl_to_dollar_quoting(original_ddl)
+    ddl = re.sub(
+        r"(CREATE\s+OR\s+REPLACE\s+)(?:TEMPORARY\s+)?FUNCTION\s+\S+(\s*\()",
+        rf"\g<1>TEMPORARY FUNCTION {temp_function_name}\2",
+        ddl,
+        flags=re.IGNORECASE,
+    )
+    ddl = re.sub(r"\$\$.*?\$\$", f"$$\n{candidate_body}\n$$", ddl, flags=re.DOTALL)
+    return ddl
+
+
 _TO_FILE_RE = re.compile(
-    r"TO_FILE\(\s*'([^']+)'\s*,\s*(\w+)\s*\)", re.IGNORECASE
+    r"TO_FILE\(\s*'((?:(?:'')|[^'])+)'\s*,\s*(\w+)\s*\)", re.IGNORECASE
 )
 
 _FILE_PARAM_RE = re.compile(
@@ -716,6 +788,58 @@ _FILE_PARAM_RE = re.compile(
 _ARRAY_PARAM_RE = re.compile(
     r'"?(\w+)"?\s+ARRAY\b', re.IGNORECASE
 )
+
+_PROMPT_WITH_TO_FILE_FIRST_ARG_RE = re.compile(
+    r"(?P<prefix>PROMPT\(\s*')"
+    r"(?P<template>(?:''|[^'])*)"
+    r"(?P<suffix>'\s*,\s*TO_FILE\(\s*'(?:(?:'')|[^'])+'\s*,\s*[^)]+\))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+# Temporary AI_COMPLETE workaround. Keep all `file: {0}` behavior behind this
+# helper so removing it after the server-side fix is a localized change.
+AI_COMPLETE_FILE_PROMPT_PREFIX = "file: "
+_ALREADY_FILE_PREFIXED_PROMPT_RE = re.compile(r"file:\s*\{0\}", re.IGNORECASE)
+
+
+def apply_file_prompt_prefix_workaround(
+    prompt_template: str,
+    *,
+    first_prompt_arg_is_file: bool,
+) -> str:
+    """Temporarily prefix file-first PROMPT templates for AI_COMPLETE.
+
+    Once AI_COMPLETE handles file-first multimodal prompts correctly without
+    this hint, revert the workaround here and keep callers unchanged.
+    """
+    if not first_prompt_arg_is_file:
+        return prompt_template
+
+    stripped_template = prompt_template.lstrip()
+    if _ALREADY_FILE_PREFIXED_PROMPT_RE.match(stripped_template):
+        return prompt_template
+    if not stripped_template.startswith("{0}"):
+        return prompt_template
+
+    leading_ws = prompt_template[: len(prompt_template) - len(stripped_template)]
+    return f"{leading_ws}{AI_COMPLETE_FILE_PROMPT_PREFIX}{stripped_template}"
+
+
+def _apply_file_prompt_prefix_workaround_to_ddl(ddl: str) -> str:
+    """Apply the temporary AI_COMPLETE file-prefix workaround to DDL."""
+
+    def _rewrite_prompt(match: re.Match[str]) -> str:
+        template = match.group("template")
+        new_template = apply_file_prompt_prefix_workaround(
+            template,
+            first_prompt_arg_is_file=True,
+        )
+        if new_template == template:
+            return match.group(0)
+        return f"{match.group('prefix')}{new_template}{match.group('suffix')}"
+
+    return _PROMPT_WITH_TO_FILE_FIRST_ARG_RE.sub(_rewrite_prompt, ddl)
 
 
 def extract_to_file_refs(ddl: str) -> tuple[str, list[str]] | None:
@@ -729,7 +853,7 @@ def extract_to_file_refs(ddl: str) -> tuple[str, list[str]] | None:
     matches = _TO_FILE_RE.findall(ddl)
     if not matches:
         return None
-    stage = matches[0][0]
+    stage = matches[0][0].replace("''", "'")
     columns = list(dict.fromkeys(m[1] for m in matches))
     return stage, columns
 
@@ -934,6 +1058,128 @@ class TempAIFunction:
 
         return ddl
 
+    @staticmethod
+    def _find_sql_string_end(sql: str, start: int) -> int:
+        """Return the first index after the closing quote of a SQL single-quoted string."""
+        pos = start + 1
+        while pos < len(sql):
+            if sql[pos] != "'":
+                pos += 1
+                continue
+
+            if pos + 1 < len(sql) and sql[pos + 1] == "'":
+                pos += 2
+                continue
+            return pos + 1
+        return pos
+
+    @staticmethod
+    def _find_ai_complete_arg_value_end(sql: str, start: int) -> int:
+        """Find the end of an SQL expression in argument position (comma- or top-level-).
+
+        This parser is simple but handles common nested forms like function calls
+        (e.g. IFNULL(MODEL_NAME, 'x')) and quoted strings.
+        """
+        if start >= len(sql):
+            return start
+
+        if sql[start] == "'":
+            return TempAIFunction._find_sql_string_end(sql, start)
+
+        paren_depth = 0
+        pos = start
+        while pos < len(sql):
+            ch = sql[pos]
+            if ch == "'":
+                pos = TempAIFunction._find_sql_string_end(sql, pos)
+                continue
+            if ch == "(":
+                paren_depth += 1
+                pos += 1
+                continue
+            if ch == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+                    pos += 1
+                    continue
+                return pos
+            if ch == "," and paren_depth == 0:
+                return pos
+            pos += 1
+        return pos
+
+    @classmethod
+    def _replace_ai_complete_named_arg(
+        cls, ai_complete_inner: str, arg_name: str, replacement_expr: str
+    ) -> str:
+        """Replace the first top-level `arg_name=>` value inside an AI_COMPLETE arg list."""
+        arg_pattern = re.compile(rf"\b{re.escape(arg_name)}\s*=>\s*", re.IGNORECASE)
+        paren_depth = 0
+        pos = 0
+        while pos < len(ai_complete_inner):
+            if ai_complete_inner[pos] == "'":
+                pos = cls._find_sql_string_end(ai_complete_inner, pos)
+                continue
+
+            if ai_complete_inner[pos] == "(":
+                paren_depth += 1
+                pos += 1
+                continue
+            if ai_complete_inner[pos] == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+                pos += 1
+                continue
+
+            if paren_depth > 0:
+                pos += 1
+                continue
+
+            match = arg_pattern.match(ai_complete_inner, pos)
+            if not match:
+                pos += 1
+                continue
+
+            value_start = match.end()
+            while value_start < len(ai_complete_inner) and ai_complete_inner[value_start].isspace():
+                value_start += 1
+            if value_start >= len(ai_complete_inner):
+                return ai_complete_inner
+
+            value_end = cls._find_ai_complete_arg_value_end(
+                ai_complete_inner,
+                value_start,
+            )
+            return (
+                ai_complete_inner[:value_start]
+                + replacement_expr
+                + ai_complete_inner[value_end:]
+            )
+
+        return ai_complete_inner
+
+    @classmethod
+    def _replace_ai_complete_model(
+        cls, ddl: str, candidate_model: str
+    ) -> str:
+        """Replace model argument in the first AI_COMPLETE(...) call with a literal."""
+        found = cls._find_ai_complete_call(ddl)
+        if not found:
+            return ddl
+
+        inner, match_start, match_end = found
+        escaped_model = candidate_model.replace("'", "''")
+        replacement_expr = f"'{escaped_model}'"
+        replaced_inner = cls._replace_ai_complete_named_arg(
+            inner,
+            "model",
+            replacement_expr,
+        )
+        if replaced_inner == inner:
+            return ddl
+
+        return ddl[:match_start] + f"AI_COMPLETE({replaced_inner})" + ddl[match_end:]
+
     @classmethod
     def _build_ddl(
         cls,
@@ -966,26 +1212,19 @@ class TempAIFunction:
             flags=re.IGNORECASE,
         )
 
-        # Replace model
-        escaped_model = candidate_model.replace("'", "''")
-        ddl = re.sub(
-            r"(model\s*=>\s*')[^']*(')",
-            rf"\g<1>{escaped_model}\2",
-            ddl,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+        ddl = cls._replace_ai_complete_model(ddl, candidate_model)
 
         # Replace prompt
         escaped_prompt = candidate_prompt.replace("'", "''")
         ddl = re.sub(
             r"('role'\s*,\s*'system'\s*,\s*'content'\s*,\s*')(?:[^']|'')*(')",
-            rf"\g<1>{escaped_prompt}\2",
+            lambda m: m.group(1) + escaped_prompt + m.group(2),
             ddl,
             count=1,
             flags=re.DOTALL,
         )
 
+        ddl = _apply_file_prompt_prefix_workaround_to_ddl(ddl)
         ddl = cls._rewrite_ai_complete_for_error_details(ddl, value_type=value_type)
         return ddl
 

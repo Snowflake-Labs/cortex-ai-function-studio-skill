@@ -11,13 +11,13 @@ stored procedures with the correct stage paths for IMPORTS and fully qualified p
 
 Usage:
     # Print SQL to stdout
-    uv run python src/create_sproc.py optimize TEMP PUBLIC AI_FUNCTIONS
+    PYTHONPATH=<SKILL_DIR>/src uv run python src/create_sproc.py optimize TEMP PUBLIC AI_FUNCTIONS
 
     # Write to file
-    uv run python src/create_sproc.py optimize TEMP PUBLIC AI_FUNCTIONS -o /tmp/sproc.sql
+    PYTHONPATH=<SKILL_DIR>/src uv run python src/create_sproc.py optimize TEMP PUBLIC AI_FUNCTIONS -o /tmp/sproc.sql
 
     # Execute directly
-    uv run python src/create_sproc.py optimize TEMP PUBLIC AI_FUNCTIONS --execute --connection MY_CONN
+    PYTHONPATH=<SKILL_DIR>/src uv run python src/create_sproc.py optimize TEMP PUBLIC AI_FUNCTIONS --execute --connection MY_CONN
 """
 
 import argparse
@@ -94,7 +94,7 @@ def _load_sproc_config() -> dict:
 
 _INTER_FILE_IMPORT_RE = re.compile(
     r"^\s*from\s+(?:custom_ai_function_utils|metrics_core|snow_gepa_adapter"
-    r"|snow_gepa_optimize|snow_synthetic_data)\s+import\s+"
+    r"|snow_gepa_experiment|snow_gepa_optimize|snow_gepa_optimize_anything|snow_synthetic_data)\s+import\s+"
     r"(?:\([^)]*\)|[^\n]+)",
     re.MULTILINE,
 )

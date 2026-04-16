@@ -1,6 +1,6 @@
 ---
 name: demos
-description: "Interactive demos showcasing custom AI function capabilities with concrete example use cases."
+description: "Interactive demos showcasing custom AI function capabilities — organized by feature, not just dataset. Each demo highlights specific studio capabilities."
 parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
@@ -8,7 +8,7 @@ parent_skill: cortex-ai-function-studio
 
 # AI Function Demos
 
-Interactive walkthroughs that demonstrate the full create → evaluate → optimize workflow using real example use cases.
+Interactive walkthroughs organized by **feature** — each demo highlights specific studio capabilities so you can jump straight to what interests you. Not every demo runs the full create → evaluate → optimize pipeline; some focus on a single capability.
 
 ## When to Load
 
@@ -22,42 +22,75 @@ Ask user:
 ```
 Which demo would you like to try?
 
-1. **PII Redaction** - Build a function that redacts sensitive information (names, emails, SSNs)
-2. **Content Moderation** - Detect toxic content across 55 languages
-3. **Insurance Claim Routing** - Build and optimize a claim routing AI function with async task execution
-4. **Policy conditioned routing** - dynamically route ticket according to company's policies
-5. **Clothing Condition Classification** - Classify garment condition from images using multimodal AI
-6. **Legal Document Extraction** - Extract structured fields from real legal contracts with GEPA optimization
-7. **Image Summarization** - Summarize image content as text (coming soon)
-8. **Sentiment Analysis** - Analyze text sentiment (coming soon)
+1. **Quick Start: Create & Evaluate** (~5 min)
+   Build a toxicity classifier and measure its accuracy — the fastest
+   way to experience the core workflow. Uses built-in exact_match metric.
+   Features: Create (direct mode), Evaluate
+
+2. **Pseudo-Labeling & Teacher-Student Distillation** (~10 min)
+   Start with unlabeled insurance claims, generate ground truth labels
+   with a strong teacher model (Claude Opus), then build a cheap student
+   model and measure how closely it reproduces teacher decisions.
+   Features: Synthetic Data (pseudo-label), Create, Evaluate
+
+3. **Custom Evaluation Metrics** (~5 min)
+   Build a legal contract field extractor and create a weighted composite
+   metric that scores 4 fields independently — governing law, parties,
+   effective date, expiration date. See how custom metrics give richer
+   signal than simple exact_match.
+   Features: Create, Custom Composite Metrics, Evaluate
+
+4. **Prompt Optimization** (~15-20 min)
+   Take a policy-conditioned ticket router where cheap models fail badly
+   on unfamiliar company vocabulary, then watch prompt optimization close
+   the accuracy gap through prompt evolution and Pareto cost/quality analysis.
+   Features: Create, Optimize, Pareto Analysis
+
+5. **Multimodal: Image Classification** (~15-20 min)
+   Classify second-hand clothing condition from garment photos. Prompt
+   optimization evolves a generic 7-word prompt into a detailed grading rubric with
+   visual cue definitions that models need to distinguish condition grades.
+   Features: Multimodal (images), Create, Optimize
+
+6. **Multimodal: Document Extraction** (~20-30 min)
+   Extract structured fields from SEC 10-K filing PDFs, build a custom
+   composite metric for multi-field scoring, and optimize across
+   document-capable models.
+   Features: Multimodal (PDFs), Custom Metrics, Optimize
+
+7. **Agent Research: Pre/Post-Processing** (~10-15 min) [Experimental]
+   Build a PII redaction function using Agent Research mode — the agent
+   searches the web for state-of-the-art techniques, proposes multiple
+   SQL UDF architectures with pre- and post-processing around AI_COMPLETE,
+   and you pick the approach. This showcases an experimental creation mode
+   where the agent acts as a research assistant.
+   Features: Create (Agent Research mode, web search, SQL pre/post-processing)
 ```
 
 ### Step 2: Route
 
-**If PII Redaction:** Load `redaction/SKILL.md`
+**If Quick Start:** Load `classification/SKILL.md`
 
-**If Content Moderation:** Load `classification/SKILL.md`
+**If Pseudo-Labeling:** Load `insurance-claim-routing/SKILL.md`
 
-**If Insurance Claim Routing:** Load `insurance-claim-routing/SKILL.md`
+**If Custom Metrics:** Load `legal-doc-extraction/SKILL.md`
 
-**If Policy conditioned routing:** Load `policy-conditioned-routing/SKILL.md`
+**If Prompt Optimization:** Load `policy-conditioned-routing/SKILL.md`
 
-**If Clothing Condition Classification:** Load `clothing-classification/SKILL.md`
+**If Multimodal Images:** Load `clothing-classification/SKILL.md`
 
-**If Legal Document Extraction:** Load `legal-doc-extraction/SKILL.md`
+**If Multimodal Documents:** Load `pdf-field-extraction/SKILL.md`
 
-**If Image Summarization:** Inform user this demo is coming soon, offer to try another demo instead.
-
-**If Sentiment Analysis:** Inform user this demo is coming soon, offer to try another demo instead.
+**If Agent Research:** Load `redaction/SKILL.md`
 
 ## What to Expect
 
 Each demo will:
 1. Create sample data in your account (with `DEMO_` prefix)
-2. Walk through creating an AI function step-by-step
-3. Evaluate the function's performance
-4. Optionally optimize the function's prompt
-5. Offer to clean up demo objects when finished
+2. Walk through specific studio capabilities (see feature tags above)
+3. Offer to clean up demo objects when finished
+
+Not every demo runs every step of the create → evaluate → optimize pipeline. Demos are designed to be fast and focused on the feature they showcase.
 
 **Note:** Demos execute real SQL and create real objects in your Snowflake account. All demo objects use the `DEMO_` prefix for easy identification and cleanup.
 
@@ -67,4 +100,4 @@ Each demo will:
 
 ## Output
 
-Routed to specific demo sub-skill (e.g., `redaction/SKILL.md`, `classification/SKILL.md`)
+Routed to specific demo sub-skill (e.g., `classification/SKILL.md`, `insurance-claim-routing/SKILL.md`)

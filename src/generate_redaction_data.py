@@ -112,6 +112,7 @@ def main(
     train: int = 50,
     test: int = 100,
     seed: int = 42,
+    language: str | None = None,
 ) -> None:
     """Load dataset, sample data, and create Snowflake tables.
 
@@ -122,12 +123,23 @@ def main(
         train: Number of training rows.
         test: Number of test rows.
         seed: Random seed for reproducibility.
+        language: Optional language filter (e.g., "French"). Case-insensitive.
     """
     logger.info("Loading ai4privacy/pii-masking-300k dataset...")
     dataset = datasets.load_dataset("ai4privacy/pii-masking-300k")
     df = dataset["train"].to_pandas()
 
     logger.info(f"Dataset size: {len(df)} rows")
+
+    if language:
+        df = df[df["language"].str.lower() == language.lower()]
+        logger.info(f"Filtered to language '{language}': {len(df)} rows")
+        if len(df) < train + test:
+            raise ValueError(
+                f"Not enough rows for language '{language}': "
+                f"need {train + test}, found {len(df)}"
+            )
+
     logger.info(f"Sampling {train} training + {test} test rows (seed={seed})...")
 
     sampled = df.sample(n=train + test, random_state=seed)
@@ -197,6 +209,12 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Optional language filter, e.g. 'French', 'English', 'German' (case-insensitive)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -210,4 +228,5 @@ if __name__ == "__main__":
         train=args.train,
         test=args.test,
         seed=args.seed,
+        language=args.language,
     )

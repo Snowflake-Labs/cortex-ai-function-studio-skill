@@ -80,20 +80,29 @@ score, feedback = compute_metric(metric_name, expected, predicted, **metric_opti
 
 **Always** present ALL 6 options below. If none of the built-in metrics fit the user's needs, a custom metric is the right answer.
 
+**Dynamic ordering:** Use the Metric Selection Guide above to identify the recommended metric for the user's task type. Place the recommended metric **first** in the list (as option 1) and reorder the remaining built-in metrics after it (options 2-5). Always append "Create custom metric" as the last option. Add a short `(recommended)` tag and a brief reason to the top metric.
+
 Present this menu when asking users to select a metric:
 
 ```
 Which metric would you like to use?
 
 Built-in metrics:
-1. exact_match - Score 1.0 if strings match exactly
-2. fuzzy_match - Score based on string similarity (configurable threshold)
-3. contains_match - Score 1.0 if expected is contained in predicted
-4. redaction_match - Match text with redacted placeholders like [NAME]
-5. llm_judge - Use LLM to judge correctness (requires task description)
+1. {recommended_metric} (recommended — {brief reason, e.g. "best for PII redaction tasks"})
+2. {remaining metric}
+3. {remaining metric}
+4. {remaining metric}
+5. {remaining metric}
 
 Or:
 6. Create custom metric - Build your own evaluation metric (e.g., match on specific output fields, weighted scoring, domain-specific logic)
 ```
+
+The built-in metrics and their descriptions (use these when filling in the template above):
+- exact_match - Score 1.0 if strings match exactly
+- fuzzy_match - Score based on string similarity (configurable threshold)
+- contains_match - Score 1.0 if expected is contained in predicted
+- redaction_match - Match text with redacted placeholders like [NAME]
+- llm_judge - Use LLM to judge correctness (requires task description)
 
 **If user selects option 6:** Load `references/custom_metrics.md` to guide through custom metric creation. Preserve workflow context (function name, tables, columns) and return to the calling workflow after creation.

@@ -11,6 +11,13 @@ Triggers: model selection step in any workflow, "see more models", "list models"
 
 ## Workflow
 
+### Fast Path
+
+**If a model has already been provided** (user specified it, or it was inherited from context like the function's baked-in model), skip the full selection workflow:
+1. Verify the model is available (Step 5)
+2. If verification passes, use it immediately — no need to present options
+3. If verification fails, fall back to the full selection flow below
+
 ### Step 1: Check Account Allowlist
 
 ```sql
@@ -35,7 +42,7 @@ Intersect the results with the models defined in `src/models.json`. Only models 
 
 1. Use the default family names from Step 3 as fallback options
 2. In fallback mode, treat **all families as available** using their preferred picks from the table
-3. **Present the first 4 families from the Step 3 table in order**: Claude (`claude-sonnet-4-6`), GPT (`openai-gpt-5.2`), Gemini (`gemini-3-pro`), Llama (`llama3.1-405b`)
+3. **Present the first 4 families from the Step 3 table in order**: Claude (`claude-sonnet-4-6`), GPT (`openai-gpt-5.2`), Gemini (`gemini-3.1-pro`), Llama (`llama3.1-405b`)
 4. Continue to Step 4 with these 4 options
 
 ⚠️ **SAY THIS TO THE USER** (do not paraphrase):
@@ -56,9 +63,9 @@ From the available models, identify the **most popular/recommended model from ea
 |--------|--------------------------|----------|
 | **Claude** (Anthropic) | `claude-sonnet-4-6` > `claude-sonnet-4-5` > `claude-4-sonnet` | Any available Claude |
 | **GPT** (OpenAI) | `openai-gpt-5.2` > `openai-gpt-5.1` > `openai-gpt-5` | Any available GPT |
-| **Gemini** (Google) | `gemini-3-pro` > `gemini-2.5-flash` | Any available Gemini |
-| **Llama** (Meta) | `llama3.1-405b` > `llama3.3-70b` > `llama3.1-70b` | Any available Llama |
-| **Mistral** | `mistral-large2` > `mixtral-8x7b` | Any available Mistral |
+| **Gemini** (Google) | `gemini-3.1-pro` > `gemini-2.5-flash` | Any available Gemini |
+| **Llama** (Meta) | `llama4-maverick` > `llama4-scout` > `llama3.1-405b` > `llama3.3-70b` > `llama3.1-70b` | Any available Llama |
+| **Mistral** | `pixtral-large` > `mistral-large2` > `mixtral-8x7b` | Any available Mistral |
 
 Fallback for any family: any available model in that family.
 
