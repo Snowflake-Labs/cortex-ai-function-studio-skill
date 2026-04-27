@@ -119,9 +119,14 @@ def _after_anchor(full: str, anchor: str) -> str:
 def load_policy_v6_rows() -> list[dict[str, str]]:
     """Return the 120 unique v6 gold rows (holdout + train variants), no padding."""
     root = Path(__file__).resolve().parent.parent
-    j2 = (root / "demos/policy-conditioned-routing/create_support_ticket_v6_dataset.sql.j2").read_text()
+    j2 = (
+        root
+        / "demos/policy-conditioned-routing/create_support_ticket_v6_dataset.sql.j2"
+    ).read_text()
 
-    pol_tuples = _extract_tuples_from_values(_after_anchor(j2, "DEMO_COMPANY_ROUTING_POLICY_V6 AS"))
+    pol_tuples = _extract_tuples_from_values(
+        _after_anchor(j2, "DEMO_COMPANY_ROUTING_POLICY_V6 AS")
+    )
     policy_by_company: dict[str, dict[str, str]] = {}
     for tup in pol_tuples:
         inner = tup.strip()[1:-1]
@@ -135,7 +140,9 @@ def load_policy_v6_rows() -> list[dict[str, str]]:
             "ENTITLEMENT_TEXT": _sql_string_literal(fields[3]),
         }
 
-    ho_tuples = _extract_tuples_from_values(_after_anchor(j2, "DEMO_TICKETS_HARD_GOLD_V6_SMALL AS"))
+    ho_tuples = _extract_tuples_from_values(
+        _after_anchor(j2, "DEMO_TICKETS_HARD_GOLD_V6_SMALL AS")
+    )
     holdout_rows: list[dict[str, str]] = []
     for tup in ho_tuples:
         inner = tup.strip()[1:-1]

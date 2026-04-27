@@ -148,7 +148,7 @@ exact_match metric works perfectly — no custom metric needed.
 Please confirm or modify any settings you'd like to change:
 
 Metric: exact_match
-Results table: DEMO_DETECT_TOXICITY_EVAL_RESULTS
+Experiment: auto-generated per evaluation (run_id)
 ```
 
 **⚠️ STOP**: Wait for user confirmation or modifications before running evaluation.
@@ -160,7 +160,8 @@ Results table: DEMO_DETECT_TOXICITY_EVAL_RESULTS
 - `input_columns`: `['TEXT']`
 - `label_column`: `EXPECTED_OUTPUT`
 - `metric_name`: `exact_match`
-- `results_table`: `{database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS`
+
+The evaluation auto-creates an experiment named after its `run_id`. Capture `experiment_name` from the JSON output for the queries below.
 
 The evaluate workflow will run the evaluation and present results. **Skip Step 6 (next steps)** in the evaluate workflow -- return here after results are presented.
 
@@ -169,16 +170,21 @@ Once evaluation is done, review the results. Show the scores to the user. Offer 
 Would you like to see which cases the function got wrong?
 ```
 
-If yes, query the results table:
+If yes, query the per-row eval artifact (requires `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION`). First create the JSON file format (required — inline `(TYPE => JSON)` isn't supported on SnowURL):
 ```sql
-SELECT 
-    LEFT(INPUT_TEXT, 150) AS TEXT_PREVIEW,
-    EXPECTED AS EXPECTED_LABEL,
-    PREDICTED AS PREDICTED_LABEL,
-    SCORE,
-    FEEDBACK
-FROM {database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS
-WHERE SCORE < 1.0
+CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE;
+
+SELECT
+    LEFT($1:input_text::STRING, 150) AS TEXT_PREVIEW,
+    $1:expected::STRING  AS EXPECTED_LABEL,
+    $1:predicted::STRING AS PREDICTED_LABEL,
+    $1:metric_score::FLOAT AS SCORE,
+    $1:metric_feedback::STRING AS FEEDBACK
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
+WHERE $1:metric_score::FLOAT < 1.0
 ORDER BY SCORE
 LIMIT 20;
 ```
@@ -197,7 +203,7 @@ Would you like to clean up the demo objects?
 This will drop:
 - {database}.{schema}.DEMO_TOXICITY_DATA
 - {database}.{schema}.DEMO_DETECT_TOXICITY (function)
-- {database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS (if created)
+- The per-evaluation experiment ({experiment_name})
 
 Options:
 1. Yes - Clean up all demo objects
@@ -210,7 +216,7 @@ If yes, execute:
 ```sql
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_TOXICITY_DATA;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_DETECT_TOXICITY(VARCHAR);
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_DETECT_TOXICITY_EVAL_RESULTS;
+DROP EXPERIMENT IF EXISTS {database}.{schema}.{experiment_name};
 ```
 
 ### Step 7: Next Steps

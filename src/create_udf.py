@@ -339,9 +339,9 @@ def _build_create_function_ddl(
     escaped_comment: str,
     body_expr: str,
 ) -> str:
-    """Build the CREATE OR REPLACE FUNCTION DDL wrapper."""
+    """Build the CREATE FUNCTION DDL wrapper."""
     return dedent(f"""\
-        CREATE OR REPLACE FUNCTION {fqn}({input_params})
+        CREATE FUNCTION {fqn}({input_params})
         RETURNS {return_type}
         LANGUAGE SQL
         COMMENT = '{COMMENT_PREFIX}{escaped_comment}'

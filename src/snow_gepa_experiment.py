@@ -29,15 +29,83 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Identifier validation
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _validate_snowflake_identifier(name: str, *, kind: str = "identifier") -> None:
+    """Validate a 1-3 part Snowflake identifier for safe SQL interpolation.
+
+    Each dot-separated part must be either:
+      - A bare identifier matching ``^[A-Za-z_][A-Za-z0-9_$]*$``, or
+      - A double-quoted identifier with any interior ``"`` escaped as ``""``.
+
+    Raises ``ValueError`` on rejection so callers cannot interpolate
+    untrusted strings (e.g. ``FOO; DROP DATABASE PROD; --``) into the
+    f-strings that build the experiment DDL below.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{kind} cannot be empty")
+
+    raw = name.strip()
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    for ch in raw:
+        if ch == '"':
+            in_quotes = not in_quotes
+            current.append(ch)
+        elif ch == "." and not in_quotes:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+
+    if in_quotes:
+        raise ValueError(f"Unterminated quoted {kind}: {raw!r}")
+
+    if not 1 <= len(parts) <= 3:
+        raise ValueError(
+            f"{kind} must be a 1-3 part identifier (e.g., DB.SCHEMA.NAME), "
+            f"got {len(parts)} parts: {raw!r}"
+        )
+
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            raise ValueError(f"Empty identifier part in {kind}: {raw!r}")
+        if stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 1:
+            inner = stripped[1:-1]
+            i = 0
+            while i < len(inner):
+                if inner[i] == '"':
+                    if i + 1 < len(inner) and inner[i + 1] == '"':
+                        i += 2
+                        continue
+                    raise ValueError(
+                        f"Invalid quoted identifier (unescaped quote) in "
+                        f"{kind}: {stripped!r}"
+                    )
+                i += 1
+        elif not _IDENTIFIER_RE.match(stripped):
+            raise ValueError(
+                f"Invalid identifier {stripped!r} in {kind} {raw!r}. "
+                f"Each part must be alphanumeric/underscore or double-quoted."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
 
 def create_gepa_experiment(session: Session, experiment_name: str) -> None:
     """Create a Snowflake Experiment if it does not already exist."""
-    session.sql(
-        f"CREATE EXPERIMENT IF NOT EXISTS {experiment_name}"
-    ).collect()
+    _validate_snowflake_identifier(experiment_name, kind="experiment_name")
+    session.sql(f"CREATE EXPERIMENT IF NOT EXISTS {experiment_name}").collect()
 
 
 def add_experiment_run(
@@ -56,9 +124,9 @@ def add_experiment_run(
         params: List of ``{"name": ..., "value": ...}`` dicts (string values).
         metrics: List of ``{"name": ..., "value": ...}`` dicts (numeric values).
     """
-    session.sql(
-        f"ALTER EXPERIMENT {experiment_name} ADD RUN {run_name}"
-    ).collect()
+    _validate_snowflake_identifier(experiment_name, kind="experiment_name")
+    _validate_snowflake_identifier(run_name, kind="run_name")
+    session.sql(f"ALTER EXPERIMENT {experiment_name} ADD RUN {run_name}").collect()
 
     if params:
         params_json = json.dumps(params).replace("\\", "\\\\").replace("'", "\\'")
@@ -79,9 +147,9 @@ def commit_experiment_run(
     session: Session, experiment_name: str, run_name: str
 ) -> None:
     """Commit a run, transitioning its status to FINISHED."""
-    session.sql(
-        f"ALTER EXPERIMENT {experiment_name} COMMIT RUN {run_name}"
-    ).collect()
+    _validate_snowflake_identifier(experiment_name, kind="experiment_name")
+    _validate_snowflake_identifier(run_name, kind="run_name")
+    session.sql(f"ALTER EXPERIMENT {experiment_name} COMMIT RUN {run_name}").collect()
 
 
 def put_experiment_artifact(
@@ -104,6 +172,8 @@ def put_experiment_artifact(
         local_path: Path to a local file or directory.
         subdir: Optional subdirectory under the run (e.g. ``"run_dir"``).
     """
+    _validate_snowflake_identifier(experiment_name, kind="experiment_name")
+    _validate_snowflake_identifier(run_name, kind="run_name")
     suffix = f"/{subdir}" if subdir else ""
     stage_path = f"snow://experiment/{experiment_name}/versions/{run_name}{suffix}"
 
@@ -112,13 +182,17 @@ def put_experiment_artifact(
             filepath = os.path.join(local_path, filename)
             if os.path.isfile(filepath):
                 session.file.put(
-                    filepath, stage_path,
-                    auto_compress=True, overwrite=True,
+                    filepath,
+                    stage_path,
+                    auto_compress=True,
+                    overwrite=True,
                 )
     else:
         session.file.put(
-            local_path, stage_path,
-            auto_compress=True, overwrite=True,
+            local_path,
+            stage_path,
+            auto_compress=True,
+            overwrite=True,
         )
 
 
@@ -207,7 +281,9 @@ def build_run_params(
             params.append({"name": name, "value": str(value)})
 
     if elapsed_seconds is not None:
-        params.append({"name": "elapsed_seconds", "value": str(round(elapsed_seconds, 2))})
+        params.append(
+            {"name": "elapsed_seconds", "value": str(round(elapsed_seconds, 2))}
+        )
 
     return params
 
@@ -237,19 +313,27 @@ def build_run_metrics(
 def write_eval_detail_artifact(
     details: list[dict[str, Any]],
     dest_dir: str | None = None,
+    filename: str = "eval_detail.json",
 ) -> str:
-    """Serialize per-row evaluation detail to a gzipped JSON file.
+    """Serialize per-row evaluation detail to a JSON file.
 
     Each element in *details* should contain keys like ``row_idx``,
     ``input_text``, ``expected``, ``predicted``, ``metric_score``,
     ``metric_feedback``, ``split``.
+
+    Args:
+        details: Per-row evaluation records.
+        dest_dir: Output directory; a temp dir is created when omitted.
+        filename: Output filename. Override to attach multiple artifacts
+            (e.g., ``seed_eval_detail.json`` and ``best_eval_detail.json``)
+            to the same experiment run.
 
     Returns the path to the written file.
     """
     if dest_dir is None:
         dest_dir = tempfile.mkdtemp(prefix="gepa_eval_")
 
-    path = os.path.join(dest_dir, "eval_detail.json")
+    path = os.path.join(dest_dir, filename)
     with open(path, "w") as f:
         json.dump(details, f)
     return path
@@ -283,13 +367,15 @@ def save_optimization_to_experiment(
     total_reflection_calls: int | None = None,
     elapsed_seconds: float | None = None,
     run_dir: str | None = None,
-    eval_details: list[dict[str, Any]] | None = None,
+    seed_eval_details: list[dict[str, Any]] | None = None,
+    best_eval_details: list[dict[str, Any]] | None = None,
 ) -> None:
     """Persist a full GEPA optimization result to a Snowflake Experiment.
 
     Creates runs for: SEED, each iteration, and MODEL_BEST.  Uploads
-    ``run_dir`` artifacts and ``eval_detail.json`` when provided.  All
-    runs are committed at the end.
+    ``run_dir`` artifacts plus ``seed_eval_detail.json`` and
+    ``best_eval_detail.json`` (when provided) to the MODEL_BEST run.
+    All runs are committed at the end.
 
     This is intentionally fault-tolerant: failures are logged but never
     propagated so that experiment persistence cannot break an optimization
@@ -318,12 +404,79 @@ def save_optimization_to_experiment(
             total_reflection_calls=total_reflection_calls,
             elapsed_seconds=elapsed_seconds,
             run_dir=run_dir,
-            eval_details=eval_details,
+            seed_eval_details=seed_eval_details,
+            best_eval_details=best_eval_details,
         )
     except Exception:
         logger.exception(
-            "Failed to persist optimization to experiment %s", experiment_name,
+            "Failed to persist optimization to experiment %s",
+            experiment_name,
         )
+
+
+def save_evaluation_to_experiment(
+    session: Session,
+    experiment_name: str,
+    *,
+    function_name: str,
+    metric_name: str,
+    model_name: str,
+    score: float,
+    num_examples: int,
+    eval_details: list[dict[str, Any]],
+    run_name: str = "EVAL",
+    sample_size: int | None = None,
+    custom_metric_udf: str = "",
+    elapsed_seconds: float | None = None,
+) -> None:
+    """Persist a standalone EVALUATE_AI_FUNCTION result to a Snowflake Experiment.
+
+    Creates the experiment if needed, adds a single ``EVAL`` run with
+    aggregate metrics + parameters, uploads ``eval_detail.json`` to the
+    run's nested stage, then commits.
+
+    Persistence failures (DDL errors, missing privileges, stage upload
+    failures) propagate to the caller so that ``evaluate_handler`` never
+    returns a SnowURL that points at nothing.
+    """
+    create_gepa_experiment(session, experiment_name)
+
+    params: list[dict[str, str]] = [
+        {"name": "function_name", "value": function_name},
+        {"name": "metric_name", "value": metric_name},
+        {"name": "model", "value": model_name},
+        {"name": "num_examples", "value": str(num_examples)},
+        {"name": "status", "value": "completed"},
+    ]
+    if sample_size is not None:
+        params.append({"name": "sample_size", "value": str(sample_size)})
+    if custom_metric_udf:
+        params.append({"name": "custom_metric_udf", "value": custom_metric_udf})
+    if elapsed_seconds is not None:
+        params.append(
+            {"name": "elapsed_seconds", "value": str(round(elapsed_seconds, 2))}
+        )
+
+    metrics: list[dict[str, Any]] = [{"name": "score", "value": score}]
+
+    add_experiment_run(
+        session,
+        experiment_name,
+        run_name,
+        params=params,
+        metrics=metrics,
+    )
+
+    if eval_details:
+        detail_path = write_eval_detail_artifact(eval_details)
+        put_experiment_artifact(
+            session,
+            experiment_name,
+            run_name,
+            local_path=detail_path,
+        )
+
+    commit_experiment_run(session, experiment_name, run_name)
 
 
 def save_failed_run_to_experiment(
@@ -355,7 +508,8 @@ def save_failed_run_to_experiment(
         commit_experiment_run(session, experiment_name, run_name)
     except Exception:
         logger.exception(
-            "Failed to log error run to experiment %s", experiment_name,
+            "Failed to log error run to experiment %s",
+            experiment_name,
         )
 
 
@@ -387,7 +541,8 @@ def _save_optimization_to_experiment_impl(
     total_reflection_calls: int | None,
     elapsed_seconds: float | None,
     run_dir: str | None,
-    eval_details: list[dict[str, Any]] | None,
+    seed_eval_details: list[dict[str, Any]] | None,
+    best_eval_details: list[dict[str, Any]] | None,
 ) -> None:
     # -- SEED run --
     seed_run = make_run_name(model, 0, is_seed=True)
@@ -405,8 +560,11 @@ def _save_optimization_to_experiment_impl(
         test_score=seed_test_score,
     )
     add_experiment_run(
-        session, experiment_name, seed_run,
-        params=seed_params, metrics=seed_metrics,
+        session,
+        experiment_name,
+        seed_run,
+        params=seed_params,
+        metrics=seed_metrics,
     )
     commit_experiment_run(session, experiment_name, seed_run)
 
@@ -415,13 +573,8 @@ def _save_optimization_to_experiment_impl(
         if idx == 0:
             continue
         iter_run = make_run_name(model, idx)
-        iter_score = (
-            val_scores[idx] if val_scores and idx < len(val_scores) else None
-        )
-        parent = (
-            make_run_name(model, idx - 1) if idx > 1
-            else seed_run
-        )
+        iter_score = val_scores[idx] if val_scores and idx < len(val_scores) else None
+        parent = make_run_name(model, idx - 1) if idx > 1 else seed_run
         iter_params = build_run_params(
             function_impl=candidate_text,
             model=model,
@@ -432,17 +585,17 @@ def _save_optimization_to_experiment_impl(
         )
         iter_metrics = build_run_metrics(valset_score=iter_score)
         add_experiment_run(
-            session, experiment_name, iter_run,
-            params=iter_params, metrics=iter_metrics,
+            session,
+            experiment_name,
+            iter_run,
+            params=iter_params,
+            metrics=iter_metrics,
         )
         commit_experiment_run(session, experiment_name, iter_run)
 
     # -- BEST run (summary with aggregate stats) --
     best_run = make_best_run_name(model)
-    best_parent = (
-        make_run_name(model, best_idx) if best_idx > 0
-        else seed_run
-    )
+    best_parent = make_run_name(model, best_idx) if best_idx > 0 else seed_run
     best_params = build_run_params(
         function_impl=best_prompt,
         model=model,
@@ -464,8 +617,11 @@ def _save_optimization_to_experiment_impl(
         test_score=best_test_score,
     )
     add_experiment_run(
-        session, experiment_name, best_run,
-        params=best_params, metrics=best_metrics,
+        session,
+        experiment_name,
+        best_run,
+        params=best_params,
+        metrics=best_metrics,
     )
 
     # Upload artifacts before committing the BEST run.
@@ -474,29 +630,43 @@ def _save_optimization_to_experiment_impl(
     # surface in the SPROC return value for diagnosis.
     if run_dir and os.path.isdir(run_dir):
         run_dir_contents = [
-            f for f in os.listdir(run_dir)
-            if os.path.isfile(os.path.join(run_dir, f))
+            f for f in os.listdir(run_dir) if os.path.isfile(os.path.join(run_dir, f))
         ]
         if run_dir_contents:
             try:
                 put_experiment_artifact(
-                    session, experiment_name, best_run,
-                    local_path=run_dir, subdir="run_dir",
+                    session,
+                    experiment_name,
+                    best_run,
+                    local_path=run_dir,
+                    subdir="run_dir",
                 )
             except Exception as exc:
                 logger.warning(
                     "Failed to upload run_dir artifacts (%d files in %s): %s",
-                    len(run_dir_contents), run_dir, exc,
+                    len(run_dir_contents),
+                    run_dir,
+                    exc,
                 )
 
-    if eval_details:
+    for label, details in (
+        ("seed", seed_eval_details),
+        ("best", best_eval_details),
+    ):
+        if not details:
+            continue
         try:
-            detail_path = write_eval_detail_artifact(eval_details)
+            detail_path = write_eval_detail_artifact(
+                details,
+                filename=f"{label}_eval_detail.json",
+            )
             put_experiment_artifact(
-                session, experiment_name, best_run,
+                session,
+                experiment_name,
+                best_run,
                 local_path=detail_path,
             )
         except Exception as exc:
-            logger.warning("Failed to upload eval detail: %s", exc)
+            logger.warning("Failed to upload %s eval detail: %s", label, exc)
 
     commit_experiment_run(session, experiment_name, best_run)

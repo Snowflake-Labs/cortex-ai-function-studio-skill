@@ -187,7 +187,7 @@ When the user's table has multiple truth columns that correspond to keys in a mu
 Help the user create a view that aggregates the truth columns using `OBJECT_CONSTRUCT`:
 
 ```sql
-CREATE OR REPLACE VIEW {database}.{schema}.{table_name}_WITH_EXPECTED AS
+CREATE VIEW {database}.{schema}.{table_name}_WITH_EXPECTED AS
 SELECT *,
     OBJECT_CONSTRUCT(
         'SENTIMENT', "SENTIMENT",
@@ -203,6 +203,8 @@ Individual keys can be verified with VARIANT syntax:
 ```sql
 SELECT EXPECTED:SENTIMENT, EXPECTED:CONFIDENCE FROM {view_name} LIMIT 5;
 ```
+
+**Note on column type:** The `OBJECT_CONSTRUCT` expression produces a VARIANT column. This is compatible with the evaluate and optimize pipelines, which convert label values to strings internally. The EXPECTED column will contain a JSON object like `{"SENTIMENT": "positive", "CONFIDENCE": 0.95}` — the same format as synthetic data's EXPECTED column. No manual casting is needed.
 
 ---
 
@@ -233,11 +235,11 @@ FROM {source_table};
 SET split_point = (SELECT FLOOR(COUNT(*) * {train_pct} / 100) FROM {base_name}_SPLIT_TEMP);
 
 -- Step 3: Create train table
-CREATE OR REPLACE TABLE {database}.{schema}.{base_name}_TRAIN AS
+CREATE TABLE {database}.{schema}.{base_name}_TRAIN AS
 SELECT * EXCLUDE (_split_rn) FROM {base_name}_SPLIT_TEMP WHERE _split_rn <= $split_point;
 
 -- Step 4: Create test table
-CREATE OR REPLACE TABLE {database}.{schema}.{base_name}_TEST AS
+CREATE TABLE {database}.{schema}.{base_name}_TEST AS
 SELECT * EXCLUDE (_split_rn) FROM {base_name}_SPLIT_TEMP WHERE _split_rn > $split_point;
 
 -- Step 5: Clean up
@@ -279,12 +281,12 @@ SELECT *,
        COUNT(*) OVER (PARTITION BY {label_column}) AS _class_total
 FROM {source_table};
 
-CREATE OR REPLACE TABLE {database}.{schema}.{base_name}_TRAIN AS
+CREATE TABLE {database}.{schema}.{base_name}_TRAIN AS
 SELECT * EXCLUDE (_split_rn, _class_total)
 FROM {base_name}_SPLIT_TEMP
 WHERE _split_rn <= FLOOR(_class_total * {train_pct} / 100);
 
-CREATE OR REPLACE TABLE {database}.{schema}.{base_name}_TEST AS
+CREATE TABLE {database}.{schema}.{base_name}_TEST AS
 SELECT * EXCLUDE (_split_rn, _class_total)
 FROM {base_name}_SPLIT_TEMP
 WHERE _split_rn > FLOOR(_class_total * {train_pct} / 100);

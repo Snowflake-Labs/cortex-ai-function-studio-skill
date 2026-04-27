@@ -26,12 +26,13 @@ Follow these steps sequentially when generating synthetic data.
 
 **IMPORTANT**: The GENERATE_SYNTHETIC_DATA procedure requires a **task description** string, NOT a function name.
 
-When an AI function is already known in context (for example from optimize/evaluate workflows), **do not ask the user to retype intention**. Infer `task_description` in this order:
+When an AI function is already known in context (for example from optimize/evaluate workflows, or when the user named the function in their initial message), **do not ask the user to retype intention**. Infer `task_description` in this order:
 
 1. Function `COMMENT` (intention text)
 2. System prompt from function DDL (fallback)
 
-Then present a quick confirmation/edit prompt:
+If the user named the function up front and inference succeeds, announce the inferred description and proceed without stopping for confirmation. Otherwise (interactive setup with no function context), present a brief confirmation prompt:
+
 ```
 I inferred this task description from your function metadata:
 {inferred_task_description}
@@ -65,6 +66,8 @@ Example:
 Store `input_columns`. For the SQL call, format as comma-separated, single-quoted values:
 `input_columns_csv = 'CLAIM', 'DOCUMENTS'`.
 Store `output_schema` as a JSON object, or `function_name` if inferring from an existing function.
+
+**Pass `--function-name` whenever the target function already exists or any input column is semi-structured (`ARRAY`, `VARIANT`, `OBJECT`).** Do not rely on `--output-schema` alone in those cases — only the function DDL exposes per-parameter types, which the generator needs in order to emit valid JSON values for each semi-structured input (e.g. a JSON array like `["billing","tech"]` for `ARRAY`, a JSON object like `{"author":"...","date":"..."}` for `OBJECT`) instead of degenerate comma-separated strings. Skipping `--function-name` will silently produce malformed data that fails downstream evaluate/optimize.
 
 #### Step 3: Collect Output Table
 
@@ -128,10 +131,10 @@ The script prints a JSON result to stdout:
 
 #### Step 6: Show Results
 
-Display the results to the user:
+Display the results to the user, including the row count and output table name so they know the workflow finished:
 
 ```
-Synthetic data generation complete!
+Synthetic data generation complete! Created {total_generated} examples in {output_table}.
 
 Output table: {output_table}
 Total examples generated: {total_generated}
@@ -143,6 +146,10 @@ The table has the following columns:
   - ID: Auto-incrementing identifier
   - Input columns: One VARCHAR column per input specified by `INPUT_COLUMNS`
   - EXPECTED: VARIANT column containing JSON object with keys from the output schema
+
+Note: The EXPECTED column is VARIANT (JSON object), not VARCHAR. The evaluate and optimize
+pipelines handle this automatically — they convert both EXPECTED and PREDICTED to strings
+internally. No manual casting is needed when passing this table to evaluate/optimize.
 
 To access individual expected values:
   SELECT EXPECTED:key_name FROM {output_table};
@@ -269,6 +276,8 @@ The SPROC creates a table with the following columns:
 | Input columns | VARCHAR | One column per input specified by `INPUT_COLUMNS` |
 | EXPECTED | VARIANT | JSON object containing all output keys from the output schema |
 
+**Input type handling:** All input columns are stored as VARCHAR. When the function has ARRAY-typed parameters and `--function-name` is provided, the generator automatically produces JSON array values (e.g., `["NAME", "EMAIL"]`) instead of plain comma-separated strings. These JSON array strings are correctly detected and parsed by the optimizer and evaluator during downstream workflows.
+
 **Accessing output values**: Use Snowflake's VARIANT syntax to access individual output keys:
 ```sql
 SELECT EXPECTED:verdict, EXPECTED:rationale FROM {output_table};
@@ -307,7 +316,7 @@ Before calling `GENERATE_SYNTHETIC_DATA`, ensure you have collected:
 
 ## Stopping Points
 
-- ✋ Step 1: After inferring/collecting task description
+- ✋ Step 1: After inferring/collecting task description — skip when the user named the function up front and inference succeeded
 - ✋ Step 4: After model selection
 - ✋ Step 6: After showing results
 - ✋ Step 7: After presenting next steps

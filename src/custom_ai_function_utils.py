@@ -218,9 +218,7 @@ def validate_stage_file_access(
         )
 
     try:
-        session.sql(
-            f"SELECT 1 FROM DIRECTORY({stage_name}) LIMIT 1"
-        ).collect()
+        session.sql(f"SELECT 1 FROM DIRECTORY({stage_name}) LIMIT 1").collect()
     except Exception as e:
         raise ValueError(
             f"Cannot access stage {stage_name}. "
@@ -235,18 +233,14 @@ def validate_stage_file_access(
         return
 
     paths_to_check = paths[:3]
-    conditions = " OR ".join(
-        f"RELATIVE_PATH = '{p}'" for p in paths_to_check
-    )
+    conditions = " OR ".join(f"RELATIVE_PATH = '{p}'" for p in paths_to_check)
     try:
         rows = session.sql(
             f"SELECT RELATIVE_PATH FROM DIRECTORY({stage_name}) "
             f"WHERE {conditions} LIMIT 1"
         ).collect()
     except Exception as e:
-        raise ValueError(
-            f"Cannot query files in stage {stage_name}. Error: {e}"
-        ) from e
+        raise ValueError(f"Cannot query files in stage {stage_name}. Error: {e}") from e
 
     if not rows:
         sample_display = ", ".join(f"'{p}'" for p in paths_to_check)
@@ -270,11 +264,7 @@ def _resolve_sample_paths(
         return [p for p in sample_file_paths if p]
 
     if table_name:
-        quoted = (
-            f'"{file_column}"'
-            if not file_column.startswith('"')
-            else file_column
-        )
+        quoted = f'"{file_column}"' if not file_column.startswith('"') else file_column
         rows = session.sql(
             f"SELECT {quoted} AS FP FROM {table_name} "
             f"WHERE {quoted} IS NOT NULL LIMIT 3"
@@ -377,9 +367,7 @@ class RobustAIComplete:
         return json.loads(text)
 
     @classmethod
-    def parse_ai_complete_payload(
-        cls, raw_response: object
-    ) -> object | None:
+    def parse_ai_complete_payload(cls, raw_response: object) -> object | None:
         """Parse AI_COMPLETE response payload into JSON-like Python objects."""
         parsed = cls._parse_json(raw_response)
         if parsed is None:
@@ -554,9 +542,7 @@ class RobustAIComplete:
             )
             message_exprs.append(system_msg)
         message_exprs.append(
-            object_construct(
-                lit("role"), lit("user"), lit("content"), content_expr
-            )
+            object_construct(lit("role"), lit("user"), lit("content"), content_expr)
         )
         messages = array_construct(*message_exprs)
 
@@ -693,11 +679,7 @@ class RobustAIComplete:
             max_tokens=max_tokens,
             response_schema=None,
         )
-        return (
-            cls._parse_json(fallback_result[0])
-            if fallback_result
-            else None
-        )
+        return cls._parse_json(fallback_result[0]) if fallback_result else None
 
 
 STAGE_KEY_PREFIX = "__STAGE_"
@@ -768,7 +750,7 @@ def build_temp_ddl_from_body(
     """
     ddl = normalize_ddl_to_dollar_quoting(original_ddl)
     ddl = re.sub(
-        r"(CREATE\s+OR\s+REPLACE\s+)(?:TEMPORARY\s+)?FUNCTION\s+\S+(\s*\()",
+        r"(CREATE\s+(?:OR\s+REPLACE\s+)?)(?:TEMPORARY\s+)?FUNCTION\s+\S+(\s*\()",
         rf"\g<1>TEMPORARY FUNCTION {temp_function_name}\2",
         ddl,
         flags=re.IGNORECASE,
@@ -781,12 +763,10 @@ _TO_FILE_RE = re.compile(
     r"TO_FILE\(\s*'((?:(?:'')|[^'])+)'\s*,\s*(\w+)\s*\)", re.IGNORECASE
 )
 
-_FILE_PARAM_RE = re.compile(
-    r'"?(\w+)"?\s+FILE\b', re.IGNORECASE
-)
+_FILE_PARAM_RE = re.compile(r'"?(\w+)"?\s+FILE\b', re.IGNORECASE)
 
-_ARRAY_PARAM_RE = re.compile(
-    r'"?(\w+)"?\s+ARRAY\b', re.IGNORECASE
+_SEMI_STRUCTURED_PARAM_RE = re.compile(
+    r'"?(\w+)"?\s+(?:ARRAY|VARIANT|OBJECT)\b', re.IGNORECASE
 )
 
 _PROMPT_WITH_TO_FILE_FIRST_ARG_RE = re.compile(
@@ -886,12 +866,14 @@ def extract_file_type_params(ddl: str) -> list[str] | None:
     return list(dict.fromkeys(matches))
 
 
-def _extract_array_params(ddl: str) -> set[str]:
-    """Extract parameter names declared with ``ARRAY`` data type from DDL.
+def _extract_semi_structured_params(ddl: str) -> set[str]:
+    """Extract parameter names declared as semi-structured types from DDL.
 
-    Returns a set of upper-cased parameter names whose type is ``ARRAY``.
-    Used by :meth:`TempAIFunction.call_rows` to cast columns back to ARRAY
-    after ``session.create_dataframe`` converts Python lists to VARCHAR.
+    Returns a set of upper-cased parameter names whose type is ``ARRAY``,
+    ``VARIANT``, or ``OBJECT``.  These parameters need ``parse_json()``
+    wrapping when called via ``create_dataframe`` because their Python
+    values (lists, dicts) must be normalized to JSON strings to avoid
+    mixed-type schema inference issues.
     """
     ddl = normalize_ddl_to_dollar_quoting(ddl)
     sig_match = re.search(
@@ -902,8 +884,11 @@ def _extract_array_params(ddl: str) -> set[str]:
     if not sig_match:
         return set()
     param_list = sig_match.group(1)
-    matches = _ARRAY_PARAM_RE.findall(param_list)
+    matches = _SEMI_STRUCTURED_PARAM_RE.findall(param_list)
     return {m.upper() for m in matches}
+
+
+_extract_array_params = _extract_semi_structured_params
 
 
 class TempAIFunction:
@@ -924,9 +909,11 @@ class TempAIFunction:
         self.temp_function_name = temp_function_name
         self.candidate_model = candidate_model
         self.candidate_prompt = candidate_prompt
-        self._file_type_params = {p.upper() for p in file_type_params} if file_type_params else set()
+        self._file_type_params = (
+            {p.upper() for p in file_type_params} if file_type_params else set()
+        )
         self._stage_name = stage_name
-        self._array_type_params = _extract_array_params(original_ddl)
+        self._semi_structured_params = _extract_semi_structured_params(original_ddl)
 
         self.accessor_field = self._extract_output_accessor(original_ddl)
 
@@ -1141,7 +1128,10 @@ class TempAIFunction:
                 continue
 
             value_start = match.end()
-            while value_start < len(ai_complete_inner) and ai_complete_inner[value_start].isspace():
+            while (
+                value_start < len(ai_complete_inner)
+                and ai_complete_inner[value_start].isspace()
+            ):
                 value_start += 1
             if value_start >= len(ai_complete_inner):
                 return ai_complete_inner
@@ -1159,9 +1149,7 @@ class TempAIFunction:
         return ai_complete_inner
 
     @classmethod
-    def _replace_ai_complete_model(
-        cls, ddl: str, candidate_model: str
-    ) -> str:
+    def _replace_ai_complete_model(cls, ddl: str, candidate_model: str) -> str:
         """Replace model argument in the first AI_COMPLETE(...) call with a literal."""
         found = cls._find_ai_complete_call(ddl)
         if not found:
@@ -1205,7 +1193,7 @@ class TempAIFunction:
 
         # Replace function name and make it TEMPORARY
         ddl = re.sub(
-            r"(CREATE\s+OR\s+REPLACE\s+)(?:TEMPORARY\s+)?FUNCTION\s+\S+(\s*\()",
+            r"(CREATE\s+(?:OR\s+REPLACE\s+)?)(?:TEMPORARY\s+)?FUNCTION\s+\S+(\s*\()",
             rf"\g<1>TEMPORARY FUNCTION {temp_function_name}\2",
             ddl,
             count=1,
@@ -1236,13 +1224,18 @@ class TempAIFunction:
             return []
 
         # Stable row id to preserve input order.
-        # Pre-serialize ARRAY-typed values to JSON so that create_dataframe
-        # stores a valid JSON string that parse_json() can restore to ARRAY.
+        # Normalize semi-structured values (ARRAY, VARIANT, OBJECT) to JSON
+        # strings so the column is uniformly VARCHAR (avoids mixed-type
+        # schema inference issues).
         indexed_rows = []
         for idx, row in enumerate(rows):
             r = {"__ROW_ID": idx}
             for k, v in (row or {}).items():
-                if self._array_type_params and k.upper() in self._array_type_params and isinstance(v, (list, tuple)):
+                if (
+                    self._semi_structured_params
+                    and k.upper() in self._semi_structured_params
+                    and isinstance(v, (list, tuple, dict))
+                ):
                     r[k] = json.dumps(v)
                 else:
                     r[k] = v
@@ -1262,10 +1255,19 @@ class TempAIFunction:
                 continue
             per_row_stage_col = f"{STAGE_KEY_PREFIX}{c}"
             if per_row_stage_col in seen:
-                arg_cols.append(call_function("TO_FILE", col(per_row_stage_col), col(c)))
-            elif self._file_type_params and c.upper() in self._file_type_params and self._stage_name:
+                arg_cols.append(
+                    call_function("TO_FILE", col(per_row_stage_col), col(c))
+                )
+            elif (
+                self._file_type_params
+                and c.upper() in self._file_type_params
+                and self._stage_name
+            ):
                 arg_cols.append(call_function("TO_FILE", lit(self._stage_name), col(c)))
-            elif self._array_type_params and c.upper() in self._array_type_params:
+            elif (
+                self._semi_structured_params
+                and c.upper() in self._semi_structured_params
+            ):
                 arg_cols.append(parse_json(col(c)))
             else:
                 arg_cols.append(col(c))

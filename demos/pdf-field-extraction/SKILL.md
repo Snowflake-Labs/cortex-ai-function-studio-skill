@@ -1,6 +1,6 @@
 ---
 name: pdf-field-extraction-demo
-description: "Interactive demo: Extract structured fields from SEC 10-K filing PDFs using multimodal AI, then evaluate and optimize across document models via GEPA prompt optimization."
+description: "Interactive demo: Extract structured fields from SEC 10-K filing PDFs using multimodal AI, create a custom composite metric for per-field scoring, and evaluate extraction accuracy with per-field analysis."
 parent_skill: demos
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
@@ -8,13 +8,11 @@ parent_skill: demos
 
 # SEC 10-K PDF Field Extraction Demo
 
-Build a multimodal AI function that extracts structured metadata from SEC 10-K filing PDFs, then evaluate accuracy and optimize prompts across document-capable models.
+Build a multimodal AI function that extracts structured metadata from SEC 10-K filing PDFs, then evaluate with a custom composite metric for per-field analysis.
 
 ## Overview
 
-Download real SEC EDGAR filings → convert cover pages to PDF → build an extraction function → evaluate baseline → create a custom composite metric → run GEPA optimization → compare cost/quality trade-offs. This is a **multimodal document** demo: the AI function reads PDFs from a Snowflake stage using `TO_FILE()`.
-
-**Estimated time:** 20-40 minutes (GEPA optimization accounts for most of this).
+Load real SEC EDGAR filings → build an extraction function → create a custom composite metric → evaluate extraction accuracy → analyze per-field results. This is a **multimodal document** demo: the AI function reads PDFs from a Snowflake stage using `TO_FILE()`. **Estimated time:** ~10 minutes.
 
 **Ground truth** is sourced from the EDGAR submissions API (company metadata), NOT from parsing the PDFs — ensuring 100% deterministic accuracy.
 
@@ -26,28 +24,24 @@ Explain to user:
 ```
 Welcome to the SEC 10-K PDF Field Extraction Demo!
 
-At the end of this demo, you will witness the Cortex AI Function Studio's ability to:
-- Extract structured fields from real SEC filing PDFs using multimodal AI_COMPLETE
-- Measure extraction accuracy with a custom composite metric
-- Optimize prompts using GEPA to improve cheaper document models
-- Compare cost vs. quality trade-offs across models using Pareto analysis
+This demo showcases multimodal document extraction with a custom
+composite metric and per-field evaluation:
 
-This demo downloads real 10-K annual report filings from the SEC EDGAR
-database, converts them to PDF, and challenges AI models to extract
-four key fields from each cover page:
+1. **Load Data** — Upload real SEC 10-K filing cover pages (PDFs) to a stage
+2. **Build the Function** — Create a multimodal extraction function
+3. **Custom Metric** — Build a weighted composite metric that scores four
+   fields independently (company name, date, EIN, state)
+4. **Evaluate** — Run the function against test data using the custom metric
+5. **Analyze** — Inspect per-field results to understand extraction
+   strengths and failure modes
 
-  company_name            — legal registrant name
-  report_date             — fiscal year end date (YYYY-MM-DD)
-  irs_ein                 — IRS Employer Identification Number (XX-XXXXXXX)
-  state_of_incorporation  — full state name (e.g. "Delaware")
-
-Ground truth comes from the EDGAR submissions API — deterministic and
-always correct. The model must read the PDF to find these same fields.
+The custom composite metric is key: by scoring each field independently,
+you get per-field visibility into extraction quality that a simple
+exact_match on the whole output would miss (e.g., "company name fuzzy
+mismatch due to abbreviation" vs "all other fields perfect").
 
 Objects created: all prefixed with DEMO_ for easy cleanup.
 ```
-
-**⚠️ STOP**: Ask user if they want to proceed before continuing.
 
 ### Step 2: Setup - Choose Location
 
@@ -61,7 +55,7 @@ Schema: [e.g., PUBLIC]
 
 Store the database and schema for use throughout the demo.
 
-### Step 3: Dataset Consent & Data Loading
+### Step 3: Dataset & Data Loading
 
 Explain to user:
 ```
@@ -71,7 +65,6 @@ creates labeled train/test tables.
 
 Source:  SEC EDGAR (https://www.sec.gov/edgar)
 Data:   Public filings from ~80 well-known US companies across industries
-        (technology, finance, healthcare, consumer, energy, industrial, defense)
 License: SEC filings are public domain
 
 The script will:
@@ -84,7 +77,7 @@ The script will:
 
 Run the data generation script:
 ```bash
-uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_sec_filing_data.py \
+PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_sec_filing_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
   --schema {schema}
@@ -94,7 +87,7 @@ uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_sec_fil
 
 Verify creation:
 ```sql
-SELECT 'TRAIN' AS SPLIT, COUNT(*) AS ROWS
+SELECT 'TRAIN' AS SPLIT, COUNT(*) AS ROW_COUNT
 FROM {database}.{schema}.DEMO_SEC_FILING_TRAIN
 UNION ALL
 SELECT 'TEST', COUNT(*)
@@ -167,15 +160,13 @@ User prompt template: "{FILE_PATH}"
 
 Return here after the smoke test succeeds.
 
-**Troubleshooting:** If the smoke test fails, verify the stage has SSE encryption and the model supports document inputs. Try `claude-sonnet-4-5` as fallback. See `references/multimodal_setup.md` for the full list of document-capable models.
-
 ### Step 5: Create Custom Composite Metric
 
 Explain to user:
 ```
 Before evaluation, we'll create a custom composite metric that scores
-each extracted field independently. This gives the optimizer fine-grained
-feedback to improve field-specific extraction.
+each extracted field independently. This gives you per-field visibility
+into extraction quality that a simple exact_match would miss.
 
 Custom metric: DEMO_SEC_EXTRACTION_METRIC
 Fields and weights:
@@ -199,175 +190,127 @@ Use this pre-approved field configuration (skip the field-by-field prompting in 
 
 | Field | Check | Weight | Notes |
 |-------|-------|--------|-------|
-| `company_name` | fuzzy_match | 0.30 | Use `SequenceMatcher` on lowered strings. Treat score ≥ 0.9 as "match" in feedback. |
+| `company_name` | fuzzy_match | 0.30 | Use `SequenceMatcher` on lowered strings. Treat score >= 0.9 as "match" in feedback. |
 | `report_date` | exact_match | 0.25 | Compare YYYY-MM-DD strings exactly. |
 | `irs_ein` | normalized exact match | 0.25 | Strip all non-digit characters before comparing (so "94-2404110" equals "942404110"). |
-| `state_of_incorporation` | case-insensitive match with fuzzy fallback | 0.20 | First try case-insensitive exact match. If that fails, use `SequenceMatcher` and treat score ≥ 0.85 as a match (to handle minor spelling variations). |
+| `state_of_incorporation` | case-insensitive match with fuzzy fallback | 0.20 | First try case-insensitive exact match. If that fails, use `SequenceMatcher` and treat score >= 0.85 as a match (to handle minor spelling variations). |
 
-Follow the custom_metrics workflow from **Step 2 onward** (write code → test → create UDF). Return here after the metric UDF is created and smoke-tested.
+Follow the custom_metrics workflow from **Step 2 onward** (write code, test, create UDF). Return here after the metric UDF is created and smoke-tested.
 
 ### Step 6: Evaluate the Extraction Function
 
 Present the evaluation configuration:
 ```
-Let's evaluate how well the function extracts fields from the test PDFs.
+Now we'll evaluate the extraction function against the test set using
+the custom composite metric. This scores every row across all four
+fields and saves detailed per-row results for analysis.
 
-We'll use the custom composite metric which scores all four fields with
-independent checks and weighted scoring.
+Please confirm or modify any settings:
 
 Metric: sec_extraction_metric (custom composite)
 Custom metric UDF: {database}.{schema}.DEMO_SEC_EXTRACTION_METRIC
-Results table: DEMO_EXTRACT_SEC_FIELDS_EVAL_RESULTS
+Test table: {database}.{schema}.DEMO_SEC_FILING_TEST
+Label column: EXPECTED_OUTPUT
+Experiment: auto-generated per evaluation (run_id)
+
+Options:
+1. Yes - Run evaluation with these settings
+2. Modify - Change settings before running
+3. No - Skip to cleanup
 ```
 
 **⚠️ STOP**: Wait for user confirmation before running evaluation.
 
-**Load** `evaluate/SKILL.md` and follow it from **Step 5 onward**, passing:
+If user chooses No, skip to Step 8.
+
+If yes, **load** `evaluate/SKILL.md` and follow it from **Step 4 onward** (Run Evaluation), passing:
 - `function_name`: `{database}.{schema}.DEMO_EXTRACT_SEC_FIELDS`
 - `function_model`: `gemini-2.5-flash`
 - `test_table`: `{database}.{schema}.DEMO_SEC_FILING_TEST`
 - `input_columns`: `['FILE_PATH']`
 - `label_column`: `EXPECTED_OUTPUT`
-- `metric`: `sec_extraction_metric`
+- `metric_name`: `sec_extraction_metric`
 - `custom_metric_udf`: `{database}.{schema}.DEMO_SEC_EXTRACTION_METRIC`
-- `results_table`: `{database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_EVAL_RESULTS`
 
-**Async by default:** When the evaluate workflow reaches the execution mode selection, choose **async** (`EVALUATE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error, fall back to sync execution. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session. **Load** `references/async_status.md` for polling patterns.
+The evaluation run will auto-create an experiment named after its `run_id`. After it returns, capture `experiment_name` from the JSON output for the queries below.
 
-**Skip Step 7 (next steps)** in the evaluate workflow — return here after results are presented.
+**Skip Step 6 (next steps)** in the evaluate workflow — return here after results are presented.
 
-Once evaluation is done, review the results. Show the scores to the user. Offer to see extraction errors:
+### Step 7: Analyze Results
+
+After evaluation completes, walk the user through the per-field results.
+
+**7.1. Show the overall score and score distribution** (per-row details live in the per-evaluation experiment's `eval_detail.json`). First create the JSON file format (required — inline `(TYPE => JSON)` isn't supported on SnowURL paths):
+
+```sql
+CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE;
+
+SELECT
+    COUNT(*) AS TOTAL_ROWS,
+    ROUND(AVG($1:metric_score::FLOAT), 3) AS AVG_SCORE,
+    SUM(CASE WHEN $1:metric_score::FLOAT = 1.0 THEN 1 ELSE 0 END) AS PERFECT_ROWS,
+    SUM(CASE WHEN $1:metric_score::FLOAT < 1.0 THEN 1 ELSE 0 END) AS IMPERFECT_ROWS
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt);
 ```
-Would you like to see which filings had extraction errors?
+
+**7.2. Offer to inspect failures:**
+
+```
+Would you like to see which filings the function extracted incorrectly?
 ```
 
-If yes, query the results table:
+If yes, query the artifact directly:
 ```sql
 SELECT
-    LEFT(INPUT_TEXT, 60) AS FILE,
-    SCORE,
-    FEEDBACK
-FROM {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_EVAL_RESULTS
-WHERE SCORE < 1.0
+    LEFT($1:input_text::STRING, 60) AS FILE,
+    ROUND($1:metric_score::FLOAT, 3) AS SCORE,
+    $1:metric_feedback::STRING AS FEEDBACK
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
+WHERE $1:metric_score::FLOAT < 1.0
 ORDER BY SCORE
 LIMIT 15;
 ```
 
-Discuss common failure patterns: date format mismatches (model returns "September 28, 2024" instead of "2024-09-28"), EIN formatting differences, company name suffix variations ("Inc." vs "Inc" vs "Incorporated"), state abbreviations instead of full names.
+> Querying `'snow://experiment/...'` requires the server-side parameter `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION` to be enabled. The path is a string literal (not `@stage`) and must be paired with a **named** FILE FORMAT.
 
-After reviewing results, continue to Step 7.
+**7.3. Discuss failure patterns:**
 
-### Step 7: Optimize with GEPA
+Analyze the feedback column to identify common themes. Typical patterns for this dataset:
+- **Company name abbreviations vs. full names**: Ground truth from EDGAR API uses abbreviated forms ("FEDEX CORP") while the model extracts the full legal name from the cover page ("FedEx Corporation"). The model is often more correct than the ground truth.
+- **Multi-registrant filings**: Some filings list parent company + subsidiaries; the model may extract the wrong entity.
+- **Ground truth noise**: The EDGAR submissions API metadata doesn't always match what's printed on the PDF cover page — this creates a ceiling on achievable accuracy.
 
-Present the optimization configuration:
-```
-Now we'll use GEPA to optimize the extraction prompt across
-document-capable models.
-
-GEPA (Genetic-Pareto Algorithm) evolves the system prompt through
-multiple generations:
-1. Scores prompt variations against training examples
-2. Reflects on extraction failures — analyzing WHY specific fields
-   were extracted incorrectly (e.g., "model returned state abbreviation
-   instead of full name", "date format was not normalized to YYYY-MM-DD")
-3. Generates new prompt variations informed by those reflections
-4. Keeps only Pareto-optimal performers (best quality at each cost level)
-
-Please confirm or modify any settings:
-
-Auto budget: medium (~10-20 minutes)
-Metric: sec_extraction_metric (custom composite)
-Label column: EXPECTED_OUTPUT
-Experiment: DEMO_EXTRACT_SEC_FIELDS_OPT_EXP
-Models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'claude-haiku-4-5']
-
-Options:
-1. Yes - Run GEPA optimization with these settings
-2. Modify - Change settings before running
-3. No - Skip to cleanup
-```
-
-**⚠️ STOP**: Wait for user confirmation before starting optimization.
-
-If user chooses No, skip to Step 9.
-
-If yes, **load** `optimize/SKILL.md` and follow it from **Step 6 onward**, passing:
-- `function_name`: `{database}.{schema}.DEMO_EXTRACT_SEC_FIELDS`
-- `training_table`: `{database}.{schema}.DEMO_SEC_FILING_TRAIN`
-- `test_table`: `{database}.{schema}.DEMO_SEC_FILING_TEST`
-- `input_columns`: `['FILE_PATH']`
-- `label_column`: `EXPECTED_OUTPUT`
-- `metric`: `sec_extraction_metric`
-- `custom_metric_udf`: `{database}.{schema}.DEMO_SEC_EXTRACTION_METRIC`
-- `models`: `['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'claude-haiku-4-5']`
-- `reflection_model`: `claude-opus-4-6` (or strongest available Claude-family model)
-- `auto_budget`: `medium`
-- `experiment_name`: `{database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_OPT_EXP`
-
-**Async by default:** When the optimize workflow reaches the execution mode selection, choose **async** (`OPTIMIZE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error, fall back to sync with `timeout_seconds: 14400`. After kicking off the async job, poll `TASK_HISTORY()` for completion. **Load** `references/async_status.md` for polling patterns.
-
-**Skip Step 9 (next steps)** in the optimize workflow — return here after results are presented and the user has decided whether to apply the optimized prompt.
-
-### Step 8: Summarize GEPA Results
-
-After optimization completes, present results and compare before/after.
-
-**8.1. Show the optimization journey:**
-
-```sql
--- List all runs (SEED, ITER_1..N, BEST per model)
-SHOW RUNS IN EXPERIMENT {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_OPT_EXP;
-
--- View metrics for each run to see how scores evolved
--- Run names follow the pattern: {MODEL}_SEED, {MODEL}_ITER_1, ..., {MODEL}_BEST
--- where {MODEL} is the uppercased model name with non-alphanumeric chars replaced by _
-SHOW RUN METRICS IN EXPERIMENT {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_OPT_EXP;
-```
-
-Highlight how prompts evolve — early candidates use generic instructions ("extract fields from this document"), later candidates include specific formatting rules (YYYY-MM-DD dates, XX-XXXXXXX EIN format, full state name vs abbreviation) that GEPA learned from extraction error feedback.
-
-**8.2. Compare baseline vs. optimized:**
-
-```sql
--- Compare seed vs best for each model
-SHOW RUN METRICS IN EXPERIMENT {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_OPT_EXP;
--- Look for {MODEL}_SEED and {MODEL}_BEST rows and compare valset_score
-```
-
-**8.3. Pareto analysis for cost/quality:**
-
-Calculate character lengths from the test table:
-```sql
-SELECT
-    120 AS avg_output_chars
-FROM {database}.{schema}.DEMO_SEC_FILING_TEST;
-```
-
-Note: for document functions, actual cost is dominated by document token count, not text chars. The Pareto filter gives a relative cost ordering which is still directionally useful.
-
-```bash
-PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/filter_pareto.py \
-    --json '[{"model": "model1", "score": 0.85}, ...]' \
-    --prompt-chars {prompt_chars} --avg-output-chars {avg_output_chars} \
-    --seed-score {baseline_score} --format table
-```
-
-**8.4. Summarize key findings:**
+**7.4. Summarize key findings:**
 
 ```
-Key result: {best_model} achieves {optimized_score:.0%} composite extraction
-accuracy at ~{cost_ratio}x cheaper than {strong_reference}. GEPA closed the
-quality gap through prompt optimization alone.
+Key findings:
 
-What GEPA learned:
-- Reflected on extraction failures across {total_candidates} prompt variations
-- Learned format-specific instructions (YYYY-MM-DD dates, XX-XXXXXXX EIN
-  format, full state names) that a generic prompt misses
-- Evolved from "extract fields from this document" to detailed extraction
-  rubrics with field-specific formatting rules and common error guards
+1. The model achieves ~{avg_score:.0%} composite extraction accuracy
+   across {total_rows} SEC 10-K filings.
+
+2. Most errors are in the company_name field — the model extracts the
+   full legal name from the PDF while the EDGAR API ground truth often
+   uses abbreviated forms. The report_date, irs_ein, and
+   state_of_incorporation fields are nearly perfect.
+
+3. The custom composite metric was essential here: a simple exact_match
+   on the full JSON output would score ~{perfect_pct:.0%} (only perfect
+   matches), while the composite metric gives partial credit and reveals
+   that individual field accuracy is much higher.
+
+Why composite metrics matter for multi-field extraction:
+- Different fields need different comparison logic (fuzzy match for
+  names, normalized match for EINs, exact match for dates)
+- Per-field feedback pinpoints which extractions need improvement
+- Weighted scores reflect business priorities (company name matters
+  more than EIN format)
 ```
 
-### Step 9: Cleanup
+### Step 8: Cleanup
 
 Ask user:
 ```
@@ -381,8 +324,7 @@ This will drop:
 - {database}.{schema}.DEMO_SEC_FILING_TEST
 - {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS (function)
 - {database}.{schema}.DEMO_SEC_EXTRACTION_METRIC (metric)
-- {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_EVAL_RESULTS
-- {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_OPT_EXP
+- The per-evaluation experiment ({experiment_name})
 ```
 
 **⚠️ STOP**: Wait for user confirmation before cleanup.
@@ -394,13 +336,10 @@ DROP TABLE IF EXISTS {database}.{schema}.DEMO_SEC_FILING_TRAIN;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_SEC_FILING_TEST;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS(VARCHAR);
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_SEC_EXTRACTION_METRIC(VARCHAR, VARCHAR);
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_EVAL_RESULTS;
-DROP EXPERIMENT IF EXISTS {database}.{schema}.DEMO_EXTRACT_SEC_FIELDS_OPT_EXP;
+DROP EXPERIMENT IF EXISTS {database}.{schema}.{experiment_name};
 ```
 
-### Step 10: Next Steps
-
-Summarize the workflow: public SEC filings → PDF conversion → multimodal extraction function → custom composite metric → baseline evaluation → GEPA optimization → cost/quality Pareto analysis.
+### Step 9: Next Steps
 
 Explain to user:
 ```
@@ -409,23 +348,26 @@ Thanks for trying the SEC 10-K PDF Field Extraction demo!
 Here's what you learned:
 - **Created** a multimodal AI function that extracts structured fields from PDFs
 - **Built** a custom composite metric that scores four fields independently
-- **Evaluated** extraction accuracy against deterministic ground truth
-- **Optimized** the prompt using GEPA to improve accuracy across document models
+- **Evaluated** extraction accuracy and analyzed per-field results
 
-Key takeaways about document extraction with GEPA:
+Key takeaways about document extraction with custom metrics:
 
-  Format precision matters: Generic prompts produce inconsistent formats
-  (date as "September 28, 2024" vs "2024-09-28", state as "DE" vs
-  "Delaware"). GEPA learns to embed explicit format rules by reflecting
-  on per-field error feedback.
+  Composite metrics reveal per-field quality: A simple exact_match on
+  the whole JSON output gives a binary pass/fail. The composite metric
+  breaks this down — you can see that date and EIN extraction is nearly
+  perfect while company name matching is the weak spot.
 
-  Composite metrics unlock targeted optimization: By scoring each field
-  separately, GEPA can identify which fields need the most attention
-  and evolve prompts that address field-specific failure modes.
+  Different fields need different comparison logic: Fuzzy matching for
+  company names (handles abbreviations), normalized matching for EINs
+  (strips formatting), exact matching for dates. One-size-fits-all
+  metrics miss these nuances.
 
-  Cost savings: Cheaper document models (gemini-2.5-flash-lite) with
-  optimized prompts can approach the accuracy of expensive models with
-  generic prompts.
+  Ground truth quality matters: The EDGAR API metadata doesn't always
+  match what's printed on the PDF cover page. Understanding ground
+  truth noise is essential for interpreting evaluation results fairly.
+
+Want to improve extraction accuracy? Try refining your prompt, adjusting
+the composite metric weights, or experimenting with different models.
 
 Ready to build your own document extraction function? Just say
 "create an AI function" and mention that you want to process PDFs.
@@ -434,7 +376,7 @@ Ready to build your own document extraction function? Just say
 ## Key Cautions
 
 - SEC filings are public domain; no license restrictions
-- Ground truth is from the EDGAR API, not from the PDFs — any discrepancy between the API metadata and the document content (e.g., company name change between filing date and current API data) may cause false negatives
+- Ground truth is from the EDGAR API, not from the PDFs — any discrepancy between the API metadata and the document content may cause false negatives
 - Stage requires `ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')` for multimodal `TO_FILE()` access
 - PDF rendering quality depends on the original HTML structure; some older filings may render with missing styles
 - To regenerate the bundled dataset, run `make build-sec-data` (requires `playwright`); this produces `data.zip`
@@ -443,9 +385,8 @@ Ready to build your own document extraction function? Just say
 
 - ✋ Step 1: After introduction
 - ✋ Step 2: After choosing database and schema
-- ✋ Step 3: Before data loading (confirm filing count)
+- ✋ Step 3: Before data loading
 - ✋ Step 4: Before creating the extraction function
 - ✋ Step 5: Before creating custom metric
 - ✋ Step 6: Before evaluation
-- ✋ Step 7: Before GEPA optimization
-- ✋ Step 9: Before cleanup
+- ✋ Step 8: Before cleanup

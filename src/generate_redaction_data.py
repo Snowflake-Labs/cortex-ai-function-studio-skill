@@ -24,8 +24,9 @@ from typing import Any
 import datasets
 import numpy as np
 import pandas as pd
-import snowflake.connector
-from snowflake.connector.pandas_tools import write_pandas
+from snowflake.snowpark import Session
+
+from custom_ai_function_utils import create_session_from_connection
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def convert_to_serializable(obj: Any) -> Any:
 
 
 def create_table(
-    conn: snowflake.connector.SnowflakeConnection,
+    session: Session,
     database: str,
     schema: str,
     table_name: str,
@@ -57,25 +58,25 @@ def create_table(
     """Create a table for storing redaction demo data.
 
     Args:
-        conn: Active Snowflake connection.
+        session: Active Snowpark session.
         database: The database name.
         schema: The schema name.
         table_name: The table name.
     """
     fqn = f"{database}.{schema}.{table_name}"
     sql = f"""
-        CREATE OR REPLACE TABLE {fqn} (
+        CREATE TABLE {fqn} (
             INPUT_TEXT VARCHAR,
             EXPECTED_OUTPUT VARCHAR,
             PRIVACY_MASK VARIANT
         )
     """
     logger.info(f"Creating table {fqn}...")
-    conn.cursor().execute(sql)
+    session.sql(sql).collect()
 
 
 def insert_data(
-    conn: snowflake.connector.SnowflakeConnection,
+    session: Session,
     database: str,
     schema: str,
     table_name: str,
@@ -84,7 +85,7 @@ def insert_data(
     """Insert data into a redaction demo table.
 
     Args:
-        conn: Active Snowflake connection.
+        session: Active Snowpark session.
         database: The database name.
         schema: The schema name.
         table_name: The table name.
@@ -102,7 +103,13 @@ def insert_data(
             ),
         }
     )
-    write_pandas(conn, upload_df, table_name, database=database, schema=schema)
+    from snowflake.snowpark.types import StructType, StructField, StringType
+
+    sp_schema = StructType([StructField(c, StringType()) for c in upload_df.columns])
+    rows = list(upload_df.itertuples(index=False, name=None))
+    session.create_dataframe(rows, schema=sp_schema).write.mode("append").save_as_table(
+        fqn
+    )
 
 
 def main(
@@ -146,17 +153,16 @@ def main(
     train_df = sampled.head(train)
     test_df = sampled.tail(test)
 
-    logger.info(f"Connecting to Snowflake using connection '{connection}'...")
-    conn = snowflake.connector.connect(
-        connection_name=os.getenv("SNOWFLAKE_CONNECTION_NAME") or connection
-    )
+    conn_name = os.getenv("SNOWFLAKE_CONNECTION_NAME") or connection
+    logger.info(f"Connecting to Snowflake using connection '{conn_name}'...")
+    session = create_session_from_connection(conn_name)
 
     try:
-        create_table(conn, database, schema, "DEMO_REDACTION_TRAIN")
-        insert_data(conn, database, schema, "DEMO_REDACTION_TRAIN", train_df)
+        create_table(session, database, schema, "DEMO_REDACTION_TRAIN")
+        insert_data(session, database, schema, "DEMO_REDACTION_TRAIN", train_df)
 
-        create_table(conn, database, schema, "DEMO_REDACTION_TEST")
-        insert_data(conn, database, schema, "DEMO_REDACTION_TEST", test_df)
+        create_table(session, database, schema, "DEMO_REDACTION_TEST")
+        insert_data(session, database, schema, "DEMO_REDACTION_TEST", test_df)
 
         logger.info("Done!")
         logger.info(
@@ -166,7 +172,7 @@ def main(
             f"  Test table: {database}.{schema}.DEMO_REDACTION_TEST ({len(test_df)} rows)"
         )
     finally:
-        conn.close()
+        session.close()
 
 
 if __name__ == "__main__":

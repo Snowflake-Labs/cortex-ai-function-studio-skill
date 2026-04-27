@@ -1,6 +1,6 @@
 ---
 name: demos
-description: "Interactive demos showcasing custom AI function capabilities — organized by feature, not just dataset. Each demo highlights specific studio capabilities."
+description: "Interactive demos for custom AI functions. Use when: demo, example, walkthrough, show me, how does this work, try it, hands-on, tutorial."
 parent_skill: cortex-ai-function-studio
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
@@ -14,11 +14,61 @@ Interactive walkthroughs organized by **feature** — each demo highlights speci
 
 Load from main skill when user intent matches DEMO: "demo", "example", "walkthrough", "show me", "how does this work".
 
+**Prerequisites:** Before routing to a demo, ensure the user has a database and schema with CREATE TABLE/FUNCTION privileges. If not already established, the demo sub-skill will prompt for location.
+
 ## Workflow
 
 ### Step 1: Select Demo
 
-Ask user:
+**If `environment == snowsight`**, ask user:
+```
+Which demo would you like to try?
+
+1. **Pseudo-Labeling & Teacher-Student Distillation** (~10 min)
+   Start with unlabeled insurance claims, generate ground truth labels
+   with a strong teacher model (Claude Opus), then build a cheap student
+   model and measure how closely it reproduces teacher decisions.
+   Features: Synthetic Data (pseudo-label), Create, Evaluate
+
+2. **Prompt Optimization** (~10 min)
+   Take a policy-conditioned ticket router where cheap models fail badly
+   on unfamiliar company vocabulary, then watch prompt optimization close
+   the accuracy gap through prompt evolution and Pareto cost/quality analysis.
+   Features: Create, Optimize, Pareto Analysis
+
+---
+
+The following demos are currently available in the CLI only.
+They may be supported in Snowsight in a future update.
+
+3. **Quick Start: Create & Evaluate** (~5 min)
+   Build a toxicity classifier and measure its accuracy — the fastest
+   way to experience the core workflow. Uses built-in exact_match metric.
+   Features: Create (direct mode), Evaluate
+
+4. **Custom Evaluation Metrics** (~5 min)
+   Build a legal contract field extractor and create a weighted composite
+   metric that scores 4 fields independently — governing law, parties,
+   effective date, expiration date. See how custom metrics give richer
+   signal than simple exact_match.
+   Features: Create, Custom Composite Metrics, Evaluate
+
+5. **Multimodal: Document Extraction** (~10 min)
+   Extract structured fields from SEC 10-K filing PDFs, build a custom
+   composite metric for multi-field scoring, and evaluate extraction
+   accuracy with per-field analysis.
+   Features: Multimodal (PDFs), Custom Metrics, Evaluate
+
+6. **Agent Research: Pre/Post-Processing** (~10 min) [Experimental]
+   Build a PII redaction function using Agent Research mode — the agent
+   searches the web for state-of-the-art techniques, proposes multiple
+   SQL UDF architectures with pre- and post-processing around AI_COMPLETE,
+   and you pick the approach. Then optimize the entire function body —
+   prompts, model, and SQL logic.
+   Features: Create (Agent Research mode, web search, SQL pre/post-processing), Optimize (body mode)
+```
+
+**If `environment == cli`** (or not set), ask user:
 ```
 Which demo would you like to try?
 
@@ -40,34 +90,32 @@ Which demo would you like to try?
    signal than simple exact_match.
    Features: Create, Custom Composite Metrics, Evaluate
 
-4. **Prompt Optimization** (~15-20 min)
+4. **Prompt Optimization** (~10 min)
    Take a policy-conditioned ticket router where cheap models fail badly
    on unfamiliar company vocabulary, then watch prompt optimization close
    the accuracy gap through prompt evolution and Pareto cost/quality analysis.
    Features: Create, Optimize, Pareto Analysis
 
-5. **Multimodal: Image Classification** (~15-20 min)
-   Classify second-hand clothing condition from garment photos. Prompt
-   optimization evolves a generic 7-word prompt into a detailed grading rubric with
-   visual cue definitions that models need to distinguish condition grades.
-   Features: Multimodal (images), Create, Optimize
-
-6. **Multimodal: Document Extraction** (~20-30 min)
+5. **Multimodal: Document Extraction** (~10 min)
    Extract structured fields from SEC 10-K filing PDFs, build a custom
-   composite metric for multi-field scoring, and optimize across
-   document-capable models.
-   Features: Multimodal (PDFs), Custom Metrics, Optimize
+   composite metric for multi-field scoring, and evaluate extraction
+   accuracy with per-field analysis.
+   Features: Multimodal (PDFs), Custom Metrics, Evaluate
 
-7. **Agent Research: Pre/Post-Processing** (~10-15 min) [Experimental]
+6. **Agent Research: Pre/Post-Processing** (~10 min) [Experimental]
    Build a PII redaction function using Agent Research mode — the agent
    searches the web for state-of-the-art techniques, proposes multiple
    SQL UDF architectures with pre- and post-processing around AI_COMPLETE,
-   and you pick the approach. This showcases an experimental creation mode
-   where the agent acts as a research assistant.
-   Features: Create (Agent Research mode, web search, SQL pre/post-processing)
+   and you pick the approach. Then optimize the entire function body —
+   prompts, model, and SQL logic.
+   Features: Create (Agent Research mode, web search, SQL pre/post-processing), Optimize (body mode)
 ```
 
+**⚠️ STOP**: Wait for user selection before proceeding.
+
 ### Step 2: Route
+
+Route based on the **demo name** the user selected (numbering differs between Snowsight and CLI menus):
 
 **If Quick Start:** Load `classification/SKILL.md`
 
@@ -76,8 +124,6 @@ Which demo would you like to try?
 **If Custom Metrics:** Load `legal-doc-extraction/SKILL.md`
 
 **If Prompt Optimization:** Load `policy-conditioned-routing/SKILL.md`
-
-**If Multimodal Images:** Load `clothing-classification/SKILL.md`
 
 **If Multimodal Documents:** Load `pdf-field-extraction/SKILL.md`
 

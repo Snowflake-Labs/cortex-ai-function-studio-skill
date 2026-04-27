@@ -132,7 +132,7 @@ def _build_async_sql(
 
     task_fqn = f"{args.database}.{args.schema}.{run_id}"
     create = (
-        f"CREATE OR REPLACE TASK {task_fqn}\n"
+        f"CREATE TASK {task_fqn}\n"
         f"  WAREHOUSE = {args.warehouse}\n"
         f"  USER_TASK_TIMEOUT_MS = {timeout_ms}\n"
         f"AS\n"
@@ -157,7 +157,7 @@ def _eval_build_call(args: argparse.Namespace) -> str:
         _sql_varchar(args.metric_name),
         _sql_varchar(args.model_name),
         _sql_int(args.sample_size),
-        _sql_varchar(args.results_table),
+        _sql_varchar(args.experiment_name),
         _sql_variant_json(args.metric_options),
         _sql_int(args.max_length),
         _sql_varchar(args.custom_metric_udf),
@@ -201,10 +201,11 @@ def _add_evaluate_args(sub: argparse.ArgumentParser) -> None:
         help="Number of rows to evaluate, or 'none' for all",
     )
     sproc.add_argument(
-        "--results-table",
+        "--experiment-name",
         type=nullable_str,
         required=True,
-        help="Table for per-row results, or 'none' to skip",
+        help="Snowflake Experiment to persist per-row eval details, or 'none' "
+        "for auto-generated (defaults to RUN_ID).",
     )
     sproc.add_argument(
         "--metric-options",
@@ -243,27 +244,53 @@ def _run_evaluate(args: argparse.Namespace, exec_fn) -> dict:
         log(f"Creating and executing Task {run_id} ...")
         exec_fn(create_sql)
         exec_fn(execute_sql_str)
+        experiment_name = args.experiment_name or run_id
+        qualified_experiment = f"{args.database}.{args.schema}.{experiment_name}"
         return {
             "status": "submitted",
             "run_id": run_id,
             "task": f"{args.database}.{args.schema}.{run_id}",
+            "experiment_name": qualified_experiment,
+            "snowurl": (
+                f"snow://experiment/{qualified_experiment}"
+                f"/versions/EVAL/eval_detail.json"
+            ),
         }
 
     sql = eval_build_sync_sql(args)
     log("Executing evaluation ...")
     rows = exec_fn(sql)
 
-    score = rows[0][0] if rows else None
+    raw = rows[0][0] if rows else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+    if not isinstance(raw, dict):
+        return {
+            "status": "error",
+            "error": (
+                f"EVALUATE_AI_FUNCTION returned no usable payload "
+                f"(got {type(raw).__name__}); expected a VARIANT object with "
+                f"score/run_id/experiment_name/snowurl."
+            ),
+            "metric": args.metric_name,
+            "function": args.function_name,
+        }
+
+    payload = raw
     result: dict = {
         "status": "success",
-        "score": score,
+        "score": payload.get("score"),
         "metric": args.metric_name,
         "function": args.function_name,
+        "run_id": payload.get("run_id") or args.run_id,
+        "experiment_name": payload.get("experiment_name") or args.experiment_name,
+        "snowurl": payload.get("snowurl"),
+        "num_examples": payload.get("num_examples"),
     }
-    if args.results_table:
-        result["results_table"] = args.results_table
-    if args.run_id:
-        result["run_id"] = args.run_id
     return result
 
 
@@ -284,7 +311,6 @@ def _opt_build_call(args: argparse.Namespace) -> str:
         _sql_varchar(args.reflection_model),
         _sql_varchar(args.test_table),
         _sql_varchar(args.auto_budget),
-        _sql_varchar(args.results_table),
         _sql_float(args.validation_fraction),
         _sql_float(args.temperature),
         _sql_int(args.max_tokens),
@@ -341,12 +367,6 @@ def _add_optimize_args(sub: argparse.ArgumentParser) -> None:
         type=nullable_str,
         required=True,
         help="Snowflake Experiment name to persist results, or 'none'",
-    )
-    opt.add_argument(
-        "--results-table",
-        type=nullable_str,
-        required=True,
-        help="Table to save per-row test-set eval results, or 'none'",
     )
     opt.add_argument("--validation-fraction", type=float, required=True)
     opt.add_argument("--temperature", type=float, required=True)

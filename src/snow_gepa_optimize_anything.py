@@ -38,17 +38,19 @@ from gepa.adapters.optimize_anything_adapter.optimize_anything_adapter import (
 )
 from gepa.core.adapter import EvaluationBatch
 import gepa.optimize_anything as _oa_module
+from gepa.logging.logger import StdOutLogger
 from gepa.optimize_anything import (
     GEPAConfig,
     EngineConfig,
     MergeConfig,
     ReflectionConfig,
+    TrackingConfig,
     _build_reflection_prompt_template,
     log,
     optimize_anything,
 )
 from snowflake.snowpark import Session
-from snowflake.snowpark.functions import call_function, col
+from snowflake.snowpark.functions import call_function, col, parse_json
 
 from metrics_core import (
     evaluate,
@@ -72,6 +74,7 @@ from snow_gepa_optimize import (
 )
 
 from custom_ai_function_utils import (
+    _extract_semi_structured_params,
     build_temp_ddl_from_body,
     build_temp_function_name,
     extract_file_type_params,
@@ -255,6 +258,7 @@ class _BatchedBodyOptimizeAnythingAdapter(OptimizeAnythingAdapter):
                     ctx.session,
                     ctx.temp_function_name,
                     rows,
+                    original_ddl=ctx.original_ddl,
                 )
             except Exception as e:
                 log(f"Runtime error (batch): {e}")
@@ -346,7 +350,7 @@ def extract_signature_from_ddl_string(ddl: str) -> str:
 
 
 def reconstruct_ddl(original_ddl: str, optimized_body: str) -> str:
-    """Build a deployable CREATE OR REPLACE FUNCTION DDL with a new body."""
+    """Build a deployable CREATE FUNCTION DDL with a new body."""
     ddl = normalize_ddl_to_dollar_quoting(original_ddl)
     return re.sub(
         r"\$\$.*?\$\$",
@@ -487,16 +491,47 @@ def _call_compiled_temp_function(
     session: Session,
     temp_function_name: str,
     rows: list[dict[str, object]],
+    original_ddl: str = "",
 ) -> list[object]:
     """Call a previously compiled temp function on *rows*.
 
     The temp function must already exist (created by
     ``_compile_temp_body_function``).  Returns one result per row.
+
+    When *original_ddl* is provided, semi-structured parameters (ARRAY,
+    VARIANT, OBJECT) are detected and normalized.  Training data values
+    arrive in mixed forms: ``load_dataset`` may ``json.loads`` a stored
+    JSON string into a Python list/dict, while other paths pass the raw
+    string.  To avoid mixed-type columns (which break Snowpark schema
+    inference), Python lists/dicts are serialized to JSON strings so
+    every value is VARCHAR, then ``parse_json(col(...))`` uniformly
+    restores the semi-structured type at call time.  ``PARSE_JSON``
+    returns ``VARIANT`` which Snowflake auto-casts to ``ARRAY`` or
+    ``OBJECT`` as needed by the function signature.  This mirrors
+    ``TempAIFunction.call_rows``.
     """
     if not rows:
         return []
 
-    indexed_rows = [{"__ROW_ID": idx, **row} for idx, row in enumerate(rows)]
+    structured_params = (
+        _extract_semi_structured_params(original_ddl) if original_ddl else set()
+    )
+
+    # Normalize semi-structured values to JSON strings so the column is
+    # uniformly VARCHAR (avoids mixed-type schema inference issues).
+    indexed_rows = []
+    for idx, row in enumerate(rows):
+        r: dict[str, object] = {"__ROW_ID": idx}
+        for k, v in row.items():
+            if (
+                structured_params
+                and k.upper() in structured_params
+                and isinstance(v, (list, tuple, dict))
+            ):
+                r[k] = json.dumps(v)
+            else:
+                r[k] = v
+        indexed_rows.append(r)
 
     all_cols: list[str] = ["__ROW_ID"]
     seen = {"__ROW_ID"}
@@ -506,7 +541,14 @@ def _call_compiled_temp_function(
                 seen.add(k)
                 all_cols.append(k)
 
-    arg_cols = [col(c) for c in all_cols if c != "__ROW_ID"]
+    arg_cols = []
+    for c in all_cols:
+        if c == "__ROW_ID":
+            continue
+        if structured_params and c.upper() in structured_params:
+            arg_cols.append(parse_json(col(c)))
+        else:
+            arg_cols.append(col(c))
 
     df = session.create_dataframe(indexed_rows)
     df = df.select(*[col(c) for c in all_cols])
@@ -543,7 +585,12 @@ def _call_temp_body_function(
     _compile_temp_body_function(
         session, original_ddl, candidate_body, temp_function_name
     )
-    return _call_compiled_temp_function(session, temp_function_name, rows)
+    return _call_compiled_temp_function(
+        session,
+        temp_function_name,
+        rows,
+        original_ddl=original_ddl,
+    )
 
 
 def make_body_evaluator(
@@ -607,6 +654,7 @@ def make_body_evaluator(
                 session,
                 temp_function_name,
                 [row],
+                original_ddl=original_ddl,
             )
             response = str(results[0]) if results else ""
 
@@ -689,7 +737,6 @@ def _run_single_model_body_optimization(
     reflection_weight: int,
     models: list[str],
     metric_name: str,
-    results_table: str | None,
     test_table: str | None,
     label_column: str,
     dataset_expected_columns: list[str] | None,
@@ -755,6 +802,9 @@ def _run_single_model_body_optimization(
                 raise_on_exception=False,
                 cache_evaluation=DEFAULT_CACHE_EVALUATIONS,
                 cache_evaluation_storage="memory",
+                # Use 'instance' frontier since our evaluators return per-row
+                # scores only, not objective_scores required by 'hybrid'.
+                frontier_type="instance",
             )
             if gepa_run_dir is not None:
                 engine_kwargs["run_dir"] = gepa_run_dir
@@ -777,6 +827,10 @@ def _run_single_model_body_optimization(
                     merge=MergeConfig(
                         max_merge_invocations=DEFAULT_MAX_MERGE_INVOCATIONS,
                     ),
+                    # Always pass a safe logger to prevent GEPA from creating
+                    # a file-based Logger that mutates global sys.stdout/stderr
+                    # — unsafe when multiple models run via ThreadPoolExecutor.
+                    tracking=TrackingConfig(logger=StdOutLogger()),
                     stop_callbacks=[budget_stopper],
                 ),
             )
@@ -785,7 +839,8 @@ def _run_single_model_body_optimization(
             logger.error("[OPTIMIZATION_ERROR] %s: %s", model, error_msg)
             if experiment_name:
                 save_failed_run_to_experiment(
-                    session, experiment_name,
+                    session,
+                    experiment_name,
                     function_name=function_name,
                     model=model,
                     error_message=error_msg,
@@ -830,61 +885,77 @@ def _run_single_model_body_optimization(
             "reflection_model": reflection_model or model,
         }
 
-        if test_table and original_ddl:
-            eval_metric_options = dict(metric_evaluator.kwargs)
-            if metric_evaluator.metric_name == "llm_judge":
-                eval_metric_options["scoring_mode"] = "binary"
-            if dataset_expected_columns:
-                eval_metric_options["expected_columns"] = dataset_expected_columns
+        # Test-set evaluation and experiment storage are wrapped in
+        # try/except so that transient session errors (e.g. shared-session
+        # I/O races across threads) degrade gracefully to validation-only
+        # scores instead of losing the entire optimization result.
+        try:
+            if test_table and original_ddl:
+                eval_metric_options = dict(metric_evaluator.kwargs)
+                if metric_evaluator.metric_name == "llm_judge":
+                    eval_metric_options["scoring_mode"] = "binary"
+                if dataset_expected_columns:
+                    eval_metric_options["expected_columns"] = dataset_expected_columns
 
-            test_temp_fn = build_temp_function_name(
-                function_name,
-                f"__OPT_TEST_{model_suffix}",
+                test_temp_fn = build_temp_function_name(
+                    function_name,
+                    f"__OPT_TEST_{model_suffix}",
+                )
+                seed_executor = _make_body_executor(
+                    session,
+                    original_ddl,
+                    model_seed_body,
+                    test_temp_fn,
+                )
+                seed_test_score, seed_eval_details = evaluate(
+                    session=session,
+                    function_name=test_temp_fn,
+                    test_table=test_table,
+                    input_columns=input_columns,
+                    label_column=label_column,
+                    metric_name=metric_evaluator.metric_name,
+                    custom_metric_udf=metric_evaluator.custom_metric_udf,
+                    metric_options=eval_metric_options,
+                    model_name=model,
+                    executor=seed_executor,
+                    run_id=run_id,
+                    split="test_seed",
+                )
+                best_executor = _make_body_executor(
+                    session,
+                    original_ddl,
+                    best_body,
+                    test_temp_fn,
+                )
+                best_test_score, best_eval_details = evaluate(
+                    session=session,
+                    function_name=test_temp_fn,
+                    test_table=test_table,
+                    input_columns=input_columns,
+                    label_column=label_column,
+                    metric_name=metric_evaluator.metric_name,
+                    custom_metric_udf=metric_evaluator.custom_metric_udf,
+                    metric_options=eval_metric_options,
+                    model_name=model,
+                    executor=best_executor,
+                    run_id=run_id,
+                    split="test_best",
+                )
+                model_output["seed_test_score"] = seed_test_score
+                model_output["best_test_score"] = best_test_score
+                model_output["_seed_eval_details"] = seed_eval_details
+                model_output["_best_eval_details"] = best_eval_details
+                test_count = session.sql(
+                    f"SELECT COUNT(*) FROM {test_table}"
+                ).collect()[0][0]
+                model_output["num_test_examples"] = test_count
+        except Exception as test_eval_err:
+            logger.warning(
+                "[TEST_EVAL_ERROR] %s: test-set evaluation failed, "
+                "falling back to validation scores: %s",
+                model,
+                test_eval_err,
             )
-            seed_executor = _make_body_executor(
-                session,
-                original_ddl,
-                model_seed_body,
-                test_temp_fn,
-            )
-            seed_test_score = evaluate(
-                session=session,
-                function_name=test_temp_fn,
-                test_table=test_table,
-                input_columns=input_columns,
-                label_column=label_column,
-                metric_name=metric_evaluator.metric_name,
-                custom_metric_udf=metric_evaluator.custom_metric_udf,
-                metric_options=eval_metric_options,
-                model_name=model,
-                executor=seed_executor,
-                results_table=results_table,
-                run_id=run_id,
-            )
-            best_executor = _make_body_executor(
-                session,
-                original_ddl,
-                best_body,
-                test_temp_fn,
-            )
-            best_test_score = evaluate(
-                session=session,
-                function_name=test_temp_fn,
-                test_table=test_table,
-                input_columns=input_columns,
-                label_column=label_column,
-                metric_name=metric_evaluator.metric_name,
-                custom_metric_udf=metric_evaluator.custom_metric_udf,
-                metric_options=eval_metric_options,
-                model_name=model,
-                executor=best_executor,
-                results_table=results_table,
-                run_id=run_id,
-            )
-            model_output["seed_test_score"] = seed_test_score
-            model_output["best_test_score"] = best_test_score
-            test_count = session.sql(f"SELECT COUNT(*) FROM {test_table}").collect()[0][0]
-            model_output["num_test_examples"] = test_count
 
         if "seed_test_score" in model_output:
             model_output["seed_score"] = model_output["seed_test_score"]
@@ -896,38 +967,53 @@ def _run_single_model_body_optimization(
             model_output["score_source"] = "validation"
 
         # -- Experiment storage --
-        if experiment_name:
-            candidates_text = []
-            for c in result.candidates:
-                if isinstance(c, dict):
-                    candidates_text.append(str(next(iter(c.values())) if c else ""))
-                else:
-                    candidates_text.append(str(c))
+        try:
+            if experiment_name:
+                candidates_text = []
+                for c in result.candidates:
+                    if isinstance(c, dict):
+                        candidates_text.append(str(next(iter(c.values())) if c else ""))
+                    else:
+                        candidates_text.append(str(c))
 
-            num_summary_examples = model_output.get("num_test_examples", len(valset))
-            save_optimization_to_experiment(
-                session, experiment_name,
-                function_name=function_name,
-                model=model,
-                seed_prompt=model_seed_body,
-                best_prompt=best_body,
-                candidates=candidates_text,
-                val_scores=result.val_aggregate_scores,
-                best_idx=result.best_idx,
-                seed_val_score=seed_val_score,
-                best_val_score=best_val_score,
-                seed_test_score=model_output.get("seed_test_score"),
-                best_test_score=model_output.get("best_test_score"),
-                score_source=model_output["score_source"],
-                num_examples=num_summary_examples,
-                reflection_model=reflection_model or model,
-                total_candidates=len(result.candidates),
-                total_metric_calls=result.total_metric_calls,
-                total_reflection_calls=reflection_lm.call_count,
-                elapsed_seconds=model_elapsed,
-                run_dir=gepa_run_dir,
+                num_summary_examples = model_output.get(
+                    "num_test_examples", len(valset)
+                )
+                save_optimization_to_experiment(
+                    session,
+                    experiment_name,
+                    function_name=function_name,
+                    model=model,
+                    seed_prompt=model_seed_body,
+                    best_prompt=best_body,
+                    candidates=candidates_text,
+                    val_scores=result.val_aggregate_scores,
+                    best_idx=result.best_idx,
+                    seed_val_score=seed_val_score,
+                    best_val_score=best_val_score,
+                    seed_test_score=model_output.get("seed_test_score"),
+                    best_test_score=model_output.get("best_test_score"),
+                    score_source=model_output["score_source"],
+                    num_examples=num_summary_examples,
+                    reflection_model=reflection_model or model,
+                    total_candidates=len(result.candidates),
+                    total_metric_calls=result.total_metric_calls,
+                    total_reflection_calls=reflection_lm.call_count,
+                    elapsed_seconds=model_elapsed,
+                    run_dir=gepa_run_dir,
+                    seed_eval_details=model_output.get("_seed_eval_details"),
+                    best_eval_details=model_output.get("_best_eval_details"),
+                )
+        except Exception as exp_err:
+            logger.warning(
+                "[EXPERIMENT_SAVE_ERROR] %s: failed to save to experiment: %s",
+                model,
+                exp_err,
             )
 
+        # Strip internal-only details before returning to the caller.
+        model_output.pop("_seed_eval_details", None)
+        model_output.pop("_best_eval_details", None)
         return model_output
 
 
@@ -947,7 +1033,6 @@ def run_body_optimization(
     reflection_model: str,
     test_table: str | None = None,
     auto_budget: Literal["demo", "light", "medium", "heavy"] = DEFAULT_AUTO_BUDGET,
-    results_table: str | None = None,
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -1191,7 +1276,6 @@ def run_body_optimization(
             reflection_weight=reflection_weight,
             models=models,
             metric_name=metric_name,
-            results_table=results_table,
             test_table=test_table,
             label_column=label_column,
             dataset_expected_columns=dataset_expected_columns,
@@ -1223,7 +1307,8 @@ def run_body_optimization(
                     }
                     if experiment_name:
                         save_failed_run_to_experiment(
-                            session, experiment_name,
+                            session,
+                            experiment_name,
                             function_name=function_name,
                             model=model,
                             error_message=f"Future execution error: {e}",

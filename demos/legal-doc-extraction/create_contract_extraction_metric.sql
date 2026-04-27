@@ -11,7 +11,7 @@
 --
 -- Substitution variables: {database}, {schema}
 
-CREATE OR REPLACE FUNCTION {database}.{schema}.DEMO_CONTRACT_EXTRACTION_METRIC(
+CREATE FUNCTION {database}.{schema}.DEMO_CONTRACT_EXTRACTION_METRIC(
     EXPECTED VARCHAR,
     PREDICTED VARCHAR
 )

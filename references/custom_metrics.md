@@ -76,7 +76,7 @@ Both types use the same UDF contract. The difference is in the internal logic.
 Every custom metric UDF must follow this contract:
 
 ```sql
-CREATE OR REPLACE FUNCTION {database}.{schema}.{metric_name}(
+CREATE FUNCTION {database}.{schema}.{metric_name}(
     EXPECTED VARCHAR,
     PREDICTED VARCHAR
 )
@@ -95,6 +95,8 @@ $$;
 ```
 
 The UDF returns a VARIANT dict with `score` and `feedback` keys.
+
+**Note on input types:** The EXPECTED and PREDICTED parameters are always VARCHAR. When the original data is VARIANT (e.g., multi-key function output or VARIANT label column from synthetic data), values arrive as JSON strings (e.g., `'{"category": "billing"}'`). For simple metrics comparing single scalar values, this is transparent. For structured/multi-key outputs, **always use `_parse_json()`** (see below) to handle both plain strings and JSON objects.
 
 ### Robust JSON Parsing (MANDATORY)
 
@@ -371,7 +373,7 @@ Do NOT deviate from this structure for composite metrics. Each field gets one bl
 
 Before creating the UDF, generate 3-5 representative test cases for the user to review. These should cover:
 - A perfect match (expected score ~1.0)
-- A complete mismatch (expected score ~0.0)
+- A complete mismatch (expected score ~0.0 for exact-match metrics; for fuzzy_match fields, SequenceMatcher gives non-zero similarity even for unrelated strings, so compute the actual expected score rather than assuming 0.0)
 - One or two partial matches (expected score between 0.0 and 1.0)
 - An edge case relevant to the use case
 
@@ -395,12 +397,15 @@ Do these test cases look right? Feel free to modify any or add your own.
 
 ### Step 4: Test with Preview
 
+The local preview test catches metric bugs (wrong scoring, broken JSON parsing) before the UDF is deployed. Do not skip it, even if the user says "go ahead".
+
 Write a test script at `/tmp/test_{metric_name}.py` that:
 1. Imports `evaluate` from `/tmp/{metric_name}.py`
 2. Runs each approved test case, comparing actual score to target (tolerance ±0.05)
 3. Prints PASS/FAIL per case with score, target, and feedback
 
-Run with:
+Run it:
+
 ```bash
 PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python /tmp/test_{metric_name}.py
 ```
@@ -414,7 +419,7 @@ Present results as a table with columns: `#`, `Description`, `Score`, `Target`, 
 Generate and execute the UDF DDL:
 
 ```sql
-CREATE OR REPLACE FUNCTION {database}.{schema}.{metric_name}(
+CREATE FUNCTION {database}.{schema}.{metric_name}(
     EXPECTED VARCHAR,
     PREDICTED VARCHAR
 )
@@ -430,7 +435,7 @@ $$;
 
 Where `{metric_code}` is the Python code from Step 2 (the `evaluate` function and any imports).
 
-**⚠️ STOP**: Show the full DDL to the user for review before executing.
+**⚠️ STOP**: Show the full DDL to the user for review. Once approved, execute it via the SQL tool — the metric does not exist until the `CREATE FUNCTION` statement actually runs against Snowflake. Displaying the DDL is not enough.
 
 Verify the UDF was created:
 ```sql
@@ -493,6 +498,6 @@ If Optimize -> Load `optimize/SKILL.md` with metric pre-selected.
 
 - Step 2: Review generated code before testing
 - Step 3: Review and approve test cases
-- Step 4: All tests must pass and results approved
-- Step 5: Review DDL before executing
+- Step 4: All tests must pass and results approved (preview test must actually run)
+- Step 5: Review DDL before executing, then execute the `CREATE FUNCTION` against Snowflake
 - Step 6: Clean up temp files after UDF creation

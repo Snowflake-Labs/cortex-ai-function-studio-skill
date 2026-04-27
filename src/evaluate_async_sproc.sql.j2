@@ -24,7 +24,7 @@ CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.EVALUATE_AI_FUNCTION_ASY
     METRIC_NAME VARCHAR,
     MODEL_NAME VARCHAR,
     SAMPLE_SIZE INTEGER DEFAULT NULL,
-    RESULTS_TABLE VARCHAR DEFAULT NULL,
+    EXPERIMENT_NAME VARCHAR DEFAULT NULL,
     METRIC_OPTIONS VARIANT DEFAULT NULL,
     MAX_LENGTH INTEGER DEFAULT 500,
     CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
@@ -97,6 +97,15 @@ BEGIN
         metric_opts_str := 'PARSE_JSON(''' || TO_VARCHAR(METRIC_OPTIONS) || ''')';
     END IF;
     
+    -- Resolve experiment name: explicit > task_name. Behavior change vs the
+    -- old RESULTS_TABLE = NULL ("don't persist") semantics -- every async
+    -- invocation now auto-creates an experiment so per-row results are always
+    -- queryable via SnowURL. Opting out of persistence is not currently
+    -- supported; pass an explicit EXPERIMENT_NAME if you want a stable handle.
+    IF (EXPERIMENT_NAME IS NULL) THEN
+        EXPERIMENT_NAME := task_name;
+    END IF;
+
     -- Build the SPROC call
     -- Escape single quotes in user-provided strings to prevent SQL injection
     sproc_call := 'CALL {{ database }}.{{ schema }}.EVALUATE_AI_FUNCTION(' ||
@@ -107,14 +116,14 @@ BEGIN
         '''' || REPLACE(METRIC_NAME, '''', '''''') || ''', ' ||
         '''' || REPLACE(MODEL_NAME, '''', '''''') || ''', ' ||
         COALESCE(TO_VARCHAR(SAMPLE_SIZE), 'NULL') || ', ' ||
-        COALESCE('''' || REPLACE(RESULTS_TABLE, '''', '''''') || '''', 'NULL') || ', ' ||
+        '''' || REPLACE(EXPERIMENT_NAME, '''', '''''') || ''', ' ||
         metric_opts_str || ', ' ||
         TO_VARCHAR(MAX_LENGTH) || ', ' ||
         COALESCE('''' || REPLACE(CUSTOM_METRIC_UDF, '''', '''''') || '''', 'NULL') || ', ' ||
         '''' || REPLACE(task_name, '''', '''''') || ''')';
     
     -- Create the task (no schedule — single execution only via EXECUTE TASK)
-    create_task_sql := 'CREATE OR REPLACE TASK {{ database }}.{{ schema }}."' || REPLACE(task_name, '"', '""') || '"' ||
+    create_task_sql := 'CREATE TASK {{ database }}.{{ schema }}."' || REPLACE(task_name, '"', '""') || '"' ||
         ' WAREHOUSE = ' || wh_to_use ||
         ' USER_TASK_TIMEOUT_MS = ' || TO_VARCHAR(TIMEOUT_MINUTES * 60 * 1000) ||
         ' AS ' || sproc_call;

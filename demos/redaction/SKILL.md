@@ -1,24 +1,27 @@
 ---
 name: redaction-demo
-description: "Interactive demo: Build a PII redaction AI function that masks sensitive information."
+description: "Interactive demo [Experimental]: Build a PII redaction function using Agent Research mode — the agent searches the web for techniques, proposes SQL UDF architectures with pre/post-processing, and you pick the approach. Then optimize the full function body."
 parent_skill: demos
 ---
 <!-- Copyright (c) 2026 Snowflake Inc. All rights reserved.
      Licensed under the Snowflake Skills License. See LICENSE file. -->
 
-# PII Redaction Demo
+# Agent Research: Pre/Post-Processing Demo [Experimental]
 
-Build an AI function that redacts personally identifiable information (PII) from text.
+Build a PII redaction function using Agent Research mode — an experimental creation mode where the agent researches implementation approaches and proposes SQL UDF architectures with pre- and post-processing around AI_COMPLETE. Then optimize the entire function body (prompts, model, and SQL logic).
 
 ## Overview
 
 This demo walks you through:
-1. Creating sample data with PII examples
-2. Building a custom AI function for PII redaction
-3. Evaluating its accuracy
-4. Optimizing it
+1. Loading French-language PII examples as sample data
+2. Using **Agent Research mode** to build the function — the agent searches the web for PII redaction techniques, proposes 2-3 SQL UDF architectures, and you select your preferred approach
+3. Testing the function with sample inputs
+4. Optimizing the entire function body — prompts, model references, and SQL pre/post-processing
 
-**Time:** 10-20 minutes
+This demo showcases two features working together: **Agent Research mode** for creating complex SQL UDFs, and **body-mode optimization** that evolves the full SQL expression (not just the prompt).
+
+**Time:** ~10 minutes
+**Status:** Experimental — Agent Research mode uses web search and approach synthesis, which may produce varying results across runs.
 
 ## Workflow
 
@@ -26,21 +29,32 @@ This demo walks you through:
 
 Explain to user:
 ```
-Welcome to the PII Redaction Demo!
+Welcome to the Agent Research Demo! [Experimental]
 
-This hands-on demo will guide you through the complete lifecycle of a custom AI function:
+This demo showcases an experimental creation mode called Agent Research,
+followed by full-body optimization of the resulting SQL UDF.
 
-1. **Create Sample Data** - Load French-language PII examples from the ai4privacy dataset
-2. **Build the Function** - Create a DEMO_REDACT_PII function using Snowflake AI_COMPLETE
-3. **Evaluate Performance** - Measure accuracy against expected outputs
-4. **Optimize the Function** - Use GEPA optimization to improve results
+1. **Research** — Search the web for state-of-the-art PII redaction techniques
+2. **Propose** — Synthesize findings into 2-3 concrete SQL UDF architectures,
+   each with different pre- and post-processing around the AI_COMPLETE call
+3. **Present** — Show you the pros/cons of each approach so you can choose
+4. **Build** — Generate the complete SQL UDF based on your selection
+5. **Optimize** — Evolve the entire function body (prompts, model, SQL logic)
 
-By the end, you'll have a working PII redaction function and understand how to evaluate and optimize any custom AI function.
+This is different from Direct mode (used in other demos) where the function
+is a straightforward AI_COMPLETE call. Agent Research mode is for tasks where
+SQL pre/post-processing can improve quality — e.g., input validation, output
+parsing, iterative transformations, or multi-step extraction.
 
-**Estimated time:** 10-20 minutes
+The optimizer can then improve the full SQL body — not just the prompt, but
+also the pre/post-processing logic around the AI_COMPLETE call.
+
+**Note:** Because this mode uses web search, results may vary between runs.
+The approaches proposed depend on what the agent finds during research.
+
+**Estimated time:** ~10 minutes
 **Objects created:** All prefixed with DEMO_ for easy cleanup
 ```
-
 
 ### Step 1: Setup - Choose Location
 
@@ -60,26 +74,26 @@ Store the database and schema for use throughout the demo.
 
 Explain to user:
 ```
-First, I'll create a sample dataset with French-language text containing PII that needs to be redacted.
+First, I'll create sample datasets with French-language text containing PII.
 
-The data comes from the ai4privacy/pii-masking-300k dataset, filtered to French entries, and includes:
+The data comes from the ai4privacy/pii-masking-300k dataset, filtered to French
+entries, and includes:
 - Names, emails, phone numbers, addresses, IDs, and more
 - Both the original text (INPUT_TEXT) and expected redacted output (EXPECTED_OUTPUT)
-- A PRIVACY_MASK column showing exactly which PII entities were redacted
 
-I'll create 50 training rows and 30 test rows in these tables:
-- {database}.{schema}.DEMO_REDACTION_TRAIN
-- {database}.{schema}.DEMO_REDACTION_TEST
+I'll create training and test tables:
+- {database}.{schema}.DEMO_REDACTION_TRAIN (50 rows — for optimization)
+- {database}.{schema}.DEMO_REDACTION_TEST (20 rows — for evaluation)
 ```
 
-Run the data generation script with 50 training and 30 test rows:
+Run the data generation script:
 ```bash
 PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/generate_redaction_data.py \
   --connection <CONNECTION_NAME> \
   --database {database} \
   --schema {schema} \
-  --train {train_rows} \
-  --test {test_rows} \
+  --train 50 \
+  --test 20 \
   --language French
 ```
 
@@ -93,190 +107,115 @@ SELECT COUNT(*) FROM {database}.{schema}.DEMO_REDACTION_TEST;
 
 Show a few sample rows:
 ```sql
-SELECT 
+SELECT
     LEFT(INPUT_TEXT, 200) AS INPUT_PREVIEW,
     LEFT(EXPECTED_OUTPUT, 200) AS OUTPUT_PREVIEW,
     PRIVACY_MASK
-FROM {database}.{schema}.DEMO_REDACTION_TRAIN 
+FROM {database}.{schema}.DEMO_REDACTION_TRAIN
 LIMIT 3;
 ```
 
-### Step 3: Create the AI Function
+### Step 3: Create AI Function with Agent Research Mode
 
-Present the function configuration to the user:
+Present the task to the user:
+```
+Now we'll create the PII redaction function using Agent Research mode.
+
+Instead of jumping straight to a simple AI_COMPLETE call, I'll:
+1. Search the web for PII redaction best practices and techniques
+2. Propose 2-3 SQL UDF approaches with different pre/post-processing strategies
+3. Let you choose the approach that best fits your needs
+
+Task: Redact all PII from French-language text, replacing each instance with [REDACTED].
+PII types: names, email addresses, phone numbers, government IDs, credit card/bank
+numbers, physical addresses, and dates/times.
+```
+
+**⚠️ STOP**: Wait for user confirmation before proceeding.
+
+**Load** `create/SKILL.md` and follow it from **Step 1 (Gather Intention)**, passing:
+- `database`, `schema`: from context
+- `task_description`: `Redact all personally identifiable information (PII) from French-language text. Replace each PII instance with [REDACTED]. PII includes: names, email addresses, phone numbers, government IDs (passports, licenses, national IDs, tax IDs), credit card/bank numbers, physical addresses (street, city, building, country), and dates/times. The function should preserve all non-PII text exactly. I want to explore different approaches with SQL pre/post-processing.`
+- `creation_mode`: `research` (this triggers Agent Research mode — Steps 4-6 in create/SKILL.md)
+- `function_name`: `DEMO_REDACT_PII`
+- `inputs`: `[{"name": "TEXT", "sql_type": "VARCHAR"}]`
+- `outputs`: `[{"name": "redacted_text", "json_type": "string", "description": "Redacted text with all PII replaced by [REDACTED]"}]`
+
+The create workflow will:
+1. **Step 5 (Research)**: Search the web for PII redaction techniques and propose 2-3 SQL UDF approaches with different pre/post-processing strategies
+2. **Step 6 (Confirm)**: Present approaches for user selection
+3. **Steps 7-9**: Generate and create the function
+
+**Skip Step 10 (next steps)** in the create workflow — return here after the function is created and smoke-tested.
+
+### Step 4: Test the Function
+
+After the function is created, test it with a sample from the dataset:
+
+```sql
+SELECT
+    LEFT(INPUT_TEXT, 200) AS ORIGINAL,
+    LEFT({database}.{schema}.DEMO_REDACT_PII(INPUT_TEXT), 200) AS REDACTED
+FROM {database}.{schema}.DEMO_REDACTION_TEST
+LIMIT 3;
+```
+
+Discuss with the user:
+- How the pre/post-processing in the selected approach affected the output
+- Whether the redaction patterns match expectations
+- How this differs from a simple Direct mode function (which would just be a bare AI_COMPLETE call)
+
+### Step 5: Optimize the Function
+
+Present the optimization configuration:
 
 ```
-Now we'll create an AI function that redacts PII from text.
+Now we'll optimize the function using body-mode optimization.
 
-For now I'll use these settings. Please confirm or modify any you'd like to change:
+Unlike prompt-only optimization, this can modify the entire SQL function body —
+the system prompt, user prompt template, model reference, and any SQL
+pre/post-processing logic from the Agent Research approach.
 
-Function name: DEMO_REDACT_PII
+Please confirm or modify any settings you'd like to change:
+
 Model: claude-sonnet-4-5
-Input: TEXT (VARCHAR) - "Text that may contain personally identifiable information (PII)"
-Output: redacted_text (string) - "Redacted text with all PII replaced by [REDACTED]"
-System prompt:
-  "Identify and redact all PII from the text below, replacing each with [REDACTED]. 
-   PII includes: names, email addresses, phone numbers, government IDs (passports, 
-   licenses, national IDs, tax IDs), credit card/bank numbers, physical addresses 
-   (street, city, building, country), and dates/times. Add no additional text, and 
-   immediately start writing the original text (with redactions) without adding any
-   preamble. Stop immediately when the input text stops."
-User prompt template: "{TEXT}"
-```
-
-Store the confirmed settings (function_name, model, system_prompt, user_prompt_template) for use in function creation.
-
-**⚠️ STOP**: Wait for user confirmation or modifications before creating the function.
-
-Create the function using `create_udf.py` with the confirmed settings:
-
-```bash
-PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKILL_DIRECTORY>/src/create_udf.py \
-    --database {database} \
-    --schema {schema} \
-    --function-name {function_name} \
-    --function-intention 'Redact all PII from input text.' \
-    --model {model} \
-    --system-prompt '{system_prompt}' \
-    --user-prompt-template '{user_prompt_template}' \
-    --inputs '[{"name": "TEXT", "sql_type": "VARCHAR"}]' \
-    --outputs '[{"name": "redacted_text", "json_type": "string", "description": "Redacted text with all PII replaced by [REDACTED]"}]' \
-    --execute --connection <CONNECTION_NAME>
-```
-
-This generates a function with the model and system prompt hardcoded in the body:
-```sql
-CREATE OR REPLACE FUNCTION {database}.{schema}.{function_name}(TEXT VARCHAR)
-RETURNS VARCHAR
-...
-AS
-$$
-    SNOWFLAKE.CORTEX.AI_COMPLETE(
-        model=>'{model}',
-        messages=>[
-            {'role': 'system', 'content': '{system_prompt}'},
-            {'role': 'user', 'content': TEXT}
-        ],
-        response_format=>{'type': 'json', 'schema': {...}}
-    ).redacted_text::VARCHAR
-$$;
-```
-
-Execute the generated SQL to create the function.
-
-Present the test example to the user:
-
-```
-Now let's test the function with a quick example to see it in action.
-
-I'll run a simple query that passes French text containing PII (a name, email, and phone number) 
-to the function. The function should return the same text with all PII replaced by [REDACTED].
-
-Example input:
-  "Veuillez contacter Jean Dupont à jean.dupont@email.com ou au 01 23 45 67 89"
-
-Would you like to:
-1. Run with this example
-2. Try a different example (provide your own text)
-```
-
-**⚠️ STOP**: Wait for user confirmation or custom example before running.
-
-Run the test:
-```sql
-SELECT {database}.{schema}.{function_name}(
-  '{example_input}'
-) AS redacted_text;
-```
-
-Show the result and explain what the function did.
-
-### Step 4: Evaluate the Function
-
-Present the evaluation plan to the user:
-
-```
-Let's evaluate how well the function performs on our test data (30 rows).
-
-Metric: redaction_match
-Results table: DEMO_REDACTION_EVAL_RESULTS
-
-Note: redaction_match compares text structure while ignoring content inside brackets,
-so [NAME] and [REDACTED] are treated as equivalent placeholders.
-```
-
-Follow the evaluate workflow (`evaluate/SKILL.md`) with these values:
-- Function: `{database}.{schema}.DEMO_REDACT_PII`
-- Test table: `{database}.{schema}.DEMO_REDACTION_TEST`
-- Input column: `INPUT_TEXT`
-- Expected column: `EXPECTED_OUTPUT`
-- Metric: `redaction_match`
-- Results table: `{database}.{schema}.DEMO_REDACTION_EVAL_RESULTS`
-
-Present the evaluation results.
-
-### Step 5: Review Failures
-
-If accuracy < 100%, automatically query and present failures:
-```sql
-SELECT 
-    INPUT_TEXT,
-    EXPECTED_OUTPUT AS EXPECTED,
-    PREDICTED,
-    SCORE
-FROM {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS
-WHERE SCORE < 1.0
-ORDER BY SCORE;
-```
-
-Discuss common failure patterns (e.g., different redaction formats, missed PII types).
-
-### Step 6: Optimize (Optional)
-
-Ask user if they want to optimize, then present configuration:
-
-```
-Would you like to try optimizing the function?
-
-This will evolve the prompt through multiple generations to find variations 
-that improve redaction accuracy. Takes ~2-10 minutes to run. 
-
-For now I'll use these settings. Please confirm or modify any you'd like to change:
-
 Auto budget: demo
 Experiment: DEMO_REDACT_PII_OPT_EXP
-
-Options:
-1. Yes - Run GEPA optimization with these settings
-2. Modify - Change settings before running
-3. No - Skip to cleanup
 ```
 
-**⚠️ STOP**: Wait for user confirmation or modifications before running optimization.
+**⚠️ STOP**: Wait for user confirmation or modifications before starting optimization.
 
-If yes, follow the optimize workflow (`optimize/SKILL.md`) with these values:
-- Function: `{database}.{schema}.DEMO_REDACT_PII`
-- Training table: `{database}.{schema}.DEMO_REDACTION_TRAIN`
-- Test table: `{database}.{schema}.DEMO_REDACTION_TEST`
-- Input column: `INPUT_TEXT`
-- Label column: `EXPECTED_OUTPUT`
-- Metric: `redaction_match`
-- Auto budget: demo
-- Experiment: `{database}.{schema}.DEMO_REDACT_PII_OPT_EXP`
+**Load** `optimize/SKILL.md` and follow it from **Step 5 onward** (Run Optimization), passing:
+- `function_name`: `{database}.{schema}.DEMO_REDACT_PII`
+- `training_table`: `{database}.{schema}.DEMO_REDACTION_TRAIN`
+- `test_table`: `{database}.{schema}.DEMO_REDACTION_TEST`
+- `input_columns`: `['INPUT_TEXT']`
+- `label_column`: `EXPECTED_OUTPUT`
+- `metric`: `redaction_match`
+- `models`: `['claude-sonnet-4-5']`
+- `reflection_model`: `claude-sonnet-4-6`
+- `auto_budget`: `demo`
+- `experiment_name`: `{database}.{schema}.DEMO_REDACT_PII_OPT_EXP`
 
-Present results and compare before/after scores.
+Return here after optimization results are presented.
 
-### Step 7: Cleanup
+After the optimizer returns, discuss:
+- Whether the optimized body changed the SQL pre/post-processing logic (not just the prompt)
+- The score improvement over the baseline
+- How body-mode optimization differs from prompt-only optimization
+
+### Step 6: Cleanup
 
 Ask user:
 ```
-Demo complete! Would you like to clean up the demo objects?
+The Agent Research demo is complete!
+
+Would you like to clean up the demo objects?
 
 This will drop:
 - {database}.{schema}.DEMO_REDACTION_TRAIN
 - {database}.{schema}.DEMO_REDACTION_TEST
-- {database}.{schema}.DEMO_REDACT_PII
-- {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS (if created)
+- {database}.{schema}.DEMO_REDACT_PII (function)
 - {database}.{schema}.DEMO_REDACT_PII_OPT_EXP (if created)
 
 Options:
@@ -284,35 +223,60 @@ Options:
 2. No - Keep objects for further exploration
 ```
 
+**⚠️ STOP**: Wait for user selection before proceeding.
+
 If yes, execute:
 ```sql
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_TRAIN;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_TEST;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_REDACT_PII(VARCHAR);
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_REDACTION_EVAL_RESULTS;
 DROP EXPERIMENT IF EXISTS {database}.{schema}.DEMO_REDACT_PII_OPT_EXP;
 ```
 
-### Step 8: Next Steps
+### Step 7: Next Steps
 
 ```
-Thanks for trying the PII Redaction demo!
+Thanks for trying the Agent Research demo!
 
-You've learned how to:
-- Create an AI function for text processing
-- Evaluate function performance with metrics
-- Optimize functions using GEPA
+Here's what you experienced:
+- **Agent Research mode** — the agent searched the web for PII redaction
+  techniques and proposed multiple SQL UDF architectures
+- **Pre/post-processing** — the function includes SQL logic before and/or
+  after the AI_COMPLETE call, not just a bare LLM invocation
+- **Approach selection** — you chose between concrete implementation
+  alternatives with different quality/complexity trade-offs
+- **Body-mode optimization** — the optimizer evolved the entire SQL function
+  body, not just the prompt — including pre/post-processing logic
 
-Ready to build your own AI function? Just say "create an AI function" to get started.
+This experimental mode is useful when:
+- Your task benefits from SQL validation or transformation around the LLM call
+- You want the agent to research domain-specific techniques
+- You want to compare multiple implementation strategies before committing
+- You want optimization to consider the full SQL structure, not just prompts
+
+For simpler tasks, Direct mode (used in the Quick Start demo) is faster.
+For prompt-only optimization, try the "Prompt Optimization" demo.
+
+Ready to build your own AI function? Just say "create an AI function" and
+mention that you want to explore implementation approaches.
 ```
+
+## Key Cautions
+
+- Agent Research mode uses web search — results may vary between runs
+- The proposed approaches depend on what the agent finds during research
+- Pre/post-processing adds SQL complexity; only use when it adds value
+- This is an experimental feature and may change in future releases
+- Body-mode optimization can modify any part of the SQL body, which may simplify or restructure the pre/post-processing
+- PII redaction via LLM is not guaranteed to be comprehensive — do not use as a production privacy filter without human review
+- The ai4privacy dataset is filtered to French text; results may differ for other languages
+- Redaction patterns depend on the model's training data — novel PII formats may be missed
+- Some model names may not be available in every account or region
 
 ## Stopping Points
 
 - ✋ Step 0: After introduction, before proceeding
 - ✋ Step 1: After location selection
-- ✋ Step 2: Before loading data (confirm row counts)
-- ✋ Step 3: Before creating function (confirm settings)
-- ✋ Step 3: Before testing function (confirm example input)
-- ✋ Step 4: Before running evaluation (confirm settings)
-- ✋ Step 6: Before running optimization (confirm settings)
-- ✋ Step 7: Before cleanup
+- ✋ Step 3: Before triggering Agent Research mode
+- ✋ Step 5: Before running optimization
+- ✋ Step 6: Before cleanup

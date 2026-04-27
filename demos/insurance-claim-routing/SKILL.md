@@ -126,10 +126,10 @@ The label-synthesis workflow must:
 
 Show the label distribution after labeling completes:
 ```sql
-SELECT EXPECTED:claim_route::STRING AS CLAIM_ROUTE, COUNT(*) AS ROWS
+SELECT EXPECTED:claim_route::STRING AS CLAIM_ROUTE, COUNT(*) AS ROW_COUNT
 FROM {database}.{schema}.DEMO_CLAIMS_DATA
 GROUP BY 1
-ORDER BY ROWS DESC;
+ORDER BY ROW_COUNT DESC;
 ```
 
 The pseudo-label workflow stores labels as a VARIANT column (`EXPECTED`). Since our output has a single field, convert it to a plain string column for evaluation:
@@ -186,21 +186,20 @@ exact_match metric works perfectly — it compares the predicted route
 directly against the teacher-labeled EXPECTED_OUTPUT.
 
 Default metric: exact_match
-Results table: DEMO_ROUTE_CLAIM_EVAL_RESULTS
+Experiment: auto-generated per evaluation (run_id)
 ```
 
 **⚠️ STOP**: Wait for user confirmation before running evaluation.
 
-**Load** `evaluate/SKILL.md` and follow it from **Step 5 onward**, passing:
+**Load** `evaluate/SKILL.md` and follow it from **Step 4 onward** (Run Evaluation), passing:
 - `function_name`: `{database}.{schema}.DEMO_ROUTE_CLAIM`
 - `function_model`: chosen student model
 - `test_table`: `{database}.{schema}.DEMO_CLAIMS_DATA`
 - `input_columns`: `['CLAIM_SUMMARY', 'INCIDENT_CHANNEL', 'CUSTOMER_SEGMENT']`
 - `label_column`: `EXPECTED_OUTPUT`
-- `metric`: `exact_match`
-- `results_table`: `{database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS`
+- `metric_name`: `exact_match`
 
-**Async by default:** When the evaluate workflow reaches the execution mode selection, choose **async** (`EVALUATE_AI_FUNCTION_ASYNC`) without asking the user. If the async SPROC returns an error string (e.g., warehouse permission issue), inform the user and fall back to sync execution (`EVALUATE_AI_FUNCTION`) instead. After kicking off the async job, poll `TASK_HISTORY()` for completion within this session rather than asking the user to return later — this is a guided demo. **Load** `references/async_status.md` for polling patterns.
+The evaluation auto-creates an experiment named after its `run_id`. Capture `experiment_name` from the JSON output for the queries below.
 
 **Skip Step 6 (next steps)** in the evaluate workflow — return here after results are presented.
 
@@ -209,16 +208,21 @@ Once evaluation is done, review the results. Show the scores to the user. Offer 
 Would you like to see which claims the function routed incorrectly?
 ```
 
-If yes, query the results table:
+If yes, query the per-row eval artifact (requires `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION`). First create the JSON file format (required — inline `(TYPE => JSON)` isn't supported on SnowURL):
 ```sql
+CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE;
+
 SELECT
-    LEFT(INPUT_TEXT, 150) AS SUMMARY_PREVIEW,
-    EXPECTED AS EXPECTED_ROUTE,
-    PREDICTED AS PREDICTED_ROUTE,
-    SCORE,
-    FEEDBACK
-FROM {database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS
-WHERE SCORE < 1.0
+    LEFT($1:input_text::STRING, 150) AS SUMMARY_PREVIEW,
+    $1:expected::STRING  AS EXPECTED_ROUTE,
+    $1:predicted::STRING AS PREDICTED_ROUTE,
+    $1:metric_score::FLOAT AS SCORE,
+    $1:metric_feedback::STRING AS FEEDBACK
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
+WHERE $1:metric_score::FLOAT < 1.0
 ORDER BY SCORE
 LIMIT 20;
 ```
@@ -239,7 +243,7 @@ This will drop:
 - {database}.{schema}.DEMO_CLAIMS_UNLABELED
 - {database}.{schema}.DEMO_CLAIMS_DATA
 - {database}.{schema}.DEMO_ROUTE_CLAIM
-- {database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS
+- The per-evaluation experiment ({experiment_name})
 ```
 
 **⚠️ STOP**: Wait for user confirmation before cleanup.
@@ -249,7 +253,7 @@ If yes, execute:
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_UNLABELED;
 DROP TABLE IF EXISTS {database}.{schema}.DEMO_CLAIMS_DATA;
 DROP FUNCTION IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM(VARCHAR, VARCHAR, VARCHAR);
-DROP TABLE IF EXISTS {database}.{schema}.DEMO_ROUTE_CLAIM_EVAL_RESULTS;
+DROP EXPERIMENT IF EXISTS {database}.{schema}.{experiment_name};
 ```
 
 ### Step 8: Next Steps

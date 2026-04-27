@@ -33,6 +33,14 @@ Do NOT:
 
 These rules apply to all sub-skills (create, evaluate, optimize, demos).
 
+**Handling "Object already exists" errors:** All `CREATE` statements (FUNCTION, TABLE, VIEW, STAGE) use plain `CREATE` (not `CREATE OR REPLACE`). If any `CREATE` fails with `SQL compilation error: Object '{name}' already exists`, prompt the user:
+```
+That object name already exists. Would you like to:
+1. **Choose a different name** — e.g., {OBJECT_NAME}_{YYYYMMDD_HHMMSS} to avoid clashes
+2. **Drop and recreate** — Drop the existing object first, then create the new one
+```
+If option 1, suggest a timestamped variant and re-run. If option 2, run the appropriate `DROP ... IF EXISTS` then retry.
+
 ## Workflow
 
 ### Step 0: Check Prerequisites

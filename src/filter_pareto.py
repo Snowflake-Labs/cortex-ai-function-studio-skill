@@ -51,7 +51,9 @@ def get_model_cost(model_name: str, prompt_chars: int, avg_output_chars: int) ->
     return prompt_chars * model["input_cost"] + avg_output_chars * model["output_cost"]
 
 
-def filter_pareto_optimal(results: list[dict], prompt_chars: int, avg_output_chars: int) -> list[dict]:
+def filter_pareto_optimal(
+    results: list[dict], prompt_chars: int, avg_output_chars: int
+) -> list[dict]:
     """Filter to pareto-optimal results based on cost and score.
 
     An option is pareto-optimal if no other option has:
@@ -65,7 +67,7 @@ def filter_pareto_optimal(results: list[dict], prompt_chars: int, avg_output_cha
 
     Returns:
         List of pareto-optimal results, sorted by relative_cost ascending.
-    """    
+    """
     if not results:
         raise ValueError("No results provided")
 

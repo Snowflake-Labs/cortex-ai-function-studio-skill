@@ -154,21 +154,14 @@ class Evaluator:
 
         metric_kwargs = dict(self.kwargs)
         file_columns = metric_kwargs.pop("file_columns", None)
-        has_files = (
-            file_columns
-            and self.metric_name == "llm_judge"
-        )
+        has_files = file_columns and self.metric_name == "llm_judge"
         if has_files:
             fc = file_columns[0]
             sk = stage_key(fc)
             metric_kwargs["file_paths"] = [
-                str(data["inputs"].get(fc, ""))
-                for data, _ in items
+                str(data["inputs"].get(fc, "")) for data, _ in items
             ]
-            per_row_stages = [
-                str(data["inputs"].get(sk, ""))
-                for data, _ in items
-            ]
+            per_row_stages = [str(data["inputs"].get(sk, "")) for data, _ in items]
             if any(per_row_stages):
                 metric_kwargs["stage_name"] = per_row_stages
         else:
@@ -319,7 +312,7 @@ class SnowflakeAdapter(
 
         inputRows = []
         for data in batch:
-            row = {c: data["inputs"].get(c, '') for c in self.input_columns}
+            row = {c: data["inputs"].get(c, "") for c in self.input_columns}
             for k, v in data["inputs"].items():
                 if k.startswith(STAGE_KEY_PREFIX):
                     row[k] = v
@@ -510,7 +503,7 @@ def load_dataset(
                 detected_file_cols.add(col)
                 if file_stage_name is None:
                     file_stage_name = row_stage
-            elif isinstance(val, str) and val.strip().startswith("["):
+            elif isinstance(val, str) and val.strip()[:1] in ("[", "{"):
                 try:
                     inputs[col] = json.loads(val)
                 except json.JSONDecodeError:
