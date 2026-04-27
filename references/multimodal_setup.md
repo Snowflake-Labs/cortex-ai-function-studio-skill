@@ -155,12 +155,12 @@ To proceed, we need to reduce to one file column. Here are your options:
 
 1. **Select one** (recommended) — Pick the primary file column for your AI function.
    I'll create a view that drops the other file columns:
-   CREATE OR REPLACE VIEW {database}.{schema}.{table}_SINGLE_FILE AS
+   CREATE VIEW {database}.{schema}.{table}_SINGLE_FILE AS
    SELECT {text_columns}, {chosen_file_col}, {label_columns}
    FROM {source_table};
 
 2. **Unpivot** — If each file column should be evaluated independently (one row per file):
-   CREATE OR REPLACE VIEW {database}.{schema}.{table}_UNPIVOT AS
+   CREATE VIEW {database}.{schema}.{table}_UNPIVOT AS
    SELECT {text_columns}, FILE_PATH, SOURCE_COLUMN, {label_columns}
    FROM {source_table}
    UNPIVOT(FILE_PATH FOR SOURCE_COLUMN IN ({col1}, {col2}, ...));
@@ -311,7 +311,7 @@ Use when the customer's table has VARCHAR columns containing stage-relative file
 
 #### Single image classification
 ```sql
-CREATE OR REPLACE FUNCTION DB.SCHEMA.CLASSIFY_IMAGE(FILE_PATH VARCHAR)
+CREATE FUNCTION DB.SCHEMA.CLASSIFY_IMAGE(FILE_PATH VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
@@ -334,7 +334,7 @@ $$;
 
 #### Image + text question
 ```sql
-CREATE OR REPLACE FUNCTION DB.SCHEMA.ANALYZE_IMAGE(FILE_PATH VARCHAR, QUESTION VARCHAR)
+CREATE FUNCTION DB.SCHEMA.ANALYZE_IMAGE(FILE_PATH VARCHAR, QUESTION VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
@@ -356,7 +356,7 @@ $$;
 
 #### Document Q&A
 ```sql
-CREATE OR REPLACE FUNCTION DB.SCHEMA.DOC_QA(DOC_PATH VARCHAR, QUESTION VARCHAR)
+CREATE FUNCTION DB.SCHEMA.DOC_QA(DOC_PATH VARCHAR, QUESTION VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
@@ -382,7 +382,7 @@ Use when the customer's table has FILE columns. No `TO_FILE()` in the body.
 
 #### Single image classification
 ```sql
-CREATE OR REPLACE FUNCTION DB.SCHEMA.CLASSIFY_IMAGE(IMAGE FILE)
+CREATE FUNCTION DB.SCHEMA.CLASSIFY_IMAGE(IMAGE FILE)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
@@ -405,7 +405,7 @@ $$;
 
 #### Image + text question
 ```sql
-CREATE OR REPLACE FUNCTION DB.SCHEMA.ANALYZE_IMAGE(IMAGE FILE, QUESTION VARCHAR)
+CREATE FUNCTION DB.SCHEMA.ANALYZE_IMAGE(IMAGE FILE, QUESTION VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS

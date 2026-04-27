@@ -324,6 +324,74 @@ def _parse_response_format_from_ddl(ddl: str) -> dict[str, object]:
         ) from exc
 
 
+def _extract_input_type_map(
+    session: Session, function_name: str, input_cols: list[str]
+) -> dict[str, str]:
+    """Extract a mapping from input column names to SQL types from a function's DDL.
+
+    Returns a dict like ``{"INPUT": "VARCHAR", "CATEGORIES": "ARRAY"}``.
+    Falls back to all-VARCHAR if the function cannot be found or parsed.
+    """
+    fn = str(function_name).strip()
+    if not fn:
+        return {}
+    base_name = fn
+    if "(" in fn:
+        base_name = fn[: fn.index("(")]
+    parts = base_name.split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        db, schema, func = (_normalize_identifier(p) for p in parts)
+    except ValueError:
+        return {}
+
+    try:
+        rows = session.sql(
+            f"SHOW FUNCTIONS LIKE '{func}' IN SCHEMA {db}.{schema}"
+        ).collect()
+    except Exception:
+        return {}
+    if not rows:
+        return {}
+
+    arguments = str(rows[0]["arguments"])
+    try:
+        param_types_str = _extract_balanced_parenthesized_content(arguments)
+    except ValueError:
+        return {}
+
+    # Split on commas that are NOT inside parentheses so types like
+    # NUMBER(10,2) stay intact.
+    param_types: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in param_types_str:
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            param_types.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        param_types.append("".join(current).strip())
+    type_map: dict[str, str] = {}
+    for i, col_name in enumerate(input_cols):
+        if i < len(param_types):
+            # The type is the last word in each param spec (e.g. "VARCHAR" from '"INPUT" VARCHAR')
+            type_parts = param_types[i].split()
+            sql_type = type_parts[-1].upper() if type_parts else "VARCHAR"
+            type_map[col_name] = sql_type
+        else:
+            type_map[col_name] = "VARCHAR"
+    return type_map
+
+
 def _extract_response_schema_from_function(
     session: Session, function_name: str
 ) -> dict[str, object]:
@@ -431,9 +499,7 @@ def _resolve_output_spec(
     schema_obj = output_schema
     if isinstance(output_schema, str):
         try:
-            schema_obj = RobustAIComplete.parse_ai_complete_payload(
-                output_schema
-            )
+            schema_obj = RobustAIComplete.parse_ai_complete_payload(output_schema)
         except json.JSONDecodeError as exc:
             raise ValueError(f"OUTPUT_SCHEMA is not valid JSON: {exc}") from exc
     if schema_obj is not None and not isinstance(schema_obj, dict):
@@ -554,12 +620,20 @@ def _prepare_generation_request(
         function_name=function_name_str or None,
     )
 
+    # Extract input parameter types from function DDL when available.
+    # This allows the LLM to generate type-appropriate values (e.g. JSON
+    # arrays for ARRAY-typed parameters instead of plain comma-separated strings).
+    input_types: dict[str, str] = {}
+    if function_name_str:
+        input_types = _extract_input_type_map(session, function_name_str, input_cols)
+
     request: dict[str, object] = {
         "mode": "pseudo_label" if is_pseudo_mode else "synthetic",
         "model": resolved_model,
         "input_cols": input_cols,
         "output_cols": output_cols,
         "output_properties": output_properties,
+        "input_types": input_types,
         "num_examples": num_examples_int,
         "source_table": source_table_str,
         "max_source_rows": max_source_rows_int,
@@ -702,6 +776,7 @@ def _generate_batch(
     input_columns: list[str],
     output_keys: list[str],
     output_properties: dict[str, dict[str, object]] | None = None,
+    input_types: dict[str, str] | None = None,
 ) -> list[dict]:
     """Generate a single batch of synthetic examples.
 
@@ -728,8 +803,24 @@ def _generate_batch(
     hint = diversity_hints[batch_idx % len(diversity_hints)]
 
     col_list = ", ".join(input_cols)
-    col_pairs = ", ".join([f'"{c}": "..."' for c in input_cols])
-    input_properties: dict[str, object] = {c: {"type": "string"} for c in input_cols}
+    _itypes = input_types or {}
+    col_pair_parts = []
+    input_properties: dict[str, object] = {}
+    structured_cols: list[str] = []
+    for c in input_cols:
+        sql_type = _itypes.get(c, "VARCHAR").upper()
+        if sql_type == "ARRAY":
+            col_pair_parts.append(f'"{c}": ["item1", "item2"]')
+            input_properties[c] = {"type": "array", "items": {"type": "string"}}
+            structured_cols.append(c)
+        elif sql_type in ("VARIANT", "OBJECT"):
+            col_pair_parts.append(f'"{c}": {{"key1": "value1", "key2": "value2"}}')
+            input_properties[c] = {"type": "object"}
+            structured_cols.append(c)
+        else:
+            col_pair_parts.append(f'"{c}": "..."')
+            input_properties[c] = {"type": "string"}
+    col_pairs = ", ".join(col_pair_parts)
     output_properties_schema: dict[str, object] = {
         c: (
             dict(output_props.get(c, {}))
@@ -745,10 +836,18 @@ def _generate_batch(
     out_pairs = ", ".join([f'"{c}": "..."' for c in output_cols])
     example_payload = f'{{"inputs": {{{col_pairs}}}, "outputs": {{{out_pairs}}}}}'
 
+    structured_type_note = ""
+    if structured_cols:
+        structured_col_list = ", ".join(structured_cols)
+        structured_type_note = (
+            f"\n          IMPORTANT: The following input keys must be structured JSON "
+            f"(arrays or objects, not plain strings): {structured_col_list}"
+        )
+
     input_instructions = dedent(f"""\
         Each example must include:
         - "inputs": a JSON object with exactly these keys: {col_list}
-          (each value is a string; keep each under 200 chars)
+          (string values should be under 200 chars){structured_type_note}
         {output_instructions}
         - Input values must be nested under the "inputs" key (do NOT use top-level keys or "input").
         - Output values must be nested under the "outputs" key (do NOT use "expected").
@@ -852,6 +951,7 @@ def _generate_examples(
     input_columns: list[str],
     output_keys: list[str],
     output_properties: dict[str, dict[str, object]] | None = None,
+    input_types: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Generate synthetic examples using batched LLM calls with retries.
 
@@ -885,6 +985,7 @@ def _generate_examples(
                 input_columns=input_columns,
                 output_keys=output_keys,
                 output_properties=output_properties,
+                input_types=input_types,
             ): idx
             for idx, size in batch_specs
         }
@@ -917,6 +1018,7 @@ def _generate_examples(
                 input_columns=input_columns,
                 output_keys=output_keys,
                 output_properties=output_properties,
+                input_types=input_types,
             )
         except Exception as e:  # noqa: BLE001 — broad catch is intentional; LLM + Snowpark calls can raise ValueError, RuntimeError, JSONDecodeError, or SnowparkSQLException
             errors.append(f"retry {retry_idx + 1} error: {str(e)}")
@@ -947,7 +1049,7 @@ def _create_output_table(
     """Create or replace output table with the canonical labeled schema."""
     input_col_ddl = ",\n            ".join([f'"{c}" VARCHAR' for c in input_cols])
     session.sql(f"""
-        CREATE OR REPLACE TABLE {output_table} (
+        CREATE TABLE {output_table} (
             ID INT AUTOINCREMENT,
             {input_col_ddl},
             EXPECTED VARIANT
@@ -975,9 +1077,13 @@ def _insert_examples(
             raw_outputs if isinstance(raw_outputs, dict) else {}
         )
 
-        row_values: list[object] = [
-            str(inputs.get(col_name, "")) for col_name in input_cols
-        ]
+        row_values: list[object] = []
+        for col_name in input_cols:
+            val = inputs.get(col_name, "")
+            if isinstance(val, (list, tuple, dict)):
+                row_values.append(json.dumps(val, ensure_ascii=False))
+            else:
+                row_values.append(str(val))
         expected_obj = {col_name: output_vals.get(col_name) for col_name in output_cols}
         expected_json = json.dumps(expected_obj, ensure_ascii=False)
         row_values.append(expected_json)
@@ -1081,9 +1187,9 @@ def _pseudo_label_batch(
                 f"got {type(parsed).__name__}"
             )
 
-        normalized = normalizer.normalize_examples(
-            [{"inputs": {}, "outputs": parsed}]
-        )[0]["outputs"]
+        normalized = normalizer.normalize_examples([{"inputs": {}, "outputs": parsed}])[
+            0
+        ]["outputs"]
         outputs.append(normalized)
 
     return outputs
@@ -1229,6 +1335,7 @@ def generate_synthetic_data(
         input_cols = request["input_cols"]
         output_cols = request["output_cols"]
         output_properties = request["output_properties"]
+        input_types = request.get("input_types") or {}
         resolved_model = str(request["model"])
 
         if request["mode"] == "pseudo_label":
@@ -1281,6 +1388,7 @@ def generate_synthetic_data(
             input_columns=input_cols,
             output_keys=output_cols,
             output_properties=output_properties,
+            input_types=input_types,
         )
 
         if not all_examples:

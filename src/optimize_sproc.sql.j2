@@ -21,7 +21,7 @@
 --
 -- =============================================================================
 
-{% if anonymous %}WITH OPTIMIZE_AI_FUNCTION AS PROCEDURE ({% else %}CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.OPTIMIZE_AI_FUNCTION({% endif %}
+{% if anonymous %}WITH OPTIMIZE_AI_FUNCTION AS PROCEDURE ({% else %}CREATE OR REPLACE PROCEDURE {{ database }}.{{ schema }}.{{ proc_name | default('OPTIMIZE_AI_FUNCTION') }}({% endif %}
     FUNCTION_NAME VARCHAR,
     TRAINING_TABLE VARCHAR,
     LABEL_COLUMN VARCHAR,
@@ -31,7 +31,6 @@
     REFLECTION_MODEL VARCHAR,
     TEST_TABLE VARCHAR DEFAULT NULL,
     AUTO_BUDGET VARCHAR DEFAULT 'light',
-    RESULTS_TABLE VARCHAR DEFAULT NULL,
     VALIDATION_FRACTION FLOAT DEFAULT 0.5,
     TEMPERATURE FLOAT DEFAULT 0.7,
     MAX_TOKENS INTEGER DEFAULT 8192,

@@ -43,27 +43,38 @@ FROM TABLE({database}.INFORMATION_SCHEMA.TASK_HISTORY(
 
 ### Evaluation Results
 
-Once state is `SUCCEEDED`, query the results table:
+Once state is `SUCCEEDED`, query the per-evaluation experiment. By default the experiment name equals the `run_id`, and the single run inside is named `EVAL`.
 
 ```sql
--- Get evaluation results by run_id
-SELECT 
-    RUN_ID,
-    AVG(SCORE) AS AVG_SCORE,
-    COUNT(*) AS ROWS_EVALUATED,
-    SUM(CASE WHEN ERROR_MESSAGE IS NOT NULL THEN 1 ELSE 0 END) AS ERRORS
-FROM {results_table}
-WHERE RUN_ID = '{run_id}'
-GROUP BY RUN_ID;
+-- Aggregate score, num examples, function name, model from experiment metadata
+SHOW RUN METRICS    IN EXPERIMENT {database}.{schema}.{experiment_name} RUN EVAL;
+SHOW RUN PARAMETERS IN EXPERIMENT {database}.{schema}.{experiment_name} RUN EVAL;
 
--- Detailed results
-SELECT * FROM {results_table} 
-WHERE RUN_ID = '{run_id}' 
+-- Per-row results (requires ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION).
+-- Step 0 — create the JSON file format once per session. Inline
+-- (FILE_FORMAT => (TYPE => JSON)) is NOT supported on SnowURL paths.
+CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE;
+
+SELECT
+    $1:row_id::INT       AS ROW_ID,
+    $1:input_text::STRING AS INPUT_TEXT,
+    $1:expected::STRING  AS EXPECTED,
+    $1:predicted::STRING AS PREDICTED,
+    $1:metric_score::FLOAT AS SCORE,
+    $1:metric_feedback::STRING AS FEEDBACK,
+    $1:error_message::STRING AS ERROR_MESSAGE
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
 ORDER BY ROW_ID;
 
--- Analyze failures
-SELECT * FROM {results_table} 
-WHERE RUN_ID = '{run_id}' AND SCORE < 1 
+-- Analyze failures only
+SELECT $1:row_id::INT AS ROW_ID, $1:expected::STRING AS EXPECTED,
+       $1:predicted::STRING AS PREDICTED, $1:metric_score::FLOAT AS SCORE
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
+WHERE $1:metric_score::FLOAT < 1
 ORDER BY SCORE;
 ```
 
@@ -213,10 +224,10 @@ FROM TABLE({database}.INFORMATION_SCHEMA.TASK_HISTORY(
 ));
 ```
 
-### Inferring table names from run_id
+### Inferring experiment names from run_id
 
 The run_id encodes the function name and timestamp:
-- `ai_func_eval_FUNC_NAME_1709234567890` → function is `FUNC_NAME`, results table is `FUNC_NAME_EVAL_RESULTS`
+- `ai_func_eval_FUNC_NAME_1709234567890` → function is `FUNC_NAME`, experiment name = the run_id itself (`ai_func_eval_FUNC_NAME_1709234567890`), single run inside is named `EVAL`
 - `ai_func_opt_FUNC_NAME_1709234567890` → function is `FUNC_NAME`, experiment name is `FUNC_NAME_OPT_EXP`
 
 To recover the function name: strip the `ai_func_eval_` or `ai_func_opt_` prefix and the trailing `_<13-digit-timestamp>` suffix. Use the database and schema provided by the user (from the mandatory step above) to fully qualify all references.
@@ -244,12 +255,23 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
 
 ### If state is SUCCEEDED — Evaluation (run_id starts with `ai_func_eval_`)
 
-1. Query the results table using the inferred name and run_id:
+1. The experiment name equals the run_id. Pull the aggregate score and metadata from experiment metadata:
    ```sql
-   SELECT AVG(SCORE) AS AVG_SCORE, COUNT(*) AS ROWS_EVALUATED,
-          SUM(CASE WHEN ERROR_MESSAGE IS NOT NULL THEN 1 ELSE 0 END) AS ERRORS
-   FROM {database}.{schema}.{results_table}
-   WHERE RUN_ID = '{run_id}';
+   SHOW RUN METRICS    IN EXPERIMENT {database}.{schema}.{run_id} RUN EVAL;
+   SHOW RUN PARAMETERS IN EXPERIMENT {database}.{schema}.{run_id} RUN EVAL;
+   ```
+
+   For the per-row error count and average score, query the `eval_detail.json` artifact directly (requires `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION`):
+   ```sql
+   CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+     TYPE = JSON
+     STRIP_OUTER_ARRAY = TRUE;
+
+   SELECT AVG($1:metric_score::FLOAT) AS AVG_SCORE,
+          COUNT(*) AS ROWS_EVALUATED,
+          SUM(CASE WHEN $1:error_message::STRING <> '' THEN 1 ELSE 0 END) AS ERRORS
+   FROM 'snow://experiment/{run_id}/versions/EVAL/eval_detail.json'
+   (FILE_FORMAT => eval_detail_json_fmt);
    ```
 
 2. Present results using the same format as `evaluate/SKILL.md` Step 5:
@@ -258,9 +280,10 @@ Would you like to re-run it? Simply start a new evaluation or optimization workf
    ==================
 
    Function: {function_name}
-   Metric: {metric_name}  (query from results table: SELECT DISTINCT METRIC_NAME)
+   Metric: {metric_name}  (from SHOW RUN PARAMETERS)
    Test Size: {n} examples
    Eval ID: {run_id}
+   Experiment: {run_id}
 
    Average Score: {score:.1%}
    ```

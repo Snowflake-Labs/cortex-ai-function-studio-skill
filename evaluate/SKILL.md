@@ -23,11 +23,11 @@ Load from main skill when user intent matches EVALUATE: "evaluate", "test", "mea
 | `label_column` | Yes | - | **Yes** | test_table |
 | `sample_size` | No | all | No | - |
 | `metric_name` | Yes | - | **Yes** | - |
-| `results_table` | No | (generated) | No | function_name |
+| `experiment_name` | No | `{run_id}` | No | - |
 
 **Critical fields** (always confirm even if pre-provided): `input_columns`, `label_column`, `metric_name`
 
-**Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `sample_size`, `results_table`
+**Simple fields** (accept silently if pre-provided): `function_name`, `test_table`, `sample_size`, `experiment_name`
 
 ## Pre-Collection
 
@@ -130,10 +130,24 @@ After confirmation, **Load** `references/data_preparation.md` Step 5 to validate
 Evaluation configuration:
 
 - Sample size: [all] - Number of rows to evaluate (or 'all')
-- Save detailed results? [yes/no] - Results saved to function-specific table
 ```
 
-**Results Table Convention:** Results are saved to a function-specific table following the pattern `{FUNCTION_NAME}_EVAL_RESULTS`. Each evaluation run is tagged with a unique `run_id` like `eval_MY_FUNC_1739919133000` for tracking multiple evaluation experiments.
+**Experiment Convention:** Per-row evaluation details are persisted as `eval_detail.json` in a per-evaluation **Snowflake Experiment**. By default the experiment is named after the auto-generated `run_id` (e.g., `ai_func_eval_MY_FUNC_1739919133000`); each evaluation produces its own experiment. The single run inside is named `EVAL`, so the queryable artifact is always at `snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json`. Reading these files requires the server-side parameter `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION` to be enabled.
+
+**Querying eval_detail.json — required pattern:** Always create a named JSON file format first (the inline `(FILE_FORMAT => (TYPE => JSON))` syntax is **not** supported on SnowURL paths). Use a `TEMPORARY` file format so it auto-cleans at session end:
+
+```sql
+CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE;
+```
+
+Then reference it from `SELECT ... FROM 'snow://...'` (string literal, no `@` prefix):
+```sql
+SELECT $1:row_id::INT AS ROW_ID, $1:metric_score::FLOAT AS SCORE
+FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt);
+```
 
 Note: The metric is selected at runtime when calling the SPROC, not at creation time.
 
@@ -178,7 +192,7 @@ PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKIL
     --metric-name {metric_name} \
     --model-name {function_model} \
     --sample-size none \
-    --results-table {results_table or none} \
+    --experiment-name none \
     --metric-options none \
     --max-length 500 \
     --custom-metric-udf none \
@@ -187,38 +201,59 @@ PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKIL
     #   --async --warehouse {warehouse} --timeout-minutes {timeout_minutes}
 ```
 
+`--experiment-name none` lets the server auto-generate the experiment from `run_id`. Pass an explicit name only if you want to reuse an existing experiment.
+
 Run `run.py evaluate --help` to see all flags and their descriptions.
 
 #### Sync Output
 
 The script prints a JSON result to stdout:
 ```json
-{"status": "success", "score": 0.85, "metric": "exact_match", "function": "DB.SCHEMA.MY_FUNC"}
+{
+  "status": "success",
+  "score": 0.85,
+  "metric": "exact_match",
+  "function": "DB.SCHEMA.MY_FUNC",
+  "run_id": "ai_func_eval_MY_FUNC_1739919133000",
+  "experiment_name": "ai_func_eval_MY_FUNC_1739919133000",
+  "snowurl": "snow://experiment/ai_func_eval_MY_FUNC_1739919133000/versions/EVAL/eval_detail.json",
+  "num_examples": 50
+}
 ```
 
 #### Async Output
 
 For async execution, the script creates a Snowflake Task whose body is the anonymous SPROC (with inlined Python) + CALL. No named procedures are created.
 ```json
-{"status": "submitted", "run_id": "ai_func_eval_MY_FUNC_1739919133000", "task": "DB.SCHEMA.ai_func_eval_MY_FUNC_1739919133000"}
+{
+  "status": "submitted",
+  "run_id": "ai_func_eval_MY_FUNC_1739919133000",
+  "task": "DB.SCHEMA.ai_func_eval_MY_FUNC_1739919133000",
+  "experiment_name": "ai_func_eval_MY_FUNC_1739919133000",
+  "snowurl": "snow://experiment/ai_func_eval_MY_FUNC_1739919133000/versions/EVAL/eval_detail.json"
+}
 ```
 
 **⚠️ WAREHOUSE NOTE**: If the script returns `{"status": "error", ...}` instead of `{"status": "submitted", "run_id": "..."}`, it likely means the current role lacks a direct USAGE grant on the target warehouse. Snowflake Tasks require an explicit grant — session-level access via role hierarchy is not sufficient. Display the `message` field to the user. It includes the exact `GRANT` command needed and instructions for finding usable warehouses.
 
-**⚠️ IMPORTANT**: Display the run_id prominently to the user:
+**⚠️ IMPORTANT**: Display the run_id and SnowURL prominently to the user:
 
 ```
 Evaluation started in background!
 
 RUN_ID: {run_id}
+EXPERIMENT: {experiment_name}
 
-Save this run_id to track your evaluation.
+Save these to track your evaluation.
 
 Check status:  See references/async_status.md
-View results:  SELECT * FROM {results_table} WHERE RUN_ID = '{run_id}';
+View results:
+  CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+    TYPE = JSON STRIP_OUTER_ARRAY = TRUE;
+  SELECT $1
+  FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+  (FILE_FORMAT => eval_detail_json_fmt);
 ```
-
-**⚠️ IMPORTANT**: For async evaluation, `--results-table` is required since the return value isn't directly accessible.
 
 **Load** `references/async_status.md` if user wants to check status.
 
@@ -236,26 +271,31 @@ Only proceed with cleanup when `STATE` is `SUCCEEDED`, `FAILED`, or `CANCELLED`.
 DROP TASK IF EXISTS {database}.{schema}.{run_id};
 ```
 
-**Results Table Schema:**
+The Snowflake Experiment created by the evaluation persists across Task cleanup so users can keep querying `eval_detail.json`. Drop it explicitly if no longer needed:
+```sql
+DROP EXPERIMENT IF EXISTS {database}.{schema}.{experiment_name};
+```
 
-When saving results, the SPROC automatically:
-1. Creates the results table if it doesn't exist
-2. Generates a unique `run_id` (e.g., `ai_func_eval_MY_FUNC_1739919133000`) for the evaluation run
-3. Records `METRIC_NAME` and `MODEL_NAME` with each row
+**Eval Detail Artifact:**
 
-| Column | Type | Description |
-|--------|------|-------------|
-| RUN_ID | VARCHAR | Unique identifier for this evaluation run |
-| ROW_ID | INTEGER | Row number from test data |
-| INPUT_TEXT | VARCHAR | Input values summary |
-| EXPECTED | VARCHAR | Expected output |
-| PREDICTED | VARCHAR | Model's prediction |
-| SCORE | FLOAT | Score for this row (0.0-1.0) |
-| FEEDBACK | VARCHAR | Metric feedback explaining the score |
-| ERROR_MESSAGE | VARCHAR | Error message if evaluation failed |
-| METRIC_NAME | VARCHAR | Name of the metric used |
-| MODEL_NAME | VARCHAR | Model name used |
-| EVAL_TIMESTAMP | TIMESTAMP | When this row was evaluated |
+The SPROC creates a per-evaluation Snowflake Experiment (default name = `run_id`) with a single run named `EVAL`. Per-row evaluation details are uploaded as `eval_detail.json` to the run's nested stage at `snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json`. Each JSON record carries:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `row_id` | INTEGER | Row number from test data |
+| `input_text` | STRING | Input values summary |
+| `expected` | STRING | Expected output |
+| `predicted` | STRING | Model's prediction |
+| `metric_score` | FLOAT | Score for this row (0.0-1.0) |
+| `metric_feedback` | STRING | Metric feedback explaining the score |
+| `error_message` | STRING | Error message if evaluation failed |
+| `metric_name` | STRING | Name of the metric used |
+| `model_name` | STRING | Model name used |
+| `split` | STRING | Always `"test"` for standalone EVALUATE |
+
+The aggregate score, function name, model, sample size, and elapsed time are stored as run metrics/parameters and queryable via `SHOW RUN METRICS / SHOW RUN PARAMETERS IN EXPERIMENT {experiment_name} RUN EVAL`.
+
+**Note on VARIANT data:** `expected` and `predicted` are stringified. When the function returns VARIANT (multi-output) or the label column is VARIANT (e.g., from synthetic data), values are serialized to JSON strings. To access fields in result queries, use `PARSE_JSON($1:expected):key` or `PARSE_JSON($1:predicted):key` after selecting from the SnowURL.
 
 **Metric Optional Parameters via `metric_options`:**
 
@@ -279,29 +319,57 @@ Eval ID: {run_id}
 Average Score: {score:.1%}
 ```
 
-**If results were saved:**
+**Detailed results:**
 ```
-Detailed results saved to: {results_table}
+Detailed results saved to experiment: {experiment_name}
 Evaluation ID: {run_id}
+SnowURL: snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json
 
-Query this evaluation run:
-  SELECT * FROM {results_table} WHERE RUN_ID = '{run_id}' ORDER BY ROW_ID;
+Step 0 — create the JSON file format once per session (required for SnowURL queries):
+  CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+    TYPE = JSON
+    STRIP_OUTER_ARRAY = TRUE;
+
+Query all rows:
+  SELECT
+      $1:row_id::INT       AS ROW_ID,
+      $1:input_text::STRING AS INPUT_TEXT,
+      $1:expected::STRING  AS EXPECTED,
+      $1:predicted::STRING AS PREDICTED,
+      $1:metric_score::FLOAT AS SCORE,
+      $1:metric_feedback::STRING AS FEEDBACK
+  FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+  (FILE_FORMAT => eval_detail_json_fmt)
+  ORDER BY ROW_ID;
 
 Analyze failures:
-  SELECT * FROM {results_table} WHERE RUN_ID = '{run_id}' AND SCORE < 1 ORDER BY SCORE;
+  SELECT $1:row_id::INT AS ROW_ID, $1:expected::STRING AS EXPECTED,
+         $1:predicted::STRING AS PREDICTED, $1:metric_score::FLOAT AS SCORE
+  FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+  (FILE_FORMAT => eval_detail_json_fmt)
+  WHERE $1:metric_score::FLOAT < 1
+  ORDER BY SCORE;
 
 Check errors:
-  SELECT * FROM {results_table} WHERE RUN_ID = '{run_id}' AND ERROR_MESSAGE IS NOT NULL;
+  SELECT $1:row_id::INT AS ROW_ID, $1:error_message::STRING AS ERROR_MESSAGE
+  FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+  (FILE_FORMAT => eval_detail_json_fmt)
+  WHERE $1:error_message::STRING IS NOT NULL AND $1:error_message::STRING <> '';
 
 Score distribution:
-  SELECT SCORE, COUNT(*) FROM {results_table} WHERE RUN_ID = '{run_id}' GROUP BY SCORE ORDER BY SCORE DESC;
+  SELECT $1:metric_score::FLOAT AS SCORE, COUNT(*) AS N
+  FROM 'snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json'
+  (FILE_FORMAT => eval_detail_json_fmt)
+  GROUP BY SCORE ORDER BY SCORE DESC;
 
-Compare evaluation runs:
-  SELECT RUN_ID, METRIC_NAME, MODEL_NAME, AVG(SCORE) AS AVG_SCORE, COUNT(*) AS ROW_COUNT
-  FROM {results_table}
-  GROUP BY RUN_ID, METRIC_NAME, MODEL_NAME
-  ORDER BY EVAL_TIMESTAMP DESC;
+Compare evaluation runs (each run is its own experiment):
+  SHOW EXPERIMENTS LIKE 'ai_func_eval_{FUNCTION_NAME}_%' IN SCHEMA {database}.{schema};
+  -- Then for each experiment of interest:
+  SHOW RUN PARAMETERS IN EXPERIMENT {database}.{schema}.{experiment_name} RUN EVAL;
+  SHOW RUN METRICS    IN EXPERIMENT {database}.{schema}.{experiment_name} RUN EVAL;
 ```
+
+> Querying `'snow://experiment/...'` requires the server-side parameter `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION` to be enabled. If queries fail with a parse / resolution error, ask your account admin to enable it. The path is a **string literal**, not a `@stage` reference, and the FILE FORMAT must be a named object — inline `(TYPE => JSON)` is not supported on SnowURL.
 
 ### Step 6: Next Steps
 

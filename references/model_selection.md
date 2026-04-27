@@ -18,6 +18,8 @@ Triggers: model selection step in any workflow, "see more models", "list models"
 2. If verification passes, use it immediately — no need to present options
 3. If verification fails, fall back to the full selection flow below
 
+If the user explicitly asks to see available models, do not take the Fast Path — run the full Step 1 → Step 4 workflow regardless of any default already collected.
+
 ### Step 1: Check Account Allowlist
 
 ```sql

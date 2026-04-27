@@ -14,6 +14,7 @@
 evaluate:
   sources:
     - custom_ai_function_utils.py
+    - snow_gepa_experiment.py
     - metrics_core.py
   handler: evaluate_handler
 

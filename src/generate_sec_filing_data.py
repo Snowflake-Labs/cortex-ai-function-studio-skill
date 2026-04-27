@@ -26,7 +26,6 @@ import argparse
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -88,7 +87,7 @@ def setup_stage(
     cur.execute(f"CREATE SCHEMA IF NOT EXISTS {fqn}")
     cur.execute(f"USE SCHEMA {fqn}")
     cur.execute(
-        f"CREATE OR REPLACE STAGE {stage_fqn} "
+        f"CREATE STAGE {stage_fqn} "
         f"ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE') DIRECTORY = (ENABLE = TRUE)"
     )
     logger.info(f"Stage ready: {stage_fqn}")
@@ -96,25 +95,18 @@ def setup_stage(
 
 
 def upload_pdfs(
-    connection_name: str,
+    conn: snowflake.connector.SnowflakeConnection,
     stage_fqn: str,
     entries: list[dict],
 ) -> None:
+    cur = conn.cursor()
     for entry in entries:
-        cmd = (
-            f'snow sql -q "PUT \'file://{entry["pdf_path"]}\' @{stage_fqn}/ '
-            f'AUTO_COMPRESS=FALSE OVERWRITE=TRUE;" '
-            f"--connection {connection_name}"
+        cur.execute(
+            f"PUT 'file://{entry['pdf_path']}' @{stage_fqn}/ "
+            f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
         )
-        subprocess.run(cmd, shell=True, check=True, capture_output=True)
 
-    subprocess.run(
-        f'snow sql -q "ALTER STAGE {stage_fqn} REFRESH;" '
-        f"--connection {connection_name}",
-        shell=True,
-        check=True,
-        capture_output=True,
-    )
+    cur.execute(f"ALTER STAGE {stage_fqn} REFRESH")
     logger.info(f"Uploaded {len(entries)} PDFs to {stage_fqn}")
 
 
@@ -129,13 +121,20 @@ def create_tables(
     cur = conn.cursor()
 
     cur.execute(
-        f"CREATE OR REPLACE TABLE {fqn}.DEMO_SEC_FILING_ALL "
+        f"CREATE TABLE {fqn}.DEMO_SEC_FILING_ALL "
         f"(FILE_PATH VARCHAR, EXPECTED_OUTPUT VARCHAR)"
     )
 
     label_keys = [
-        "company_name", "report_date", "irs_ein", "state_of_incorporation",
-        "ticker", "exchange", "phone", "business_address", "filer_category",
+        "company_name",
+        "report_date",
+        "irs_ein",
+        "state_of_incorporation",
+        "ticker",
+        "exchange",
+        "phone",
+        "business_address",
+        "filer_category",
     ]
     for entry in entries:
         expected = json.dumps(
@@ -148,7 +147,7 @@ def create_tables(
         )
 
     cur.execute(
-        f"CREATE OR REPLACE TABLE {fqn}.DEMO_SEC_FILING_TRAIN AS "
+        f"CREATE TABLE {fqn}.DEMO_SEC_FILING_TRAIN AS "
         f"SELECT FILE_PATH, EXPECTED_OUTPUT FROM ("
         f"  SELECT *, ROW_NUMBER() OVER (ORDER BY RANDOM(42)) AS _RN,"
         f"  COUNT(*) OVER () AS _TOTAL"
@@ -156,7 +155,7 @@ def create_tables(
         f") WHERE _RN <= FLOOR(_TOTAL * {train_pct} / 100)"
     )
     cur.execute(
-        f"CREATE OR REPLACE TABLE {fqn}.DEMO_SEC_FILING_TEST AS "
+        f"CREATE TABLE {fqn}.DEMO_SEC_FILING_TEST AS "
         f"SELECT FILE_PATH, EXPECTED_OUTPUT FROM ("
         f"  SELECT *, ROW_NUMBER() OVER (ORDER BY RANDOM(42)) AS _RN,"
         f"  COUNT(*) OVER () AS _TOTAL"
@@ -168,9 +167,9 @@ def create_tables(
     train_n = cur.execute(
         f"SELECT COUNT(*) FROM {fqn}.DEMO_SEC_FILING_TRAIN"
     ).fetchone()[0]
-    test_n = cur.execute(
-        f"SELECT COUNT(*) FROM {fqn}.DEMO_SEC_FILING_TEST"
-    ).fetchone()[0]
+    test_n = cur.execute(f"SELECT COUNT(*) FROM {fqn}.DEMO_SEC_FILING_TEST").fetchone()[
+        0
+    ]
     logger.info(f"  Train: {fqn}.DEMO_SEC_FILING_TRAIN ({train_n} rows)")
     logger.info(f"  Test:  {fqn}.DEMO_SEC_FILING_TEST ({test_n} rows)")
 
@@ -197,7 +196,7 @@ def main(
         try:
             stage_fqn = setup_stage(conn, database, schema)
             logger.info("Uploading PDFs to stage...")
-            upload_pdfs(connection, stage_fqn, entries)
+            upload_pdfs(conn, stage_fqn, entries)
             logger.info("Creating train/test tables...")
             create_tables(conn, database, schema, entries, train_pct)
             logger.info("Done!")
@@ -217,7 +216,9 @@ if __name__ == "__main__":
         help="Path to data.zip archive (default: auto-detected from skill layout)",
     )
     parser.add_argument(
-        "--train-pct", type=int, default=60,
+        "--train-pct",
+        type=int,
+        default=60,
         help="Training split percentage (default: 60)",
     )
     args = parser.parse_args()

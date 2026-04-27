@@ -11,11 +11,9 @@ No external dependencies except stdlib.
 from collections.abc import Callable
 from collections import Counter
 import re
-from textwrap import dedent
 import time
 from typing import Protocol, runtime_checkable
 
-import pandas as pd
 from snowflake.snowpark import Session
 import json
 
@@ -25,6 +23,7 @@ from custom_ai_function_utils import (
     with_custom_ai_function_query_tag,
     RobustAIComplete,
 )
+from snow_gepa_experiment import save_evaluation_to_experiment
 
 LLM_JUDGE_DEFAULT_MODEL = "claude-sonnet-4-5"
 LLM_JUDGE_DEFAULT_TEMP = 0.0
@@ -688,8 +687,7 @@ def _parse_continuous_result(raw: object) -> tuple[float, str]:
 
 
 _LLM_JUDGE_FILE_ADDENDUM = (
-    "\n\nThe attached file shows the actual input. "
-    "Use it to verify the prediction."
+    "\n\nThe attached file shows the actual input. " "Use it to verify the prediction."
 )
 
 
@@ -735,7 +733,9 @@ def llm_judge_batch(
         return []
 
     continuous = scoring_mode == "continuous"
-    template = _LLM_JUDGE_CONTINUOUS_TEMPLATE if continuous else _LLM_JUDGE_BINARY_TEMPLATE
+    template = (
+        _LLM_JUDGE_CONTINUOUS_TEMPLATE if continuous else _LLM_JUDGE_BINARY_TEMPLATE
+    )
     parser = _parse_continuous_result if continuous else _parse_binary_result
 
     multimodal = bool(file_paths and stage_name)
@@ -764,7 +764,9 @@ def llm_judge_batch(
         user_prompts=judge_prompts,
         temperature=temperature,
         max_tokens=max_tokens,
-        response_schema=_LLM_JUDGE_CONTINUOUS_SCHEMA if continuous else _LLM_JUDGE_BINARY_SCHEMA,
+        response_schema=_LLM_JUDGE_CONTINUOUS_SCHEMA
+        if continuous
+        else _LLM_JUDGE_BINARY_SCHEMA,
         file_paths=file_paths if multimodal else None,
         stage_name=stage_name if multimodal else None,
     )
@@ -998,6 +1000,7 @@ def compute_metric_batch(
         compute_metric(metric_name, exp, pred, session, **kwargs) for exp, pred in items
     ]
 
+
 def _collect_eval_rows(
     session,
     *,
@@ -1070,13 +1073,13 @@ def evaluate(
     metric_name: str,
     model_name: str = LLM_JUDGE_DEFAULT_MODEL,
     sample_size: int | None = None,
-    results_table: str | None = None,
     metric_options: dict | None = None,
     max_length: int = 500,
     custom_metric_udf: str | None = None,
     run_id: str | None = None,
     executor: PredictionExecutor | None = None,
-) -> float:
+    split: str = "test",
+) -> tuple[float, list[dict]]:
     """Evaluate an AI function against a test dataset.
 
     The function is called directly without parameter overrides. The model
@@ -1093,11 +1096,23 @@ def evaluate(
         metric_name: Metric to use for evaluation
         model_name: Model name for results tracking metadata
         sample_size: Number of rows to evaluate (None = all)
-        results_table: Table to save detailed results (None = don't save)
         metric_options: Metric-specific options
         max_length: Max length for truncated fields (default 500)
         custom_metric_udf: Fully qualified name of a custom metric UDF.
         run_id: Optional external run ID for tracking (auto-generated if None).
+        executor: Optional callable that produces predictions; when omitted,
+            the function is invoked via SQL.
+        split: Tag stored on each per-row detail record (e.g., ``"test"``,
+            ``"validation"``). Useful when callers persist multiple eval
+            artifacts side-by-side in the same experiment run.
+
+    Returns:
+        Tuple of ``(avg_score, eval_details)`` where ``eval_details`` is
+        a list of per-row dicts with keys ``row_id``, ``input_text``,
+        ``expected``, ``predicted``, ``metric_score``, ``metric_feedback``,
+        ``error_message``, and ``split``. Callers persist the details by
+        uploading them as ``eval_detail.json`` to a Snowflake Experiment
+        run's nested stage.
     """
     input_cols, output_field, metric_opts, results_data = _collect_eval_rows(
         session,
@@ -1119,7 +1134,7 @@ def evaluate(
     )
 
     if not results_data:
-        return 0.0
+        return 0.0, []
 
     if executor is None:
         predicted_raw_list = []
@@ -1154,9 +1169,8 @@ def evaluate(
 
         predicted_raw_obj = predicted_raw_list[idx]
         error_message = None
-        if (
-            isinstance(predicted_raw_obj, str)
-            and predicted_raw_obj.startswith("INFERENCE_ERROR:")
+        if isinstance(predicted_raw_obj, str) and predicted_raw_obj.startswith(
+            "INFERENCE_ERROR:"
         ):
             error_message = predicted_raw_obj
             predicted_raw = ""
@@ -1223,53 +1237,21 @@ def evaluate(
             )
         )
 
-    if results_table:
-        session.sql(f"""
-            CREATE TABLE IF NOT EXISTS {results_table} (
-                RUN_ID VARCHAR,
-                ROW_ID INTEGER,
-                INPUT_TEXT VARCHAR,
-                EXPECTED VARCHAR,
-                PREDICTED VARCHAR,
-                SCORE FLOAT,
-                FEEDBACK VARCHAR,
-                ERROR_MESSAGE VARCHAR,
-                METRIC_NAME VARCHAR,
-                MODEL_NAME VARCHAR,
-                EVAL_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
-            )
-        """).collect()
-
-        # Use provided run_id or generate one (format: ai_func_eval_FUNCNAME_timestamp_ms)
-        if not run_id:
-            func_short_name = function_name.split(".")[-1].split("(")[0]
-            run_id = f"ai_func_eval_{func_short_name}_{int(time.time() * 1000)}"
-
-        result_records = [
-            {
-                "RUN_ID": run_id,
-                "ROW_ID": r[0],
-                "INPUT_TEXT": r[1] or "",
-                "EXPECTED": r[2] or "",
-                "PREDICTED": r[3] or "",
-                "SCORE": r[4],
-                "FEEDBACK": r[5] or "",
-                "ERROR_MESSAGE": r[6] or "",
-                "METRIC_NAME": metric_name,
-                "MODEL_NAME": model_name,
-            }
-            for r in results
-        ]
-        results_df = pd.DataFrame(result_records)
-        db, schema, table = results_table.split(".")
-        session.write_pandas(
-            results_df,
-            table,
-            database=db,
-            schema=schema,
-            auto_create_table=False,
-            overwrite=False,
-        )
+    eval_details: list[dict] = [
+        {
+            "row_id": r[0],
+            "input_text": r[1] or "",
+            "expected": r[2] or "",
+            "predicted": r[3] or "",
+            "metric_score": r[4],
+            "metric_feedback": r[5] or "",
+            "error_message": r[6] or "",
+            "metric_name": metric_name,
+            "model_name": model_name,
+            "split": split,
+        }
+        for r in results
+    ]
 
     avg_score = total_score / len(results_data) if results_data else 0
 
@@ -1283,7 +1265,7 @@ def evaluate(
         except Exception:
             pass  # Cleanup failure should not break the evaluation
 
-    return avg_score
+    return avg_score, eval_details
 
 
 @with_ai_sql_error_handling_use_fail_on_error_disabled_for_sproc()
@@ -1297,18 +1279,30 @@ def evaluate_handler(
     metric_name: str,
     model_name: str = LLM_JUDGE_DEFAULT_MODEL,
     sample_size: int | None = None,
-    results_table: str | None = None,
+    experiment_name: str | None = None,
     metric_options: dict | None = None,
     max_length: int = 500,
     custom_metric_udf: str | None = None,
     run_id: str | None = None,
-) -> float:
+) -> dict:
     """SPROC entry point for EVALUATE_AI_FUNCTION.
 
     Thin wrapper around :func:`evaluate` that exposes only the parameters
-    available through the stored procedure interface.
+    available through the stored procedure interface. Persists per-row
+    eval details as ``eval_detail.json`` to a per-evaluation Snowflake
+    Experiment and returns a VARIANT pointing at the SnowURL where the
+    results can be queried.
     """
-    return evaluate(
+    start_time = time.time()
+
+    if not run_id:
+        func_short_name = function_name.split(".")[-1].split("(")[0]
+        run_id = f"ai_func_eval_{func_short_name}_{int(time.time() * 1000)}"
+
+    if not experiment_name:
+        experiment_name = run_id
+
+    score, eval_details = evaluate(
         session,
         function_name,
         test_table,
@@ -1317,9 +1311,33 @@ def evaluate_handler(
         metric_name,
         model_name=model_name,
         sample_size=sample_size,
-        results_table=results_table,
         metric_options=metric_options,
         max_length=max_length,
         custom_metric_udf=custom_metric_udf,
         run_id=run_id,
     )
+
+    elapsed = time.time() - start_time
+
+    save_evaluation_to_experiment(
+        session,
+        experiment_name,
+        function_name=function_name,
+        metric_name=metric_name,
+        model_name=model_name,
+        score=score,
+        num_examples=len(eval_details),
+        eval_details=eval_details,
+        sample_size=sample_size,
+        custom_metric_udf=custom_metric_udf or "",
+        elapsed_seconds=elapsed,
+    )
+
+    snowurl = f"snow://experiment/{experiment_name}/versions/EVAL/eval_detail.json"
+    return {
+        "score": score,
+        "run_id": run_id,
+        "experiment_name": experiment_name,
+        "snowurl": snowurl,
+        "num_examples": len(eval_details),
+    }

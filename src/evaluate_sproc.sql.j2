@@ -20,13 +20,13 @@
     METRIC_NAME VARCHAR,
     MODEL_NAME VARCHAR,
     SAMPLE_SIZE INTEGER DEFAULT NULL,
-    RESULTS_TABLE VARCHAR DEFAULT NULL,
+    EXPERIMENT_NAME VARCHAR DEFAULT NULL,
     METRIC_OPTIONS VARIANT DEFAULT NULL,
     MAX_LENGTH INTEGER DEFAULT 500,
     CUSTOM_METRIC_UDF VARCHAR DEFAULT NULL,
     RUN_ID VARCHAR DEFAULT NULL
 )
-RETURNS FLOAT
+RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.12'
 PACKAGES = ('snowflake-snowpark-python', 'pandas')
@@ -39,7 +39,8 @@ $${% if not anonymous %};{% endif %}
 {%- else -%}
 IMPORTS = (
     '@{{ database }}.{{ schema }}.{{ stage_name }}/custom_ai_function_utils.py',
-    '@{{ database }}.{{ schema }}.{{ stage_name }}/metrics_core.py'
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/metrics_core.py',
+    '@{{ database }}.{{ schema }}.{{ stage_name }}/snow_gepa_experiment.py'
 )
 HANDLER = 'metrics_core.evaluate_handler'
 EXECUTE AS CALLER{% if not anonymous %};{% endif %}

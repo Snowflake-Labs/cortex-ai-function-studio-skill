@@ -390,13 +390,29 @@ Then use `ask_user_question` for next steps (Evaluate / Optimize / Generate more
 
 ## Optimize Workflow: Progress Bar (Step 5)
 
-Show a live progress bar in the notebook while optimization runs. The budget maps to a known candidate count `N`:
+Show an approximate progress bar in the notebook while optimization runs. Progress is derived from two signals:
 
-| Budget | N (expected candidates) |
-|--------|------------------------|
-| light  | 10 |
-| medium | 18 |
-| heavy  | 27 |
+1. **QUERY_HISTORY** — the optimization SPROC executes child queries (CREATE TEMPORARY FUNCTION, SELECT, AI_COMPLETE) that appear in `INFORMATION_SCHEMA.QUERY_HISTORY()` tagged with `SPROC_OPTIMIZATION`. Each GEPA iteration produces ~3-5 queries, so counting tagged queries and dividing by the expected total gives approximate progress.
+2. **Experiment completion** — when a model finishes, its `{MODEL}_BEST` run appears in the experiment. This gives a definitive "done" signal.
+
+### Budget to iteration mapping
+
+The budget preset determines N (max proposal iterations). Compute N in the progress cell using the same formula as the backend (`resolve_budget` in `snow_gepa_optimize.py`):
+
+| Preset | n (candidates) | N (max iterations) | Queries (Q=4) | Queries (Q=6) | Queries (Q=7) |
+|--------|---------------|-------------------|---------------|---------------|---------------|
+| demo   | 2             | 4                 | ~16           | ~24           | ~28           |
+| light  | 6             | 10                | ~40           | ~60           | ~70           |
+| medium | 12            | 18                | ~72           | ~108          | ~126          |
+| heavy  | 18            | 27                | ~108          | ~162          | ~189          |
+
+**Estimated queries per model** = `N * Q` where Q depends on the metric:
+
+- **Deterministic metrics** (exact_match, fuzzy_match, contains_match, redaction_match): Q = 4 (1 reflection + 1 compile + 2 evaluation). Scoring runs in Python — no extra SQL.
+- **llm_judge**: Q = 7 (adds 1 AI_COMPLETE judge query per evaluation batch — 2 minibatch + ~1 valset on accepted candidates; actual average is slightly lower since rejected iterations skip valset, but 7 is a conservative upper bound).
+- **Custom metric UDF**: Q = 6 (adds 1 UDF call per evaluation batch — similar to llm_judge but slightly cheaper).
+
+For multiple models, multiply by `len(MODELS)` since models run in parallel threads within the same SPROC session.
 
 ### Sequence
 
@@ -407,67 +423,128 @@ Show a live progress bar in the notebook while optimization runs. The budget map
    **Markdown cell:**
    ```markdown
    # 🔧 Optimization: {function_name}
-   **Budget:** {auto_budget} (~{N} candidates) | **Run ID:** {run_id}
+   **Budget:** {auto_budget} (~{N} iterations per model) | **Metric:** {metric_name} | **Experiment:** {experiment_name}
    ```
 
-   **Python cell** — polls the tracking table and prints progress. Snowsight Workspace notebooks do not support in-place output updates (`clear_output`, `update_display`, `\r`, and `streamlit` are all unavailable). Instead, this cell prints a new line **only when progress changes** to keep output clean.
+   **Python cell** — approximates progress by counting SPROC child queries in QUERY_HISTORY, and detects completion via the experiment's `{MODEL}_BEST` runs. Uses ANSI escape sequences for in-place updates.
    ```python
-   import time
+   import math, sys, time, re
    from snowflake.snowpark.context import get_active_session
 
    session = get_active_session()
-   RUN_ID = "{run_id}"
-   TRACKING_TABLE = "{tracking_table}"
-   N = {N}
-   MODELS = {models_list}  # e.g. ["claude-sonnet-4-5"] or ["claude-sonnet-4-5", "llama3.1-70b"]
-   TIMEOUT = {timeout_seconds}  # e.g. light=600, medium=1800, heavy=3600
+   EXPERIMENT = "{experiment_name}"
+   MODELS = {models_list}
+   TIMEOUT = {timeout_seconds}
+   AUTO_BUDGET = "{auto_budget}"
+   METRIC_NAME = "{metric_name}"
+   CUSTOM_METRIC_UDF = "{custom_metric_udf}"
 
-   def bar(cur, total):
-       pct = min(cur / total, 1.0) if total > 0 else 0
-       filled = int(20 * pct)
-       return "█" * filled + "░" * (20 - filled), pct
+   BUDGET_N = {"demo": 2, "light": 6, "medium": 12, "heavy": 18}
+   n = BUDGET_N.get(AUTO_BUDGET, 6)
+   N = int(max(2 * 2 * math.log2(n), 1.5 * n))
 
-   prev = {}
+   if METRIC_NAME == "llm_judge":
+       QUERIES_PER_ITER = 7
+   elif CUSTOM_METRIC_UDF and CUSTOM_METRIC_UDF != "none":
+       QUERIES_PER_ITER = 6
+   else:
+       QUERIES_PER_ITER = 4
+   EXPECTED_TOTAL_QUERIES = N * QUERIES_PER_ITER * len(MODELS)
+
+   start_ts = session.sql("SELECT CURRENT_TIMESTAMP()::VARCHAR AS TS").collect()[0]["TS"]
+
+   def model_prefix(model):
+       return re.sub(r"[^A-Za-z0-9]", "_", model).upper()
+
+   def bar(pct):
+       filled = int(20 * min(pct, 1.0))
+       return "█" * filled + "░" * (20 - filled)
+
+   db = session.get_current_database()
+   wh = session.get_current_warehouse()
+
+   def count_sproc_queries():
+       try:
+           rows = session.sql(
+               f"SELECT COUNT(*) AS QC FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY("
+               f"END_TIME_RANGE_START => '{start_ts}'::TIMESTAMP_LTZ, "
+               f"RESULT_LIMIT => 10000)) "
+               f"WHERE QUERY_TAG LIKE '%SPROC_OPTIMIZATION%'"
+               f"  AND DATABASE_NAME = '{db}'"
+               f"  AND WAREHOUSE_NAME = '{wh}'"
+           ).collect()
+           return rows[0]["QC"] if rows else 0
+       except Exception:
+           return 0
+
+   def check_done():
+       done = {}
+       for m in MODELS:
+           try:
+               best_run = f"{model_prefix(m)}_BEST"
+               rows = session.sql(
+                   f"SHOW RUN METRICS IN EXPERIMENT {EXPERIMENT} RUN {best_run}"
+               ).collect()
+               for r in rows:
+                   if r["name"] == "valset_score" and r["value"] is not None:
+                       done[m] = float(r["value"])
+           except Exception:
+               pass
+       return done
+
+   first_print = True
    start = time.time()
-   print("Optimization started — tracking progress...\n")
-   while time.time() - start < TIMEOUT:
-       rows = session.sql(
-           f"SELECT MODEL_NAME, COUNT(DISTINCT CANDIDATE_INDEX) AS n FROM {TRACKING_TABLE} "
-           f"WHERE RUN_ID = '{RUN_ID}' AND EVAL_TYPE = 'incremental' GROUP BY MODEL_NAME"
-       ).collect()
-       progress = {r["MODEL_NAME"]: r["N"] for r in rows}
+   sys.stdout.write(f"Optimization started — {len(MODELS)} model(s), ~{N} iterations each\n\n")
+   sys.stdout.flush()
 
-       summary = session.sql(
-           f"SELECT MODEL_NAME, METRIC_SCORE FROM {TRACKING_TABLE} "
-           f"WHERE RUN_ID = '{RUN_ID}' AND EVAL_TYPE = 'summary' AND CANDIDATE_INDEX = 1"
-       ).collect()
-       done = {r["MODEL_NAME"]: r["METRIC_SCORE"] for r in summary}
+   while time.time() - start < TIMEOUT:
+       done = check_done()
+       qc = count_sproc_queries()
+       remaining = len(MODELS) - len(done)
+       remaining_qc = max(qc - len(done) * N * QUERIES_PER_ITER, 0)
+       if remaining > 0:
+           pct = min(remaining_qc / max(remaining * N * QUERIES_PER_ITER, 1), 0.99)
+       else:
+           pct = 1.0
        elapsed = int(time.time() - start)
 
-       for m in MODELS:
-           cur = progress.get(m, 0)
-           if m in done and prev.get(m) != "done":
-               b, _ = bar(N, N)
-               print(f"  [{b}] {m} ✅ Complete | Best: {done[m]:.1%}  ({elapsed}s)")
-               prev[m] = "done"
-           elif cur != prev.get(m):
-               b, pct = bar(cur, N)
-               print(f"  [{b}] {m} {pct:.0%}  ({cur}/{N} candidates, {elapsed}s)")
-               prev[m] = cur
+       if not first_print:
+           sys.stdout.write(f"\033[{len(MODELS) + 1}A")
 
-       if set(done) >= set(MODELS):
-           print(f"\n✅ All models complete ({elapsed}s)")
+       overall_pct = (len(done) + pct * remaining) / len(MODELS) if MODELS else 0
+       sys.stdout.write(f"\r\033[2K  [{bar(overall_pct)}] {overall_pct:.0%} overall  ({elapsed}s)\n")
+       for m in MODELS:
+           if m in done:
+               sys.stdout.write(f"\r\033[2K    ✅ {m} — Complete | Best: {done[m]:.1%}\n")
+           else:
+               model_pct = min((remaining_qc / max(remaining, 1)) / max(N * QUERIES_PER_ITER, 1), 0.99)
+               sys.stdout.write(f"\r\033[2K    [{bar(model_pct)}] {m} ~{model_pct:.0%}\n")
+       sys.stdout.flush()
+       first_print = False
+
+       if len(done) == len(MODELS):
+           sys.stdout.write(f"\n✅ All models complete ({elapsed}s)\n")
+           sys.stdout.flush()
            break
-       time.sleep(5)
+       time.sleep(8)
    else:
-       print("\n⏱️ Progress tracking timed out. Optimization may still be running.")
+       sys.stdout.write(f"\n⏱️ Progress tracking timed out after {TIMEOUT}s. Check the following for more info on the optimization: SHOW RUNS IN EXPERIMENT {EXPERIMENT}\n")
+       sys.stdout.flush()
    ```
 
-   The `MODELS` list comes from the user's model selection in Step 4.3 of `optimize/SKILL.md`. For a single model, the cell renders one bar; for multiple models, one bar per model — each finishing independently as its `summary` row appears. Lines only print when a model's candidate count changes, keeping output compact.
+   **How progress is approximated:** The cell counts queries tagged with `SPROC_OPTIMIZATION` in `INFORMATION_SCHEMA.QUERY_HISTORY()` since the optimization started (using `CURRENT_TIMESTAMP()` captured from the Snowflake session to avoid timezone mismatches). Results are scoped to the current user (default `QUERY_HISTORY` behavior), database, and warehouse to avoid counting unrelated queries. The queries-per-iteration constant (Q) adapts to the metric: Q=4 for deterministic metrics (scoring is pure Python, no extra SQL), Q=7 for `llm_judge` (adds AI_COMPLETE judge calls — valset judge only fires when a candidate is accepted, so actual Q averages slightly lower), and Q=6 for custom metric UDFs (detected via `{custom_metric_udf}` — adds UDF calls per eval batch). Overall progress = `query_count / (N * Q * num_models)`, capped at 99% until the experiment's `{MODEL}_BEST` run confirms completion. `QUERY_HISTORY` can have a short delay (seconds), so the bar may update in small jumps rather than smoothly.
+
+   For multi-model runs, per-model progress divides the total query count by the number of models (`qc / len(MODELS)`) since all model threads share one SPROC session and query tag — individual model queries can't be distinguished.
+
+   The `METRIC_NAME` and `CUSTOM_METRIC_UDF` values come from Step 4.1 of `optimize/SKILL.md` and the `--metric-name` / `--custom-metric-udf` flags respectively.
+
+   The `MODELS` list comes from the user's model selection in Step 4.3 of `optimize/SKILL.md`. For a single model, the cell renders one progress bar; for multiple models, one bar per model plus an overall bar. Each model's bar transitions to a completion marker when its `{MODEL}_BEST` run appears in the experiment.
+
+   **⚠️ Concurrent optimizations:** The query tag filter (`LIKE '%SPROC_OPTIMIZATION%'`) is not scoped to a specific run. If two optimizations run simultaneously (e.g., different functions), their queries are counted together, inflating progress. This is an inherent limitation of the frontend-only approach — in practice, concurrent optimizations from the same user are rare.
 
 3. **Run the progress cell** immediately after adding it — use `notebook_action(action="run_notebook", run_type="after", cell_id=<first_new_cell_id>)`. The cell starts its polling loop in the notebook kernel, which runs independently from the agent.
 
-4. **Start optimization** via `bash` as normal (Step 5 in `optimize/SKILL.md`). The bash call blocks until the SPROC finishes, but the notebook cell is polling concurrently from its own Snowpark session. When the SPROC writes `summary` rows at the end, the progress cell detects completion and shows 100%.
+4. **Start optimization** via `bash` as normal (Step 5 in `optimize/SKILL.md`). The bash call blocks until the SPROC finishes, but the notebook cell is polling concurrently from its own Snowpark session. When the experiment's `{MODEL}_BEST` run appears, the progress cell shows completion.
 
 **⚠️ The progress cell must be added and run BEFORE starting the bash optimization command.** The notebook kernel and bash run concurrently — if you start bash first, there's no progress cell to show updates.
 

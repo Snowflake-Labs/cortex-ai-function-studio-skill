@@ -23,8 +23,8 @@ Before starting the workflow, scan the user's message and conversation context f
 | `input_source` | Yes | - | No | - |
 | `source_table` | If from_table | - | No | input_source |
 | `source_stage` | If multimodal | @{db}.{schema}.AI_FUNCTIONS | No | input_source |
-| `inputs` | Yes | - | **Yes** | input_source |
-| `outputs` | Yes | - | **Yes** | - |
+| `inputs` | Yes | - | **Research only** | input_source |
+| `outputs` | Yes | - | **Research only** | - |
 | `creation_mode` | Yes (direct, research) | - | No | clarifications, inputs, outputs |
 | `selected_approach` | If research | - | **Yes** | creation_mode |
 | `system_prompt` | If direct | (generated) | **Yes** | task_description |
@@ -35,7 +35,7 @@ Before starting the workflow, scan the user's message and conversation context f
 | `model` | Yes | claude-sonnet-4-6 | No | - |
 | `udf_body_sql` | If research | (generated) | **Yes** | selected_approach, inputs, outputs, model |
 
-**Critical fields** (always confirm even if pre-provided): `selected_approach` + `udf_body_sql` (only if use research mode), `system_prompt` + `user_prompt_template` (direct mode), `inputs`, `outputs`
+**Critical fields** (always confirm even if pre-provided): `selected_approach` + `udf_body_sql` (only if research mode), `system_prompt` + `user_prompt_template` (direct mode). In Direct mode, `inputs` and `outputs` are shown in the Step 8 review block and do not need separate confirmation.
 
 **Simple fields** (accept silently if pre-provided): `creation_mode`, `input_source`, `source_table`, `database`, `schema`, `function_name`, `model`, `task_description`
 
@@ -82,14 +82,9 @@ For example:
 
 #### Step 2: Clarifying Questions
 
-Based on the `task_description`, ask targeted clarifying questions. **Only ask questions whose answers are not already apparent from the user's message.** Batch related questions together — do not ask one at a time. If the user's initial message already provides enough context, skip this step entirely.
+**Skip this step unless the task is genuinely ambiguous** — i.e., you cannot generate a reasonable system prompt without more information. Most well-described tasks ("classify sentiment", "extract entities from contracts", "score review quality") do not need clarification. Any minor details (edge cases, formatting preferences) can be adjusted when the user reviews the generated prompt in Step 8.
 
-Questions to consider (ask only what's missing):
-- **Domain/context**: What industry or domain? (e.g., customer support, legal, medical, finance)
-- **Input characteristics**: What does the input data look like? (free text, structured fields, mixed, multiple columns)
-- **Output expectations**: What does "good output" look like? (exact categories, free-form text, numeric scores, structured JSON)
-- **Edge cases**: Any special handling needed? (nulls, empty inputs, multilingual content, ambiguous cases)
-- **Quality vs. speed tradeoffs**: Is accuracy or latency more important?
+If clarification is truly needed (e.g., the user said "process my data" with no specifics), ask at most 2-3 targeted questions batched together. Do not ask one at a time.
 
 If you need to ask, wait for user answers before proceeding. Do not gate this as a mandatory stop — only pause if questions were actually asked.
 
@@ -140,7 +135,13 @@ Output 1:
   - Description: (e.g., "The detected sentiment")
 ```
 
-**⚠️ STOP**: Always confirm inputs/outputs before proceeding (critical field).
+**Input type notes:** Semi-structured inputs (`ARRAY`, `VARIANT`, `OBJECT`) are surfaced into the prompt template as JSON strings — `ARRAY` via `ARRAY_TO_STRING(<col>, ', ')`, `VARIANT` and `OBJECT` via `TO_VARCHAR(<col>)`. The evaluate/optimize pipelines do the same conversion, so the prompt sees the JSON serialization rather than native structured data — that is functionally correct, just be aware of it when designing the prompt. Preserve the user's declared SQL types verbatim in the function signature: pass `sql_type: "ARRAY"`, `"VARIANT"`, or `"OBJECT"` to `create_udf.py` exactly as the user described the column; do not silently downcast to `VARCHAR`. For single-output functions, the return type maps from JSON type: `string` -> VARCHAR, `number` -> FLOAT, `integer` -> NUMBER, `boolean` -> BOOLEAN, `array`/`object` -> VARIANT. Multi-output functions always use `RETURNS VARIANT`.
+
+**If creation mode will be Research** (user already indicated research, custom SQL, or pre/post-processing):
+- **⚠️ STOP**: Confirm inputs/outputs before proceeding — research depends on accurate I/O definitions and changing them later wastes work.
+
+**If creation mode will be Direct** (the common path):
+- Do **not** stop here. Inputs/outputs will be shown in the Step 8 review block where the user confirms everything together. Proceed to Step 4.
 
 #### Step 4: Select Creation Mode
 
@@ -221,9 +222,9 @@ Use the target `database` and `schema` values that were already collected during
 
 **If `function_name` already collected**, accept silently.
 
-**If not collected**: Generate a suggested name (SCREAMING_SNAKE_CASE) based on task description or outputs. Ask user to accept or provide their own.
+**If not collected**: Generate a name (SCREAMING_SNAKE_CASE) based on task description or outputs. Do not ask the user to confirm — the name will be shown in the Step 8 review block where they can edit it along with everything else.
 
-**If `model` already collected**, accept silently.
+**If `model` already collected**, accept silently — unless the user explicitly asked to see model options (e.g., "show me available models"), in which case load `references/model_selection.md` and present the options.
 
 **If not collected**: It is MANDATORY to **load** `references/model_selection.md` and follow its full workflow.
 
@@ -252,12 +253,16 @@ Use the target `database` and `schema` values that were already collected during
     Language: {LANGUAGE}
     ```
 
-  **⚠️ STOP**: Present the system prompt and user prompt template together as a single review block:
+  **⚠️ STOP**: Present everything as a single review block. This is the only confirmation point for Direct mode — inputs, outputs, function name, and prompts are all shown here:
   ```
   Here's what I'll create:
 
-  Function: {database}.{schema}.{function_name}({inputs}) → {return_type}
+  Function: {database}.{schema}.{function_name}
   Model: {model}
+
+  Inputs: {input_name} ({sql_type}), ...
+  Outputs: {output_name} ({json_type}), ...
+  Returns: {return_type}
 
   System prompt:
     "{system_prompt}"
@@ -265,15 +270,13 @@ Use the target `database` and `schema` values that were already collected during
   User prompt template:
     "{user_prompt_template}"
 
-  Outputs: {output_fields}
-
-  Confirm or edit?
+  Confirm or edit any of the above?
   ```
   Wait for user to confirm or request edits before proceeding.
 
 **Agent Research mode:**
 
-	Based on the confirmed approach, inputs, outputs, and model, write the complete `CREATE OR REPLACE FUNCTION` DDL.
+	Based on the confirmed approach, inputs, outputs, and model, write the complete `CREATE FUNCTION` DDL. Preserve the user's declared SQL types verbatim in the function signature — never silently convert semi-structured inputs (`ARRAY`, `VARIANT`, `OBJECT`) to `VARCHAR`.
 
 	**The UDF body is NOT limited to a single AI_COMPLETE call.** It should follow the structural pattern selected in the Planning phase, which may include:
 	- SQL pre-processing on **scalar inputs only** (CASE WHEN, CONCAT, IFF, OBJECT_CONSTRUCT) — do NOT pre-process ARRAY or VARIANT inputs as they have indefinite length; pass them directly to AI_COMPLETE
@@ -285,7 +288,7 @@ Use the target `database` and `schema` values that were already collected during
 
 	**Show the complete DDL to the user:**
 	```sql
-	CREATE OR REPLACE FUNCTION DB.SCHEMA.FUNCTION_NAME(inputs...)
+	CREATE FUNCTION DB.SCHEMA.FUNCTION_NAME(inputs...)
 	RETURNS <return_type>
 	LANGUAGE SQL
 	COMMENT = '<description>'
@@ -337,6 +340,10 @@ After creation, test with a sample query:
 SELECT <function_name>(<sample_input>) AS result;
 ```
 
+**Important — return type awareness for smoke tests:**
+- **Single-output functions** (one entry in `outputs`): The UDF body already extracts the field (e.g., `:route::VARCHAR`) and `RETURNS` the scalar type (VARCHAR, FLOAT, etc.). Call the function directly — do **NOT** add a `:field_name` accessor on the outside. Example: `SELECT my_func(input) AS result` (correct), NOT `SELECT my_func(input):route` (error: GET on VARCHAR).
+- **Multi-output functions** (multiple entries in `outputs`): The function `RETURNS VARIANT` containing all fields. Access individual fields with `:field_name::TYPE`. Example: `SELECT my_func(input):sentiment::VARCHAR AS sentiment, my_func(input):confidence::FLOAT AS confidence`.
+
 If there are multiple pre- and post-processing steps, we should test edge cases to confirm that the function behaves correctly.
 
 Verify execution, format, types, and edge cases.
@@ -363,13 +370,27 @@ If evaluate → Load `evaluate/SKILL.md` with context:
 
 ## Best Practices
 
-**SQL UDF Bodies:** Custom AI functions are `LANGUAGE SQL` UDFs. The body is a single SQL expression (not a statement block). Use scalar subqueries `(SELECT expr FROM (SELECT AI_COMPLETE(...) AS r))` when the AI_COMPLETE result is referenced multiple times. Inside UDF bodies, use `ARRAY_CONSTRUCT()` (not `[...]`), `OBJECT_CONSTRUCT()` (not `{...}`), and `PARSE_JSON('...')` for the response_format value. Named parameters (`model=>`, `messages=>`, `response_format=>`) are valid. AI_COMPLETE is called exactly once per invocation. Do not apply input enrichment to ARRAY or VARIANT inputs — their indefinite length makes them unsuitable for SQL-level transformation; pass them directly to AI_COMPLETE. When the body uses `OBJECT_CONSTRUCT(...)`, declare `RETURNS OBJECT` (not `RETURNS VARIANT`) — Snowflake enforces strict return type compatibility. Do not use PostgreSQL `E'...'` escape string syntax; use regular `'\n'` or `CHAR(10)` for newlines.
+**SQL UDF Bodies:** Custom AI functions are `LANGUAGE SQL` UDFs. The body is a single SQL expression (not a statement block). Use scalar subqueries `(SELECT expr FROM (SELECT AI_COMPLETE(...) AS r))` when the AI_COMPLETE result is referenced multiple times. Inside UDF bodies, use `ARRAY_CONSTRUCT()` (not `[...]`), `OBJECT_CONSTRUCT()` (not `{...}`), and `PARSE_JSON('...')` for the response_format value. AI_COMPLETE is called exactly once per invocation. Do not apply input enrichment to ARRAY or VARIANT inputs — their indefinite length makes them unsuitable for SQL-level transformation; pass them directly to AI_COMPLETE. When the body uses `OBJECT_CONSTRUCT(...)` for multi-output, declare `RETURNS VARIANT` so the function is compatible with the evaluate/optimize pipelines. Do not use PostgreSQL `E'...'` escape string syntax; use regular `'\n'` or `CHAR(10)` for newlines.
+
+**AI_COMPLETE calling convention:** Use the unqualified built-in `AI_COMPLETE(...)` — not the legacy `SNOWFLAKE.CORTEX.COMPLETE(...)`, which is a different (older) function and is not supported by the evaluate/optimize pipelines. Always use the named-parameter messages-array syntax; positional arguments are not supported for chat completions. The canonical pattern is:
+
+```sql
+AI_COMPLETE(
+    model => 'claude-sonnet-4-6',
+    messages => ARRAY_CONSTRUCT(
+        OBJECT_CONSTRUCT('role', 'system', 'content', '<system prompt>'),
+        OBJECT_CONSTRUCT('role', 'user', 'content', '<user message>')
+    )
+)::VARCHAR
+```
+
+Do NOT use the positional form `AI_COMPLETE('model', 'system', 'user')` — it will fail with `Invalid argument types` for chat-based models.
 
 **System Prompts:** Be specific, define edge cases, use structure, add examples for complex tasks, keep focused.
 
 **JSON Schema:** Use correct types (`string`, `number`, `boolean`, `array`, `object`), mark required fields, define `items` for arrays.
 
-**Output Types:** VARCHAR (text), FLOAT/NUMBER (scores), BOOLEAN (flags), ARRAY (lists), OBJECT (multiple fields via OBJECT_CONSTRUCT), VARIANT (raw AI_COMPLETE output with multiple fields).
+**Output Types:** For single-output functions, the return type maps from JSON type: `string` -> VARCHAR, `number` -> FLOAT, `integer` -> NUMBER, `boolean` -> BOOLEAN, `array`/`object` -> VARIANT. Multi-output functions always use `RETURNS VARIANT`. This applies to both Direct mode and Agent Research mode — always use `RETURNS VARIANT` for multi-output so the function is compatible with the evaluate and optimize pipelines. Do not use `RETURNS OBJECT` — the evaluate/optimize SPROCs expect VARIANT.
 
 **Testing:** Test typical inputs, edge cases (NULL, empty, long), verify types and structure.
 
@@ -390,9 +411,9 @@ If evaluate → Load `evaluate/SKILL.md` with context:
 ## Stopping Points
 
 Planning:
-- ✋ Step 3: Confirm inputs/outputs
+- ✋ Step 3: (research only) Confirm inputs/outputs — skipped for Direct mode since they appear in Step 8 review
 - ✋ Step 5: (research only) After presenting approaches — wait for selection or custom description
 
 Create:
-- ✋ Step 8: (direct) Confirm combined review (function name, model, system prompt, user prompt template, outputs)
+- ✋ Step 8: (direct) Confirm combined review (function name, model, system prompt, user prompt template, inputs, outputs)
 - ✋ Step 8: (research) Confirm complete DDL before execution

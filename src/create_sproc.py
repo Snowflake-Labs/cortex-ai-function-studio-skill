@@ -139,6 +139,7 @@ def render_sproc_sql(
     *,
     anonymous: bool = False,
     inline: bool = False,
+    proc_name: str = "OPTIMIZE_AI_FUNCTION",
 ) -> str:
     """Render the SPROC SQL with the correct stage path and fully qualified names.
 
@@ -152,6 +153,10 @@ def render_sproc_sql(
             ``CALL name(args);`` with the actual arguments.
         inline: If True, embed Python source code directly in the SPROC
             body instead of using IMPORTS from a stage.
+        proc_name: Name for the stored procedure when ``anonymous=False``.
+            Defaults to ``OPTIMIZE_AI_FUNCTION``.  Pass a timestamped name
+            (e.g. ``OPTIMIZE_AI_FUNCTION_1234567890``) to avoid collisions
+            when multiple benchmark runs share the same schema.
 
     Returns:
         Rendered SQL string
@@ -160,6 +165,8 @@ def render_sproc_sql(
     validate_identifier(schema, "schema")
     if not inline:
         validate_identifier(stage_name, "stage_name")
+    if not anonymous:
+        validate_identifier(proc_name, "proc_name")
 
     template_path = get_template_path(sproc_type)
     if not template_path.exists():
@@ -181,6 +188,7 @@ def render_sproc_sql(
         inline=inline,
         inline_body=inline_body,
         inline_handler=inline_handler,
+        proc_name=proc_name,
     )
 
     return rendered_sql

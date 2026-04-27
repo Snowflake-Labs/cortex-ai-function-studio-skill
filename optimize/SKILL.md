@@ -14,6 +14,8 @@ Automatically improves AI functions through iterative function body optimization
 
 **The target function must be created via `create/SKILL.md`** (or have compatible structure). The optimizer reverse-parses the function DDL to extract the full function body as the seed for optimization, then creates temporary functions with candidate body variations during optimization. The function body must contain at least one `AI_COMPLETE` call. The optimizer can modify the entire body -- prompts, model references, SQL pre/post-processing -- while preserving the function signature.
 
+**ARRAY-typed parameters are supported.** The optimizer detects ARRAY parameters from the function DDL and automatically handles type casting when passing training data (stored as VARCHAR) to candidate functions. No manual type conversion is needed. For best results, ensure synthetic training data was generated with `--function-name` so that ARRAY inputs are stored as JSON arrays (e.g., `["NAME", "EMAIL"]`) rather than comma-separated strings.
+
 **Supported multimodal patterns:**
 - **VARCHAR file paths**: function takes VARCHAR inputs with `TO_FILE()` in the body — auto-detected from DDL.
 - **FILE data type**: function takes FILE parameters directly — auto-detected from DDL signature. `stage_name` **must** be provided in metric options.
@@ -38,16 +40,15 @@ Load from main skill when user intent matches OPTIMIZE: "optimize", "tune", "imp
 | `label_column` | Yes | - | **Yes** | training_table |
 | `metric` | Yes | - | **Yes** | - |
 | `auto_budget` | Yes | light | No | - |
-| `models` | Yes | [function's model] | No | - |
+| `models` | Yes | [function's model] | **Yes** | - |
 | `reflection_model` | Yes | claude-sonnet-4-6 | No | - |
 | `experiment_name` | No | (generated) | No | function_name |
-| `results_table` | No | (generated) | No | function_name |
 | `aggregation_metric` | No | accuracy | No | metric |
 | `optimize_mode` | No | body | No | - |
 
-**Critical fields** (always confirm even if pre-provided): `function_structure_confirmed`, `input_columns`, `label_column`, `metric`
+**Critical fields** (always confirm even if pre-provided): `function_structure_confirmed`, `input_columns`, `label_column`, `metric`, `models`
 
-**Simple fields** (accept silently if pre-provided): `function_name`, `training_table`, `test_table`, `auto_budget`, `models`, `reflection_model`, `experiment_name`, `results_table`, `aggregation_metric`, `optimize_mode`
+**Simple fields** (accept silently if pre-provided): `function_name`, `training_table`, `test_table`, `auto_budget`, `reflection_model`, `experiment_name`, `aggregation_metric`, `optimize_mode`
 
 ## Pre-Collection
 
@@ -189,7 +190,40 @@ Store as `auto_budget`. Default: `light`
 
 **If `models` already collected**, skip. Otherwise:
 
-**Default to the model extracted from the function DDL in Step 2.** Do not ask the user to choose models — use the function's baked-in model. If the user explicitly requests multiple models or a different model, accommodate that.
+Present the available models from `src/models.json` grouped by cost tier, with the function's current model (from Step 2) highlighted. The user must select which models to optimize for — do not silently pick for them.
+
+**⚠️ STOP**: Show the model list and wait for the user's selection before proceeding.
+
+```
+Which models would you like to optimize for? You can select one or more.
+
+Your function currently uses: {current_model}
+
+Available models (grouped by relative cost):
+
+  Budget-friendly:
+    - llama3.1-8b, mistral-7b, gemini-2.5-flash-lite, openai-gpt-5-nano,
+      openai-gpt-oss-20b, llama4-scout
+
+  Mid-range:
+    - llama3.1-70b, llama3.3-70b, llama4-maverick, gemini-2.5-flash,
+      claude-haiku-4-5, openai-gpt-5-mini, deepseek-r1, mixtral-8x7b,
+      openai-gpt-oss-120b, openai-o4-mini
+
+  Premium:
+    - claude-sonnet-4-5, claude-sonnet-4-6, openai-gpt-4.1, openai-gpt-5,
+      openai-gpt-5-chat, openai-gpt-5.1, gemini-3.1-pro, mistral-large2,
+      pixtral-large
+
+  High-end:
+    - claude-opus-4-5, claude-opus-4-6, openai-gpt-5.2, openai-gpt-5.4,
+      llama3.1-405b, mistral-large
+
+Tip: Selecting models across different cost tiers helps find the best
+cost/quality tradeoff via Pareto analysis.
+
+Enter model names (comma-separated), or just press enter to use: {current_model}
+```
 
 Store as `models` (array). Default: `[<model from function DDL>]`
 
@@ -205,8 +239,7 @@ Store as `reflection_model`. Default: `claude-sonnet-4-6`
 
 **⚠️ STOP**: Present all optimization settings together as a single review block:
 
-- **Experiment name**: Snowflake Experiment to persist optimization results. Default: `{FUNCTION_NAME}_OPT_EXP`
-- **Results table**: Where to save per-row test-set evaluation results. Default: `{FUNCTION_NAME}_EVAL_RESULTS`. Only used when a test table is provided.
+- **Experiment name**: Snowflake Experiment to persist optimization results (per-iteration runs, parameters, metrics) AND per-row seed/best test eval details (uploaded as `seed_eval_detail.json` / `best_eval_detail.json` to the `{MODEL}_BEST` run's nested stage). Default: `{FUNCTION_NAME}_OPT_EXP`
 - **Validation fraction**: Fraction of training data for validation vs reflection. Recommended default from the Step 3 training row count: `0.5`; if the training table has more than 200 rows, use `0.2`
 
 ```
@@ -222,7 +255,6 @@ Model: {models}
 Reflection model: {reflection_model}
 Budget: {auto_budget}
 Experiment: {experiment_name}
-Results table: {results_table}
 
 Confirm or edit?
 ```
@@ -230,6 +262,8 @@ Confirm or edit?
 Proceed with defaults unless user requests changes.
 
 ### Step 5: Run Optimization
+
+**Always pass `timeout_seconds: 14400` (4 hours / 240 minutes) on every `OPTIMIZE_AI_FUNCTION` SQL call.** The SPROC routinely runs for 10+ minutes; the default 180s statement timeout will kill it mid-run. The `run.py optimize` script sets this for you; if you invoke the SQL tool directly, you must pass it explicitly.
 
 Explain to the user what the procedure does:
 ```
@@ -263,7 +297,6 @@ PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKIL
     --metric-name {metric_name} --models {model1} {model2} --reflection-model {reflection_model} \
     --test-table {test_table or none} --auto-budget {auto_budget} \
     --experiment-name {experiment_name or none} \
-    --results-table {results_table or none} \
     --validation-fraction {validation_fraction} --temperature 0.0 --max-tokens 8192 \
     --metric-options none --custom-metric-udf none \
     --run-id none --aggregation-metric {aggregation_metric or none}
@@ -271,6 +304,14 @@ PYTHONPATH=<SKILL_DIRECTORY>/src uv run --project <SKILL_DIRECTORY> python <SKIL
 ```
 
 Run `run.py optimize --help` to see all flags and their descriptions.
+
+**Direct SQL invocation** — if you call `CALL OPTIMIZE_AI_FUNCTION(...)` via the SQL tool directly (instead of `run.py`), pass `timeout_seconds=14400`:
+
+```text
+sql_execute(sql="CALL OPTIMIZE_AI_FUNCTION(...)", timeout_seconds=14400)
+```
+
+For the async `run.py optimize --async` path, append `--timeout-minutes 240` to align task-level timeout with the SPROC budget.
 
 #### Sync Output
 
@@ -322,9 +363,9 @@ The procedure returns JSON with: `run_id`, `seed_body`, `best_body`, `best_ddl`,
 
 - `seed_score` / `best_score` are the unified scores (from test data if a test table was provided, otherwise from validation data).
 - `score_source` indicates which dataset: `"test"` or `"validation"`.
-- `best_ddl` is the complete `CREATE OR REPLACE FUNCTION` DDL with the optimized body.
+- `best_ddl` is the complete `CREATE FUNCTION` DDL with the optimized body.
 
-**Important**: Capture `run_id` — needed for version management.
+**Important**: Capture `run_id` — needed for experiment tracking.
 
 If the optimization was run asynchronously and the JSON return is unavailable, query the experiment for results:
 ```sql
@@ -337,6 +378,33 @@ SHOW RUN METRICS IN EXPERIMENT {experiment_name} RUN {MODEL}_BEST;
 -- Get the optimized prompt/body from the best run
 SHOW RUN PARAMETERS IN EXPERIMENT {experiment_name} RUN {MODEL}_BEST;
 ```
+
+For per-row test-set evaluation details (uploaded by the optimizer to the `{MODEL}_BEST` run's nested stage), create a named JSON file format and query the artifacts via SnowURL string-literal paths:
+
+```sql
+-- Step 0: create the JSON file format once per session.
+CREATE OR REPLACE TEMPORARY FILE FORMAT eval_detail_json_fmt
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE;
+
+-- Per-row details for the SEED candidate's test eval
+SELECT $1:row_id::INT AS ROW_ID, $1:expected::STRING AS EXPECTED,
+       $1:predicted::STRING AS PREDICTED, $1:metric_score::FLOAT AS SCORE,
+       $1:metric_feedback::STRING AS FEEDBACK
+FROM 'snow://experiment/{experiment_name}/versions/{MODEL}_BEST/seed_eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
+ORDER BY ROW_ID;
+
+-- Per-row details for the BEST optimized candidate's test eval
+SELECT $1:row_id::INT AS ROW_ID, $1:expected::STRING AS EXPECTED,
+       $1:predicted::STRING AS PREDICTED, $1:metric_score::FLOAT AS SCORE,
+       $1:metric_feedback::STRING AS FEEDBACK
+FROM 'snow://experiment/{experiment_name}/versions/{MODEL}_BEST/best_eval_detail.json'
+(FILE_FORMAT => eval_detail_json_fmt)
+ORDER BY ROW_ID;
+```
+
+> Querying `'snow://experiment/...'` requires the server-side parameter `ENABLE_EXPERIMENT_SNOWURL_READ_PATH_RESOLUTION` to be enabled. The path is a **string literal**, not a `@stage` reference, and the FILE FORMAT must be a named object — inline `(TYPE => JSON)` is not supported on SnowURL.
 
 **6.2. Get average output length:**
 
@@ -375,7 +443,7 @@ Apply the optimized function?
 
 **If "Yes" (replace original):**
 
-The optimizer returns `best_ddl`, a complete `CREATE OR REPLACE FUNCTION` DDL statement with the optimized body. 
+The optimizer returns `best_ddl`, a complete `CREATE FUNCTION` DDL statement with the optimized body. 
 
 **⚠️ STOP**: Show the `best_ddl` to the user for review. Once confirmed, execute the DDL directly:
 
@@ -438,6 +506,7 @@ After doing this analysis, help user identify whether they should run optimizati
 
 Critical confirmations (always stop, even if pre-provided):
 - ✋ Step 3: Confirm column mapping (input_columns, label_column)
+- ✋ Step 4.3: Show available models and wait for user selection
 
 Optional confirmations:
 - ✋ Step 6: After presenting pareto-optimal results (get user selection)
@@ -450,10 +519,11 @@ Optional confirmations:
 | `Function not found` | Use fully qualified name: `DB.SCHEMA.MY_FUNC`. Verify: `SHOW FUNCTIONS LIKE 'MY_FUNC' IN SCHEMA DB.SCHEMA;` |
 | `Could not extract function body from DDL` | Function DDL could not be parsed. Recreate via `create/SKILL.md`. |
 | `Could not extract model name from DDL` | Function body does not contain `model=>'...'`. Recreate via `create/SKILL.md`. |
+| Statement timeout / `Statement reached its statement_timeout_in_seconds` while running `OPTIMIZE_AI_FUNCTION` | Always pass `timeout_seconds: 14400` (4 hours / 240 minutes) on the SQL call. The default 180s timeout will kill the SPROC mid-run. |
 
 ## Output
 
-- VARIANT result with best function body and DDL per model
+- VARIANT result from the SPROC (JSON object) with best function body and DDL per model — the `run.py` script parses this and prints it as a JSON string to stdout
 - Experiment object with optimization history (runs, metrics, parameters)
 - Updated AI function with optimized body (if applied)
 - No persistent artifacts — Python code is inlined into the anonymous SPROC
